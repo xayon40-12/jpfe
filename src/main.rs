@@ -18,13 +18,6 @@ use crate::models::Chapter;
 use crate::pdf::extract_pdf_chapters;
 use crate::tokenizer::JapaneseTokenizer;
 
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum DictKindArg {
-    #[default]
-    Unidic,
-    Ipadic,
-}
-
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ReadingFormat {
     Hiragana,
@@ -98,10 +91,6 @@ struct Args {
     /// Path to custom external MeCab/Lindera dictionary directory
     #[arg(long = "dict-path")]
     dict_path: Option<PathBuf>,
-
-    /// Dictionary to use for morphological analysis and lemmatization (default: unidic)
-    #[arg(long = "dict", value_enum, default_value_t = DictKindArg::Unidic)]
-    dict: DictKindArg,
 
     /// Book-wide scanning scope for whole-book frequency and first-appearance chapter calculation
     #[arg(long = "scan-scope", value_enum, default_value_t = ScanScope::Full)]
@@ -227,14 +216,9 @@ fn main() -> Result<()> {
     // 3. Initialize tokenizer
     let reading_in_hiragana = matches!(args.reading, ReadingFormat::Hiragana);
     let include_particles = !args.content_only;
-    let dict_kind = match args.dict {
-        DictKindArg::Unidic => crate::tokenizer::DictKind::UniDic,
-        DictKindArg::Ipadic => crate::tokenizer::DictKind::IpaDic,
-    };
 
-    println!("Initializing Japanese morphological tokenizer (Lindera + {:?})...", args.dict);
+    println!("Initializing Japanese morphological tokenizer (Lindera + UniDic)...");
     let mut tokenizer = JapaneseTokenizer::new(
-        dict_kind,
         args.dict_path.as_deref(),
         reading_in_hiragana,
         include_particles,
@@ -326,37 +310,51 @@ fn main() -> Result<()> {
         println!("  Vocabulary preview:");
         if include_first_appearance_col {
             println!(
-                "    {:<4} {:<10} {:<12} {:<8} {:<6} {:<8} {:<8} {:<10}",
-                "Rank", "Word", "Reading", "POS", "Count", "Chapter%", "Cumul%", "First Seen"
+                "    {} {} {} {} {} {} {} {}",
+                pad_display("Rank", 5),
+                pad_display("Word", 12),
+                pad_display("Reading", 14),
+                pad_display("POS", 8),
+                pad_display("Count", 6),
+                pad_display("Chapter%", 9),
+                pad_display("Cumul%", 8),
+                pad_display("First Seen", 12),
             );
             for e in entries.iter().take(8) {
+                let first_seen_short: String = e.first_appearance_chapter.chars().take(10).collect();
                 println!(
-                    "    {:<4} {:<10} {:<12} {:<8} {:<6} {:<8} {:<8} {:<10}",
-                    e.rank,
-                    e.word,
-                    e.pronunciation,
-                    e.pos,
-                    e.occurrences,
-                    e.chapter_percent,
-                    e.cumulative_percent,
-                    e.first_appearance_chapter.chars().take(8).collect::<String>()
+                    "    {} {} {} {} {} {} {} {}",
+                    pad_display(&e.rank.to_string(), 5),
+                    pad_display(&e.word, 12),
+                    pad_display(&e.pronunciation, 14),
+                    pad_display(&e.pos, 8),
+                    pad_display(&e.occurrences.to_string(), 6),
+                    pad_display(&e.chapter_percent, 9),
+                    pad_display(&e.cumulative_percent, 8),
+                    pad_display(&first_seen_short, 12),
                 );
             }
         } else {
             println!(
-                "    {:<4} {:<10} {:<12} {:<8} {:<6} {:<8} {:<8}",
-                "Rank", "Word", "Reading", "POS", "Count", "Chapter%", "Cumul%"
+                "    {} {} {} {} {} {} {}",
+                pad_display("Rank", 5),
+                pad_display("Word", 12),
+                pad_display("Reading", 14),
+                pad_display("POS", 8),
+                pad_display("Count", 6),
+                pad_display("Chapter%", 9),
+                pad_display("Cumul%", 8),
             );
             for e in entries.iter().take(8) {
                 println!(
-                    "    {:<4} {:<10} {:<12} {:<8} {:<6} {:<8} {:<8}",
-                    e.rank,
-                    e.word,
-                    e.pronunciation,
-                    e.pos,
-                    e.occurrences,
-                    e.chapter_percent,
-                    e.cumulative_percent
+                    "    {} {} {} {} {} {} {}",
+                    pad_display(&e.rank.to_string(), 5),
+                    pad_display(&e.word, 12),
+                    pad_display(&e.pronunciation, 14),
+                    pad_display(&e.pos, 8),
+                    pad_display(&e.occurrences.to_string(), 6),
+                    pad_display(&e.chapter_percent, 9),
+                    pad_display(&e.cumulative_percent, 8),
                 );
             }
         }
@@ -373,4 +371,11 @@ fn main() -> Result<()> {
     println!("============================================================");
 
     Ok(())
+}
+
+fn pad_display(s: &str, target_width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let w = s.width();
+    let pad = target_width.saturating_sub(w);
+    format!("{}{}", s, " ".repeat(pad))
 }

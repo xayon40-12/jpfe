@@ -148,11 +148,9 @@ impl FrequencyAnalyzer {
                 pronunciation,
                 pos,
                 occurrences: count,
-                chapter_frequency: chapter_freq,
                 chapter_percent: format!("{:.4}%", chapter_pct),
                 cumulative_percent: format!("{:.2}%", cum_pct),
                 book_occurrences: book_count,
-                book_frequency: book_freq,
                 book_percent: format!("{:.4}%", book_pct),
                 first_appearance_chapter: first_chapter,
             });

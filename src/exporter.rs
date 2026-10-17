@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use csv::WriterBuilder;
+use unicode_width::UnicodeWidthStr;
 
 use crate::models::WordEntry;
 
@@ -40,43 +41,25 @@ pub fn export_chapter_entries(
         ExportFormat::Csv => "csv",
     };
 
-    // 1. Export full statistics table
-    let full_filename = format!("chapter_{:02}_{}.{}", chapter_index, sanitized_title, extension);
-    let full_path = full_dir.join(&full_filename);
-
-    let file = File::create(&full_path)
-        .with_context(|| format!("Failed to create output file: {:?}", full_path))?;
-
-    let delimiter = match format {
-        ExportFormat::Tsv => b'\t',
-        ExportFormat::Csv => b',',
-    };
-
-    let mut writer = WriterBuilder::new()
-        .delimiter(delimiter)
-        .has_headers(true)
-        .from_writer(file);
-
-    // Write header
+    // 1. Build table rows (omitting redundant frequency decimals, keeping percentages)
     let mut header = vec![
-        "rank",
-        "word",
-        "pronunciation",
-        "pos",
-        "occurrences",
-        "chapter_frequency",
-        "chapter_percent",
-        "cumulative_percent",
-        "book_occurrences",
-        "book_frequency",
-        "book_percent",
+        "rank".to_string(),
+        "word".to_string(),
+        "pronunciation".to_string(),
+        "pos".to_string(),
+        "occurrences".to_string(),
+        "chapter_percent".to_string(),
+        "cumulative_percent".to_string(),
+        "book_occurrences".to_string(),
+        "book_percent".to_string(),
     ];
     if include_first_appearance_col {
-        header.push("first_appearance_chapter");
+        header.push("first_appearance_chapter".to_string());
     }
-    writer.write_record(&header)?;
 
-    // Write rows
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len() + 1);
+    rows.push(header);
+
     for entry in entries {
         let mut row = vec![
             entry.rank.to_string(),
@@ -84,21 +67,61 @@ pub fn export_chapter_entries(
             entry.pronunciation.clone(),
             entry.pos.clone(),
             entry.occurrences.to_string(),
-            format!("{:.6}", entry.chapter_frequency),
             entry.chapter_percent.clone(),
             entry.cumulative_percent.clone(),
             entry.book_occurrences.to_string(),
-            format!("{:.6}", entry.book_frequency),
             entry.book_percent.clone(),
         ];
         if include_first_appearance_col {
             row.push(entry.first_appearance_chapter.clone());
         }
-        writer.write_record(&row)?;
+        rows.push(row);
     }
-    writer.flush()?;
 
-    // 2. Export single-column words text file
+    // 2. Export full statistics table
+    let full_filename = format!("chapter_{:02}_{}.{}", chapter_index, sanitized_title, extension);
+    let full_path = full_dir.join(&full_filename);
+
+    match format {
+        ExportFormat::Csv => {
+            let file = File::create(&full_path)
+                .with_context(|| format!("Failed to create output file: {:?}", full_path))?;
+            let mut writer = WriterBuilder::new()
+                .delimiter(b',')
+                .has_headers(false)
+                .from_writer(file);
+            for row in &rows {
+                writer.write_record(row)?;
+            }
+            writer.flush()?;
+        }
+        ExportFormat::Tsv => {
+            // Calculate column widths based on East Asian Display Width
+            let num_cols = rows[0].len();
+            let mut col_widths = vec![0; num_cols];
+            for row in &rows {
+                for (i, cell) in row.iter().enumerate() {
+                    col_widths[i] = col_widths[i].max(cell.width());
+                }
+            }
+
+            let mut file = File::create(&full_path)
+                .with_context(|| format!("Failed to create output file: {:?}", full_path))?;
+
+            for row in &rows {
+                let mut padded_parts = Vec::with_capacity(num_cols);
+                for (i, cell) in row.iter().enumerate() {
+                    let cell_w = cell.width();
+                    let pad = col_widths[i].saturating_sub(cell_w);
+                    padded_parts.push(format!("{}{}", cell, " ".repeat(pad)));
+                }
+                writeln!(file, "{}", padded_parts.join("\t"))?;
+            }
+            file.flush()?;
+        }
+    }
+
+    // 3. Export single-column words text file
     let words_filename = format!("chapter_{:02}_{}.txt", chapter_index, sanitized_title);
     let words_path = words_dir.join(&words_filename);
     let mut words_file = File::create(&words_path)

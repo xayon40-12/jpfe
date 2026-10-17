@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-lindera = { version = "6.2.0", features = ["embed-ipadic", "embed-unidic"] }
+lindera = { version = "6.2.0", features = ["embed-unidic"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
 regex = "1.10"
@@ -14,3 +14,4 @@ csv = "1.3"
 anyhow = "1.0"
 lopdf = "0.42"
 rayon = "1.10"
+unicode-width = "0.2"

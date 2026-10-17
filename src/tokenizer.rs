@@ -6,16 +6,8 @@ use lindera::dictionary::{load_embedded_dictionary, load_fs_dictionary, Dictiona
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DictKind {
-    #[default]
-    UniDic,
-    IpaDic,
-}
-
 pub struct JapaneseTokenizer {
     segmenter: Segmenter,
-    dict_kind: DictKind,
     reading_cache: HashMap<String, String>,
     reading_in_hiragana: bool,
     include_particles: bool,
@@ -30,7 +22,6 @@ pub struct ParsedWord {
 
 impl JapaneseTokenizer {
     pub fn new(
-        dict_kind: DictKind,
         dict_path: Option<&Path>,
         reading_in_hiragana: bool,
         include_particles: bool,
@@ -39,19 +30,14 @@ impl JapaneseTokenizer {
             load_fs_dictionary(p)
                 .with_context(|| format!("Failed to load dictionary from: {:?}", p))?
         } else {
-            match dict_kind {
-                DictKind::UniDic => load_embedded_dictionary(DictionaryKind::UniDic)
-                    .with_context(|| "Failed to load embedded UniDic dictionary")?,
-                DictKind::IpaDic => load_embedded_dictionary(DictionaryKind::IPADIC)
-                    .with_context(|| "Failed to load embedded IPADIC dictionary")?,
-            }
+            load_embedded_dictionary(DictionaryKind::UniDic)
+                .with_context(|| "Failed to load embedded UniDic dictionary")?
         };
 
         let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
 
         Ok(Self {
             segmenter,
-            dict_kind,
             reading_cache: HashMap::new(),
             reading_in_hiragana,
             include_particles,
@@ -61,45 +47,22 @@ impl JapaneseTokenizer {
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
         let mut tokens = self.segmenter.segment(Cow::Borrowed(text))?;
 
-        match self.dict_kind {
-            DictKind::UniDic => {
-                let mut raw_items = Vec::with_capacity(tokens.len());
-                for token in tokens.iter_mut() {
-                    let surface = token.surface.to_string();
-                    let details = token.details();
-                    let pos = details.first().copied().unwrap_or("*").to_string();
-                    let lform_reading = details.get(6).copied().unwrap_or("*").to_string();
-                    let lemma = details.get(7).copied().unwrap_or("*").to_string();
-                    let orth_base = details.get(10).copied().unwrap_or("*").to_string();
-                    raw_items.push((surface, pos, lform_reading, lemma, orth_base));
-                }
-                drop(tokens);
-                self.process_unidic(raw_items)
-            }
-            DictKind::IpaDic => {
-                let mut raw_items = Vec::with_capacity(tokens.len());
-                for token in tokens.iter_mut() {
-                    let surface = token.surface.to_string();
-                    let details = token.details();
-                    let pos = details.first().copied().unwrap_or("*").to_string();
-                    let raw_base = details.get(6).copied().unwrap_or("*").to_string();
-                    let raw_reading = details.get(7).copied().unwrap_or("*").to_string();
-                    raw_items.push((surface, pos, raw_base, raw_reading));
-                }
-                drop(tokens);
-                self.process_ipadic(raw_items)
-            }
+        let mut raw_items = Vec::with_capacity(tokens.len());
+        for token in tokens.iter_mut() {
+            let surface = token.surface.to_string();
+            let details = token.details();
+            let pos = details.first().copied().unwrap_or("*").to_string();
+            let lform_reading = details.get(6).copied().unwrap_or("*").to_string();
+            let lemma = details.get(7).copied().unwrap_or("*").to_string();
+            let orth_base = details.get(10).copied().unwrap_or("*").to_string();
+            raw_items.push((surface, pos, lform_reading, lemma, orth_base));
         }
-    }
+        drop(tokens);
 
-    fn process_unidic(
-        &mut self,
-        raw_items: Vec<(String, String, String, String, String)>,
-    ) -> Result<Vec<ParsedWord>> {
         let mut words = Vec::with_capacity(raw_items.len());
 
         for (surface, pos, raw_reading, raw_lemma, raw_orth_base) in raw_items {
-            // Filter out punctuation and symbols
+            // Filter out punctuation, symbols, and whitespace
             if pos == "記号" || pos == "補助記号" || pos == "空白" {
                 continue;
             }
@@ -191,48 +154,6 @@ impl JapaneseTokenizer {
         Ok(words)
     }
 
-    fn process_ipadic(
-        &mut self,
-        raw_items: Vec<(String, String, String, String)>,
-    ) -> Result<Vec<ParsedWord>> {
-        let mut words = Vec::with_capacity(raw_items.len());
-
-        for (surface, pos, raw_base, raw_reading) in raw_items {
-            if pos == "記号" {
-                continue;
-            }
-
-            if !self.include_particles && (pos == "助詞" || pos == "助動詞") {
-                continue;
-            }
-
-            let base_word = if raw_base == "*" || raw_base.is_empty() {
-                surface.clone()
-            } else {
-                raw_base
-            };
-
-            if !is_valid_word(&base_word) {
-                continue;
-            }
-
-            let canon_reading = self.resolve_reading(&base_word, &surface, &raw_reading);
-            let pronunciation = if self.reading_in_hiragana {
-                katakana_to_hiragana(&canon_reading)
-            } else {
-                canon_reading
-            };
-
-            words.push(ParsedWord {
-                base_word,
-                pronunciation,
-                pos,
-            });
-        }
-
-        Ok(words)
-    }
-
     fn resolve_reading(&mut self, base: &str, surface: &str, raw_reading: &str) -> String {
         if let Some(cached) = self.reading_cache.get(base) {
             return cached.clone();
@@ -260,11 +181,7 @@ impl JapaneseTokenizer {
         if let Ok(mut base_tokens) = self.segmenter.segment(Cow::Borrowed(base)) {
             if base_tokens.len() == 1 {
                 let b_details = base_tokens[0].details();
-                let reading_idx = match self.dict_kind {
-                    DictKind::UniDic => 6,
-                    DictKind::IpaDic => 7,
-                };
-                if let Some(&r) = b_details.get(reading_idx) {
+                if let Some(&r) = b_details.get(6) {
                     if r != "*" && !r.is_empty() {
                         self.reading_cache.insert(base.to_string(), r.to_string());
                         return r.to_string();

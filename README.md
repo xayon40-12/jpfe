@@ -8,16 +8,18 @@ A high-performance Rust CLI tool designed for Japanese language learners and NLP
 
 - **Accurate Lemmatization (辞書形 / 原形)**: Converts all inflected verbs, adjectives, and auxiliaries back to their base elementary dictionary forms (e.g., `追い出された` → `追い出す`, `教わった` → `教わる`, `死んでしまった` → `死ぬ`, `美しかった` → `美味しい`).
 - **True Root Verb Extraction**: Accurately maps potential forms (可能動詞 / 可能形 like `吸える` → `吸う`, `起こせる` → `起こす`, `行ける` → `行く`, `話せる` → `話す`, `読める` → `読む`, `見れる` → `見る`), passive forms, and causative forms back to their elementary root dictionary verbs, avoiding redundant headwords.
-- **Modern Comprehensive Dictionary (UniDic by default)**: Uses NINJAL's **UniDic** by default for modern lexical analysis, accurately separating lemmas (*goiso*) from inflected word forms, while also supporting **IPADIC** or custom external dictionaries.
+- **Modern Comprehensive Dictionary (UniDic)**: Powered by NINJAL's modern **UniDic** dictionary, providing accurate lexical analysis with strict separation of lemmas (*goiso*) from conjugated word forms, with optional external dictionary support via `--dict-path`.
 - **Both EPUB and PDF Support**:
   - **EPUB**: Automatically parses container, manifest, spine, and TOC; safely strips `<rt>` and `<rp>` ruby tags so furigana annotations do not duplicate or pollute word tokens.
   - **PDF**: Multi-threaded page extraction using `rayon` and `lopdf` with support for Japanese PDF font encodings (including 2-byte `UniJIS-UTF16-H` UTF-16BE streams) and automatic chapter boundary detection.
 - **Punctuation & Symbol Filtering**: Non-word sequences, ellipses, and punctuation (e.g., `「――――`, `　………`, `―――`, `！　`, `　『`, `ーーー`) are strictly excluded from token counts and output files.
+- **Visually Aligned Columns**: Automatically pads columns taking into account East Asian display widths (Kanji/Kana = width 2, Latin/digits = width 1), ensuring all columns align vertically in terminal pagers and text editors.
+- **Clean Percentages**: Redundant decimal frequencies are omitted, showing clean, readable percentage metrics (`chapter_percent`, `cumulative_percent`, and `book_percent`).
 - **Whole-Novel Min Count (`-m`, default: 3)**: Filters out hapax legomena and words that occur less than 3 times across the entire novel, focusing your study effort on recurring vocabulary.
 - **Target Vocabulary Coverage (Default: 99.0%)**: Calculates running cumulative frequency percentages and filters down to any chosen threshold (e.g., 99%, 95%, 90%) to prioritize high-yield words.
 - **Hiding Previously Seen Words (Default: Active)**: Automatically hides words that already appeared in earlier chapters while preserving the word's true chapter rank (creating natural rank "holes"). This allows learners to focus strictly on new vocabulary introduced in each chapter.
 - **Two Parallel Output Formats (`full/` and `words/`)**:
-  - `full/`: Comprehensive TSV/CSV tables with full statistics for analysis.
+  - `full/`: Comprehensive, aligned TSV/CSV tables with full statistics for analysis.
   - `words/`: Single-column `.txt` files containing only the target words (one per line) ready for instant import into Anki, yomitan, or flashcard apps.
 - **Blazing Fast**: Scans, tokenizes, and lemmatizes millions of words across hundreds of chapters in ~1 second using Rust.
 
@@ -52,20 +54,18 @@ Contains a clean, single-column text file per chapter with one dictionary-form w
 ```
 
 ### 2. `full/` Directory
-Contains tab-separated (`.tsv`) or comma-separated (`.csv`) files with the following columns:
+Contains visually aligned tab-separated (`.tsv`) or comma-separated (`.csv`) files with the following columns:
 
 | Column | Description | Example |
 | :--- | :--- | :--- |
-| `rank` | Frequency rank in this chapter (holes appear when previous words are hidden) | `20` |
+| `rank` | Frequency rank in this chapter (holes appear when previous words are hidden) | `21` |
 | `word` | Dictionary / base form (原形) | `母親` |
 | `pronunciation` | Canonical reading (Hiragana or Katakana) | `ははおや` |
 | `pos` | Part of speech (品詞: 名詞, 動詞, 形容詞, 助詞, etc.) | `名詞` |
 | `occurrences` | Number of occurrences in this chapter | `13` |
-| `chapter_frequency` | Relative frequency in this chapter (decimal) | `0.005783` |
-| `chapter_percent` | Relative frequency in this chapter (percentage) | `0.5783%` |
-| `cumulative_percent` | Running cumulative coverage of this chapter | `48.09%` |
-| `book_occurrences` | Total occurrences across the entire novel | `87` |
-| `book_frequency` | Relative frequency across the entire novel | `0.000058` |
+| `chapter_percent` | Relative frequency in this chapter (percentage) | `0.5677%` |
+| `cumulative_percent` | Running cumulative coverage of this chapter | `50.61%` |
+| `book_occurrences` | Total occurrences across the entire novel | `88` |
 | `book_percent` | Relative frequency across the entire novel (percentage) | `0.0058%` |
 | `first_appearance_chapter`* | Chapter where word is first encountered (*included when showing all words) | `第一話` |
 
@@ -161,6 +161,5 @@ Within each chapter, vocabulary is sorted using a multi-level priority:
 | `--format` | | `tsv` | Full stats table format: `tsv` or `csv` |
 | `--reading` | | `hiragana` | Reading pronunciation format: `hiragana` or `katakana` |
 | `--content-only` | | `false` | If set, excludes particles (`助詞`) and auxiliary verbs (`助動詞`) |
-| `--dict` | | `unidic` | Morphological dictionary to use: `unidic` or `ipadic` |
 | `--dict-path` | | `None` | Path to optional external MeCab/Lindera dictionary directory |
 | `--scan-scope` | | `full` | `full` (scans whole novel for global counts) or `selected` |

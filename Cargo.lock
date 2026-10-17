@@ -533,6 +533,7 @@ dependencies = [
  "regex",
  "roxmltree",
  "serde",
+ "unicode-width",
  "zip",
 ]
 
@@ -799,7 +800,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -853,7 +854,6 @@ checksum = "acdfde95c0360c7214c7f97cbd52f293c41da5c7f215979b065b2b41772d199f"
 dependencies = [
  "anyhow",
  "lindera-dictionary",
- "lindera-ipadic",
  "lindera-unidic",
  "log",
  "percent-encoding",
@@ -894,15 +894,6 @@ dependencies = [
  "tar",
  "thiserror",
  "ureq",
-]
-
-[[package]]
-name = "lindera-ipadic"
-version = "6.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a768d9679036f287bbb94fef447148c263931dd72e9c438a04d75bf7d19111b8"
-dependencies = [
- "lindera-dictionary",
 ]
 
 [[package]]
@@ -1641,6 +1632,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "untrusted"
