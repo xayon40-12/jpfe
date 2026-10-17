@@ -60,7 +60,7 @@ impl FrequencyAnalyzer {
         chapter_title: &str,
         chapter_tokens: &[crate::tokenizer::ParsedWord],
         target_percentage: f64,
-        min_count: usize,
+        min_book_count: usize,
         hide_previous_words: bool,
     ) -> Vec<WordEntry> {
         let chapter_total = chapter_tokens.len();
@@ -92,10 +92,6 @@ impl FrequencyAnalyzer {
         let mut rank = 0;
 
         for (word, count) in sorted_words {
-            if count < min_count {
-                continue;
-            }
-
             rank += 1;
             cumulative_count += count;
 
@@ -104,6 +100,29 @@ impl FrequencyAnalyzer {
             let cum_pct = (cumulative_count as f64 / chapter_total as f64) * 100.0;
 
             let book_count = self.book_word_counts.get(word).copied().unwrap_or(count);
+
+            // Filter out words that appear less than min_book_count times across the entire book
+            if book_count < min_book_count {
+                if target_percentage < 100.0 && cum_pct >= target_percentage {
+                    break;
+                }
+                continue;
+            }
+
+            let first_chapter = self
+                .word_first_chapter
+                .get(word)
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            // If hiding words that appeared in previous chapters, skip lines for words whose first appearance is earlier
+            if hide_previous_words && first_chapter != chapter_title {
+                if target_percentage < 100.0 && cum_pct >= target_percentage {
+                    break;
+                }
+                continue;
+            }
+
             let book_freq = if self.book_total_words > 0 {
                 book_count as f64 / self.book_total_words as f64
             } else {
@@ -122,20 +141,6 @@ impl FrequencyAnalyzer {
                 .get(word)
                 .cloned()
                 .unwrap_or_else(|| "Unknown".to_string());
-
-            let first_chapter = self
-                .word_first_chapter
-                .get(word)
-                .cloned()
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            // If hiding words that appeared in previous chapters, skip lines for words whose first appearance is earlier
-            if hide_previous_words && first_chapter != chapter_title {
-                if target_percentage < 100.0 && cum_pct >= target_percentage {
-                    break;
-                }
-                continue;
-            }
 
             entries.push(WordEntry {
                 rank,

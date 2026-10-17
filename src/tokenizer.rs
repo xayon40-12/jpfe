@@ -6,8 +6,16 @@ use lindera::dictionary::{load_embedded_dictionary, load_fs_dictionary, Dictiona
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DictKind {
+    #[default]
+    UniDic,
+    IpaDic,
+}
+
 pub struct JapaneseTokenizer {
     segmenter: Segmenter,
+    dict_kind: DictKind,
     reading_cache: HashMap<String, String>,
     reading_in_hiragana: bool,
     include_particles: bool,
@@ -22,6 +30,7 @@ pub struct ParsedWord {
 
 impl JapaneseTokenizer {
     pub fn new(
+        dict_kind: DictKind,
         dict_path: Option<&Path>,
         reading_in_hiragana: bool,
         include_particles: bool,
@@ -30,14 +39,19 @@ impl JapaneseTokenizer {
             load_fs_dictionary(p)
                 .with_context(|| format!("Failed to load dictionary from: {:?}", p))?
         } else {
-            load_embedded_dictionary(DictionaryKind::IPADIC)
-                .with_context(|| "Failed to load embedded IPADIC dictionary")?
+            match dict_kind {
+                DictKind::UniDic => load_embedded_dictionary(DictionaryKind::UniDic)
+                    .with_context(|| "Failed to load embedded UniDic dictionary")?,
+                DictKind::IpaDic => load_embedded_dictionary(DictionaryKind::IPADIC)
+                    .with_context(|| "Failed to load embedded IPADIC dictionary")?,
+            }
         };
 
         let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
 
         Ok(Self {
             segmenter,
+            dict_kind,
             reading_cache: HashMap::new(),
             reading_in_hiragana,
             include_particles,
@@ -46,23 +60,47 @@ impl JapaneseTokenizer {
 
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
         let mut tokens = self.segmenter.segment(Cow::Borrowed(text))?;
-        
-        // Extract raw fields first so tokens borrow of segmenter is released
-        let mut raw_items = Vec::with_capacity(tokens.len());
-        for token in tokens.iter_mut() {
-            let surface = token.surface.to_string();
-            let details = token.details();
-            let pos = details.first().copied().unwrap_or("*").to_string();
-            let raw_base = details.get(6).copied().unwrap_or("*").to_string();
-            let raw_reading = details.get(7).copied().unwrap_or("*").to_string();
-            raw_items.push((surface, pos, raw_base, raw_reading));
-        }
 
+        match self.dict_kind {
+            DictKind::UniDic => {
+                let mut raw_items = Vec::with_capacity(tokens.len());
+                for token in tokens.iter_mut() {
+                    let surface = token.surface.to_string();
+                    let details = token.details();
+                    let pos = details.first().copied().unwrap_or("*").to_string();
+                    let lform_reading = details.get(6).copied().unwrap_or("*").to_string();
+                    let lemma = details.get(7).copied().unwrap_or("*").to_string();
+                    let orth_base = details.get(10).copied().unwrap_or("*").to_string();
+                    raw_items.push((surface, pos, lform_reading, lemma, orth_base));
+                }
+                drop(tokens);
+                self.process_unidic(raw_items)
+            }
+            DictKind::IpaDic => {
+                let mut raw_items = Vec::with_capacity(tokens.len());
+                for token in tokens.iter_mut() {
+                    let surface = token.surface.to_string();
+                    let details = token.details();
+                    let pos = details.first().copied().unwrap_or("*").to_string();
+                    let raw_base = details.get(6).copied().unwrap_or("*").to_string();
+                    let raw_reading = details.get(7).copied().unwrap_or("*").to_string();
+                    raw_items.push((surface, pos, raw_base, raw_reading));
+                }
+                drop(tokens);
+                self.process_ipadic(raw_items)
+            }
+        }
+    }
+
+    fn process_unidic(
+        &mut self,
+        raw_items: Vec<(String, String, String, String, String)>,
+    ) -> Result<Vec<ParsedWord>> {
         let mut words = Vec::with_capacity(raw_items.len());
 
-        for (surface, pos, raw_base, raw_reading) in raw_items {
+        for (surface, pos, raw_reading, raw_lemma, raw_orth_base) in raw_items {
             // Filter out punctuation and symbols
-            if pos == "記号" {
+            if pos == "記号" || pos == "補助記号" || pos == "空白" {
                 continue;
             }
 
@@ -71,11 +109,63 @@ impl JapaneseTokenizer {
                 continue;
             }
 
-            // Extract base form (dictionary form)
-            let base_word = if raw_base == "*" || raw_base.is_empty() {
-                surface.clone()
+            // Strip etymology annotations from UniDic lemma (e.g. "トラック-truck" -> "トラック")
+            let clean_lemma = raw_lemma.split('-').next().unwrap_or(&raw_lemma);
+
+            let (base_word, reading_seed) = if clean_lemma == "*" || clean_lemma.is_empty() {
+                (surface.clone(), raw_reading)
             } else {
-                raw_base
+                match pos.as_str() {
+                    "動詞" | "形容詞" => {
+                        // Normalize common auxiliary/basic verbs usually written in kana
+                        if clean_lemma == "為る" && surface.chars().all(is_hiragana) {
+                            ("する".to_string(), "スル".to_string())
+                        } else if clean_lemma == "居る" && surface.chars().all(is_hiragana) {
+                            ("いる".to_string(), "イル".to_string())
+                        } else if clean_lemma == "成る" && surface.chars().all(is_hiragana) {
+                            ("なる".to_string(), "ナル".to_string())
+                        } else if clean_lemma == "有る" && surface.chars().all(is_hiragana) {
+                            ("ある".to_string(), "アル".to_string())
+                        } else if clean_lemma == "無い" && surface.chars().all(is_hiragana) {
+                            ("ない".to_string(), "ナイ".to_string())
+                        } else if clean_lemma == "良い" && surface.chars().all(is_hiragana) {
+                            ("いい".to_string(), "イイ".to_string())
+                        } else {
+                            // If surface used a different kanji than representative lemma (e.g. 治せる vs 直す)
+                            let adapted = if clean_lemma.chars().count() > 1 && surface.chars().count() > 1 {
+                                let first_surface = surface.chars().next().unwrap();
+                                let first_lemma = clean_lemma.chars().next().unwrap();
+                                if first_surface != first_lemma && is_cjk_kanji(first_surface) && is_cjk_kanji(first_lemma) {
+                                    let remainder: String = clean_lemma.chars().skip(1).collect();
+                                    format!("{}{}", first_surface, remainder)
+                                } else {
+                                    clean_lemma.to_string()
+                                }
+                            } else {
+                                clean_lemma.to_string()
+                            };
+                            (adapted, raw_reading)
+                        }
+                    }
+                    "名詞" => {
+                        // For nouns, prefer surface orthography (e.g. 煙草, ご飯, トラック) over phonetic lemma
+                        let w = if !raw_orth_base.is_empty() && raw_orth_base != "*" {
+                            raw_orth_base
+                        } else {
+                            clean_lemma.to_string()
+                        };
+                        (w, raw_reading)
+                    }
+                    _ => {
+                        // For other parts of speech (adverbs, conjunctions, etc.)
+                        let w = if !raw_orth_base.is_empty() && raw_orth_base != "*" {
+                            raw_orth_base
+                        } else {
+                            clean_lemma.to_string()
+                        };
+                        (w, raw_reading)
+                    }
+                }
             };
 
             // Filter out empty, whitespace, pure punctuation, symbols, or standalone dashes/ellipses
@@ -83,7 +173,49 @@ impl JapaneseTokenizer {
                 continue;
             }
 
-            // Resolve canonical reading for base word
+            // Resolve canonical reading
+            let canon_reading = self.resolve_reading(&base_word, &surface, &reading_seed);
+            let pronunciation = if self.reading_in_hiragana {
+                katakana_to_hiragana(&canon_reading)
+            } else {
+                canon_reading
+            };
+
+            words.push(ParsedWord {
+                base_word,
+                pronunciation,
+                pos,
+            });
+        }
+
+        Ok(words)
+    }
+
+    fn process_ipadic(
+        &mut self,
+        raw_items: Vec<(String, String, String, String)>,
+    ) -> Result<Vec<ParsedWord>> {
+        let mut words = Vec::with_capacity(raw_items.len());
+
+        for (surface, pos, raw_base, raw_reading) in raw_items {
+            if pos == "記号" {
+                continue;
+            }
+
+            if !self.include_particles && (pos == "助詞" || pos == "助動詞") {
+                continue;
+            }
+
+            let base_word = if raw_base == "*" || raw_base.is_empty() {
+                surface.clone()
+            } else {
+                raw_base
+            };
+
+            if !is_valid_word(&base_word) {
+                continue;
+            }
+
             let canon_reading = self.resolve_reading(&base_word, &surface, &raw_reading);
             let pronunciation = if self.reading_in_hiragana {
                 katakana_to_hiragana(&canon_reading)
@@ -118,11 +250,21 @@ impl JapaneseTokenizer {
             return base.to_string();
         }
 
-        // If base differs from surface (e.g. conjugated verb/adjective), segment the base form
+        // If raw_reading is valid, use it
+        if raw_reading != "*" && !raw_reading.is_empty() {
+            self.reading_cache.insert(base.to_string(), raw_reading.to_string());
+            return raw_reading.to_string();
+        }
+
+        // Segment base word to find its reading
         if let Ok(mut base_tokens) = self.segmenter.segment(Cow::Borrowed(base)) {
             if base_tokens.len() == 1 {
                 let b_details = base_tokens[0].details();
-                if let Some(&r) = b_details.get(7) {
+                let reading_idx = match self.dict_kind {
+                    DictKind::UniDic => 6,
+                    DictKind::IpaDic => 7,
+                };
+                if let Some(&r) = b_details.get(reading_idx) {
                     if r != "*" && !r.is_empty() {
                         self.reading_cache.insert(base.to_string(), r.to_string());
                         return r.to_string();
@@ -140,6 +282,14 @@ impl JapaneseTokenizer {
         self.reading_cache.insert(base.to_string(), fallback.clone());
         fallback
     }
+}
+
+pub fn is_cjk_kanji(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c)
+}
+
+pub fn is_hiragana(c: char) -> bool {
+    ('\u{3041}'..='\u{3096}').contains(&c)
 }
 
 pub fn is_katakana(c: char) -> bool {
@@ -168,10 +318,9 @@ pub fn is_valid_word(s: &str) -> bool {
     // (Kanji, Hiragana, Katakana except standalone prolonged sound marks) or alphabetic letter
     let has_linguistic_char = trimmed.chars().any(|c| {
         // Kanji (CJK Unified Ideographs + Extension A)
-        ('\u{4E00}'..='\u{9FFF}').contains(&c)
-            || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        is_cjk_kanji(c)
             // Hiragana (\u{3041}..\u{3096})
-            || ('\u{3041}'..='\u{3096}').contains(&c)
+            || is_hiragana(c)
             // Katakana (\u{30A1}..\u{30FA}, excluding standalone prolonged sound mark \u{30FC})
             || (('\u{30A1}'..='\u{30FA}').contains(&c) && c != 'ー')
             // Alphabetic letters

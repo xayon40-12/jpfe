@@ -18,6 +18,13 @@ use crate::models::Chapter;
 use crate::pdf::extract_pdf_chapters;
 use crate::tokenizer::JapaneseTokenizer;
 
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum DictKindArg {
+    #[default]
+    Unidic,
+    Ipadic,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ReadingFormat {
     Hiragana,
@@ -48,9 +55,9 @@ struct Args {
     #[arg(value_name = "INPUT_FILE")]
     input: PathBuf,
 
-    /// Output directory for per-chapter column files
-    #[arg(short = 'o', long = "output-dir", default_value = "output")]
-    output_dir: PathBuf,
+    /// Output directory for per-chapter column files (default: adjacent to input file, named '<input>_frequency')
+    #[arg(short = 'o', long = "output-dir")]
+    output_dir: Option<PathBuf>,
 
     /// Target cumulative percentage of vocabulary to learn per chapter (e.g. 99.0)
     #[arg(short = 'p', long = "target-percentage", default_value_t = 99.0)]
@@ -76,9 +83,9 @@ struct Args {
     #[arg(long = "content-only", default_value_t = false)]
     content_only: bool,
 
-    /// Minimum occurrences in chapter to be included
-    #[arg(long = "min-count", default_value_t = 1)]
-    min_count: usize,
+    /// Minimum occurrences across the entire novel to be included (default: 3)
+    #[arg(short = 'm', long = "min-book-count", visible_alias = "min-count", default_value_t = 3)]
+    min_book_count: usize,
 
     /// Show all words including those that appeared in previous chapters (default is to hide previous words with rank holes)
     #[arg(long = "show-previous-words", visible_alias = "show-seen", visible_alias = "show-all", default_value_t = false)]
@@ -91,6 +98,10 @@ struct Args {
     /// Path to custom external MeCab/Lindera dictionary directory
     #[arg(long = "dict-path")]
     dict_path: Option<PathBuf>,
+
+    /// Dictionary to use for morphological analysis and lemmatization (default: unidic)
+    #[arg(long = "dict", value_enum, default_value_t = DictKindArg::Unidic)]
+    dict: DictKindArg,
 
     /// Book-wide scanning scope for whole-book frequency and first-appearance chapter calculation
     #[arg(long = "scan-scope", value_enum, default_value_t = ScanScope::Full)]
@@ -129,13 +140,27 @@ fn main() -> Result<()> {
         bail!("Input file does not exist: {:?}", args.input);
     }
 
+    let output_dir = match args.output_dir {
+        Some(dir) => dir,
+        None => {
+            let parent = args.input.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let file_name = args
+                .input
+                .file_name()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed("output"));
+            parent.join(format!("{}_frequency", file_name))
+        }
+    };
+
     println!("============================================================");
     println!("  Japanese Novel Word Frequency & Vocabulary Extractor");
     println!("============================================================");
     println!("Input: {:?}", args.input);
-    println!("Output directory: {:?}", args.output_dir);
+    println!("Output directory: {:?}", output_dir);
     let hide_previous_words = !args.show_previous_words;
     println!("Target cumulative percentage: {:.1}%", args.target_percentage);
+    println!("Min occurrences in whole novel: {}", args.min_book_count);
     println!("Pronunciation: {:?}", args.reading);
     println!("Content words only: {}", args.content_only);
     println!("Hide previously seen words: {}", hide_previous_words);
@@ -202,9 +227,14 @@ fn main() -> Result<()> {
     // 3. Initialize tokenizer
     let reading_in_hiragana = matches!(args.reading, ReadingFormat::Hiragana);
     let include_particles = !args.content_only;
+    let dict_kind = match args.dict {
+        DictKindArg::Unidic => crate::tokenizer::DictKind::UniDic,
+        DictKindArg::Ipadic => crate::tokenizer::DictKind::IpaDic,
+    };
 
-    println!("Initializing Japanese morphological tokenizer (Lindera + IPADIC)...");
+    println!("Initializing Japanese morphological tokenizer (Lindera + {:?})...", args.dict);
     let mut tokenizer = JapaneseTokenizer::new(
+        dict_kind,
         args.dict_path.as_deref(),
         reading_in_hiragana,
         include_particles,
@@ -253,12 +283,12 @@ fn main() -> Result<()> {
             &chapter.title,
             chapter_tokens,
             args.target_percentage,
-            args.min_count,
+            args.min_book_count,
             hide_previous_words,
         );
 
-        let out_path = export_chapter_entries(
-            &args.output_dir,
+        let export_paths = export_chapter_entries(
+            &output_dir,
             chapter.index,
             &chapter.title,
             &entries,
@@ -266,7 +296,7 @@ fn main() -> Result<()> {
             include_first_appearance_col,
         )?;
 
-        total_exported_files.push(out_path.clone());
+        total_exported_files.push(export_paths.full_path.clone());
 
         let total_unique_in_ch = {
             let set: HashSet<&str> = chapter_tokens.iter().map(|t| t.base_word.as_str()).collect();
@@ -289,7 +319,8 @@ fn main() -> Result<()> {
             filter_mode_desc,
             entries.len()
         );
-        println!("  Saved to: {}", out_path.display());
+        println!("  Full stats: {}", export_paths.full_path.display());
+        println!("  Words list: {}", export_paths.words_path.display());
 
         // Print top preview
         println!("  Vocabulary preview:");
@@ -338,7 +369,7 @@ fn main() -> Result<()> {
         total_exported_files.len(),
         t0.elapsed()
     );
-    println!("Output directory: {}", std::fs::canonicalize(&args.output_dir)?.display());
+    println!("Output directory: {}", std::fs::canonicalize(&output_dir)?.display());
     println!("============================================================");
 
     Ok(())

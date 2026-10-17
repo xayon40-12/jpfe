@@ -854,6 +854,7 @@ dependencies = [
  "anyhow",
  "lindera-dictionary",
  "lindera-ipadic",
+ "lindera-unidic",
  "log",
  "percent-encoding",
  "serde",
@@ -900,6 +901,15 @@ name = "lindera-ipadic"
 version = "6.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a768d9679036f287bbb94fef447148c263931dd72e9c438a04d75bf7d19111b8"
+dependencies = [
+ "lindera-dictionary",
+]
+
+[[package]]
+name = "lindera-unidic"
+version = "6.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "902760af2698ee0c4aaaae7a06f1e959fdad0e575af9455ea7bf332eeb00f350"
 dependencies = [
  "lindera-dictionary",
 ]

@@ -1,4 +1,5 @@
 use std::fs::{create_dir_all, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use csv::WriterBuilder;
@@ -11,6 +12,12 @@ pub enum ExportFormat {
     Csv,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChapterExportPaths {
+    pub full_path: PathBuf,
+    pub words_path: PathBuf,
+}
+
 pub fn export_chapter_entries(
     output_dir: &Path,
     chapter_index: usize,
@@ -18,9 +25,14 @@ pub fn export_chapter_entries(
     entries: &[WordEntry],
     format: ExportFormat,
     include_first_appearance_col: bool,
-) -> Result<PathBuf> {
-    create_dir_all(output_dir)
-        .with_context(|| format!("Failed to create output directory: {:?}", output_dir))?;
+) -> Result<ChapterExportPaths> {
+    let full_dir = output_dir.join("full");
+    let words_dir = output_dir.join("words");
+
+    create_dir_all(&full_dir)
+        .with_context(|| format!("Failed to create full output directory: {:?}", full_dir))?;
+    create_dir_all(&words_dir)
+        .with_context(|| format!("Failed to create words output directory: {:?}", words_dir))?;
 
     let sanitized_title = sanitize_filename(chapter_title);
     let extension = match format {
@@ -28,11 +40,12 @@ pub fn export_chapter_entries(
         ExportFormat::Csv => "csv",
     };
 
-    let filename = format!("chapter_{:02}_{}.{}", chapter_index, sanitized_title, extension);
-    let file_path = output_dir.join(&filename);
+    // 1. Export full statistics table
+    let full_filename = format!("chapter_{:02}_{}.{}", chapter_index, sanitized_title, extension);
+    let full_path = full_dir.join(&full_filename);
 
-    let file = File::create(&file_path)
-        .with_context(|| format!("Failed to create output file: {:?}", file_path))?;
+    let file = File::create(&full_path)
+        .with_context(|| format!("Failed to create output file: {:?}", full_path))?;
 
     let delimiter = match format {
         ExportFormat::Tsv => b'\t',
@@ -83,9 +96,23 @@ pub fn export_chapter_entries(
         }
         writer.write_record(&row)?;
     }
-
     writer.flush()?;
-    Ok(file_path)
+
+    // 2. Export single-column words text file
+    let words_filename = format!("chapter_{:02}_{}.txt", chapter_index, sanitized_title);
+    let words_path = words_dir.join(&words_filename);
+    let mut words_file = File::create(&words_path)
+        .with_context(|| format!("Failed to create words file: {:?}", words_path))?;
+
+    for entry in entries {
+        writeln!(words_file, "{}", entry.word)?;
+    }
+    words_file.flush()?;
+
+    Ok(ChapterExportPaths {
+        full_path,
+        words_path,
+    })
 }
 
 fn sanitize_filename(name: &str) -> String {
