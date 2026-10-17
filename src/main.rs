@@ -97,7 +97,11 @@ struct Args {
     scan_scope: ScanScope,
 }
 
-fn parse_chapter_selection(spec: &str, total_chapters: usize) -> Result<HashSet<usize>> {
+fn parse_chapter_selection(
+    spec: &str,
+    min_chapter: usize,
+    max_chapter: usize,
+) -> Result<HashSet<usize>> {
     let mut selected = HashSet::new();
     for part in spec.split(',') {
         let part = part.trim();
@@ -108,13 +112,13 @@ fn parse_chapter_selection(spec: &str, total_chapters: usize) -> Result<HashSet<
             let start: usize = start_str.trim().parse()?;
             let end: usize = end_str.trim().parse()?;
             for i in start..=end {
-                if i >= 1 && i <= total_chapters {
+                if i >= min_chapter && i <= max_chapter {
                     selected.insert(i);
                 }
             }
         } else {
             let num: usize = part.parse()?;
-            if num >= 1 && num <= total_chapters {
+            if num >= min_chapter && num <= max_chapter {
                 selected.insert(num);
             }
         }
@@ -183,9 +187,13 @@ fn main() -> Result<()> {
         bail!("No chapters could be extracted from {:?}", args.input);
     }
 
+    let min_chapter_index = all_chapters.iter().map(|ch| ch.index).min().unwrap_or(0);
+    let max_chapter_index = all_chapters.iter().map(|ch| ch.index).max().unwrap_or(0);
+    let pad_width = max_chapter_index.to_string().len().max(2);
+
     println!("Extracted {} chapters from book in {:?}", all_chapters.len(), t0.elapsed());
-    for (i, ch) in all_chapters.iter().take(5).enumerate() {
-        println!("  [{:>2}] {} ({} chars)", i + 1, ch.title, ch.text.chars().count());
+    for ch in all_chapters.iter().take(5) {
+        println!("  [{:>width$}] {} ({} chars)", ch.index, ch.title, ch.text.chars().count(), width = pad_width);
     }
     if all_chapters.len() > 5 {
         println!("  ... and {} more chapters", all_chapters.len() - 5);
@@ -194,11 +202,11 @@ fn main() -> Result<()> {
 
     // 2. Determine which chapters to output
     let selected_indices: HashSet<usize> = if let Some(ref spec) = args.chapters {
-        parse_chapter_selection(spec, all_chapters.len())?
+        parse_chapter_selection(spec, min_chapter_index, max_chapter_index)?
     } else if let Some(n) = args.num_chapters {
-        (1..=n.min(all_chapters.len())).collect()
+        all_chapters.iter().take(n).map(|ch| ch.index).collect()
     } else {
-        (1..=all_chapters.len()).collect()
+        all_chapters.iter().map(|ch| ch.index).collect()
     };
 
     println!("Selected {} chapter(s) for export:", selected_indices.len());
@@ -209,7 +217,7 @@ fn main() -> Result<()> {
     selected_chapters_list.sort_by_key(|ch| ch.index);
 
     for ch in &selected_chapters_list {
-        println!("  -> Chapter {:02}: {}", ch.index, ch.title);
+        println!("  -> Chapter {:0width$}: {}", ch.index, ch.title, width = pad_width);
     }
     println!("------------------------------------------------------------");
 
@@ -278,6 +286,7 @@ fn main() -> Result<()> {
             &entries,
             export_format,
             include_first_appearance_col,
+            pad_width,
         )?;
 
         total_exported_files.push(export_paths.full_path.clone());
@@ -288,8 +297,9 @@ fn main() -> Result<()> {
         };
 
         println!(
-            "Chapter {:02}: \"{}\"",
-            chapter.index, chapter.title
+            "Chapter {:0width$}: \"{}\"",
+            chapter.index, chapter.title,
+            width = pad_width
         );
         let filter_mode_desc = if hide_previous_words {
             "New words exported (seen words hidden, ranks preserved with holes)"

@@ -90,6 +90,8 @@ pub fn extract_pdf_chapters(path: &Path) -> Result<Vec<Chapter>> {
         });
     }
 
+    crate::models::adjust_chapter_indices(&mut chapters);
+
     Ok(chapters)
 }
 

@@ -21,6 +21,8 @@ A fast, precision Rust CLI tool designed for Japanese language learners and NLP 
 - **Two Parallel Output Formats (`full/` and `words/`)**:
   - `full/`: Comprehensive, visually aligned TSV/CSV tables with full statistics for analysis.
   - `words/`: Single-column `.txt` files containing only the target words (one per line) ready for instant import into Anki, yomitan, or flashcard apps.
+- **Prologue as Chapter 0**: When a book begins with a prologue (`プロローグ`, `序章`, `序`, `まえがき`, etc.), it is automatically detected and indexed as **Chapter 0**. This aligns subsequent story chapters naturally (e.g. `第一話` becomes Chapter 1).
+- **Dynamic Zero-Padded Filenames**: Filenames dynamically use leading zeros based on the total number of chapters in the book (e.g., `chapter_000`, `chapter_001`, ..., `chapter_285`), ensuring that operating system file managers and shell tools sort all chapters in exact numerical sequence.
 - **Blazing Fast**: Scans, tokenizes, and lemmatizes millions of words across hundreds of chapters in ~1 second using Rust.
 
 ---
@@ -48,13 +50,13 @@ By default, files are exported to a folder adjacent to the input file named `<fi
 ```text
 <input_file>_frequency/
 ├── full/
-│   ├── chapter_01_prologue.tsv
-│   ├── chapter_02_chapter_one.tsv
-│   └── chapter_03_chapter_two.tsv
+│   ├── chapter_000_prologue.tsv
+│   ├── chapter_001_chapter_one.tsv
+│   └── chapter_002_chapter_two.tsv
 └── words/
-    ├── chapter_01_prologue.txt
-    ├── chapter_02_chapter_one.txt
-    └── chapter_03_chapter_two.txt
+    ├── chapter_000_prologue.txt
+    ├── chapter_001_chapter_one.txt
+    └── chapter_002_chapter_two.txt
 ```
 
 ### 1. `words/` Directory
@@ -112,9 +114,10 @@ Disables hiding previously seen words, outputting all vocabulary for each chapte
 jpfe book.epub -n 3 --show-previous-words
 ```
 
-### 5. Process Specific Chapters (e.g., Chapters 1 through 5)
+### 5. Process Specific Chapters (e.g., Chapters 0 through 5 or 1 through 5)
 ```bash
-jpfe book.epub -c 1-5
+# If the book has a prologue, it is chapter 0:
+jpfe book.epub -c 0-5
 ```
 
 ### 6. Adjust Whole-Novel Minimum Count Threshold

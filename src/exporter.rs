@@ -26,6 +26,7 @@ pub fn export_chapter_entries(
     entries: &[WordEntry],
     format: ExportFormat,
     include_first_appearance_col: bool,
+    pad_width: usize,
 ) -> Result<ChapterExportPaths> {
     let full_dir = output_dir.join("full");
     let words_dir = output_dir.join("words");
@@ -79,7 +80,11 @@ pub fn export_chapter_entries(
     }
 
     // 2. Export full statistics table
-    let full_filename = format!("chapter_{:02}_{}.{}", chapter_index, sanitized_title, extension);
+    let full_filename = format!(
+        "chapter_{:0width$}_{}.{}",
+        chapter_index, sanitized_title, extension,
+        width = pad_width
+    );
     let full_path = full_dir.join(&full_filename);
 
     match format {
@@ -122,7 +127,11 @@ pub fn export_chapter_entries(
     }
 
     // 3. Export single-column words text file
-    let words_filename = format!("chapter_{:02}_{}.txt", chapter_index, sanitized_title);
+    let words_filename = format!(
+        "chapter_{:0width$}_{}.txt",
+        chapter_index, sanitized_title,
+        width = pad_width
+    );
     let words_path = words_dir.join(&words_filename);
     let mut words_file = File::create(&words_path)
         .with_context(|| format!("Failed to create words file: {:?}", words_path))?;
