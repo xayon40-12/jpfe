@@ -1,6 +1,6 @@
-# Japanese Novel Word Frequency Extractor (`frequency_extraction`)
+# `jpfe`: Japanese Novel Word Frequency Extractor
 
-A high-performance Rust CLI tool designed for Japanese language learners and NLP workflows to extract per-chapter word frequencies from **EPUB** and **PDF** books and light novels.
+A fast, precision Rust CLI tool designed for Japanese language learners and NLP workflows to extract per-chapter vocabulary frequencies from **EPUB** and **PDF** books and light novels.
 
 ---
 
@@ -19,9 +19,25 @@ A high-performance Rust CLI tool designed for Japanese language learners and NLP
 - **Target Vocabulary Coverage (Default: 99.0%)**: Calculates running cumulative frequency percentages and filters down to any chosen threshold (e.g., 99%, 95%, 90%) to prioritize high-yield words.
 - **Hiding Previously Seen Words (Default: Active)**: Automatically hides words that already appeared in earlier chapters while preserving the word's true chapter rank (creating natural rank "holes"). This allows learners to focus strictly on new vocabulary introduced in each chapter.
 - **Two Parallel Output Formats (`full/` and `words/`)**:
-  - `full/`: Comprehensive, aligned TSV/CSV tables with full statistics for analysis.
+  - `full/`: Comprehensive, visually aligned TSV/CSV tables with full statistics for analysis.
   - `words/`: Single-column `.txt` files containing only the target words (one per line) ready for instant import into Anki, yomitan, or flashcard apps.
 - **Blazing Fast**: Scans, tokenizes, and lemmatizes millions of words across hundreds of chapters in ~1 second using Rust.
+
+---
+
+## Installation & Build
+
+### Install globally with Cargo:
+```bash
+cargo install --path .
+```
+This installs the `jpfe` binary into your `~/.cargo/bin` directory, making it available system-wide.
+
+### Or build locally:
+```bash
+cargo build --release
+```
+The compiled binary will be located at `./target/release/jpfe`.
 
 ---
 
@@ -71,68 +87,56 @@ Contains visually aligned tab-separated (`.tsv`) or comma-separated (`.csv`) fil
 
 ---
 
-## Build
-
-Compile the release binary with Cargo:
-
-```bash
-cargo build --release
-```
-
-The compiled binary will be located at `./target/release/frequency_extraction`.
-
----
-
 ## Usage Examples
 
 ### 1. Default Run on an EPUB (First 3 Chapters)
 Exports the first 3 chapters to `<path>/book.epub_frequency/` with default 99% coverage, minimum whole-book count of 3, and previously seen words hidden:
 ```bash
-./target/release/frequency_extraction path/to/book.epub -n 3
+jpfe path/to/book.epub -n 3
 ```
 
 ### 2. Default Run on a PDF
 ```bash
-./target/release/frequency_extraction path/to/book.pdf -n 3
+jpfe path/to/book.pdf -n 3
 ```
 
 ### 3. Custom Output Directory
 Specify an explicit output path using `-o`:
 ```bash
-./target/release/frequency_extraction book.epub -n 3 -o my_vocab_output
+jpfe book.epub -n 3 -o my_vocab_output
 ```
 
 ### 4. Show All Words (Including Previously Seen Words)
 Disables hiding previously seen words, outputting all vocabulary for each chapter along with the `first_appearance_chapter` column:
 ```bash
-./target/release/frequency_extraction book.epub -n 3 --show-previous-words
+jpfe book.epub -n 3 --show-previous-words
 ```
 
 ### 5. Process Specific Chapters (e.g., Chapters 1 through 5)
 ```bash
-./target/release/frequency_extraction book.epub -c 1-5
+jpfe book.epub -c 1-5
 ```
 
 ### 6. Adjust Whole-Novel Minimum Count Threshold
 To include words appearing at least 5 times across the whole novel (or set to 1 to include all words):
 ```bash
-./target/release/frequency_extraction book.epub -n 3 -m 5
+jpfe book.epub -n 3 -m 5
 ```
 
 ### 7. Custom Target Percentage (e.g., Top 95%)
 ```bash
-./target/release/frequency_extraction book.epub -n 3 -p 95.0
+jpfe book.epub -n 3 -p 95.0
 ```
 
 ### 8. Extract Content Words Only (Nouns, Verbs, Adjectives, Adverbs)
 Excludes grammatical particles (`助詞`) and auxiliary verbs (`助動詞`):
 ```bash
-./target/release/frequency_extraction book.epub -n 3 --content-only
+jpfe book.epub -n 3 --content-only
 ```
 
 ### 9. Export in CSV Format with Katakana Readings
 ```bash
-./target/release/frequency_extraction book.epub -n 3 --reading katakana --format csv
+jpfe book.epub -n 3 --reading katakana --format csv
 ```
 
 ---

@@ -521,23 +521,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "frequency_extraction"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "csv",
- "lindera",
- "lopdf",
- "rayon",
- "regex",
- "roxmltree",
- "serde",
- "unicode-width",
- "zip",
-]
-
-[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -827,6 +810,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
  "jiff-tzdb",
+]
+
+[[package]]
+name = "jpfe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "csv",
+ "lindera",
+ "lopdf",
+ "rayon",
+ "regex",
+ "roxmltree",
+ "serde",
+ "unicode-width",
+ "zip",
 ]
 
 [[package]]

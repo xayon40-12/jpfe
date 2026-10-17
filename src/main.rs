@@ -38,7 +38,7 @@ enum ScanScope {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "frequency_extraction",
+    name = "jpfe",
     author = "Japanese Novel Frequency Analyzer",
     version = "0.1.0",
     about = "Extract word frequencies per chapter from Japanese EPUB or PDF books with base-form lemmatization."
