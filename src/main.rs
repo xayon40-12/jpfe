@@ -72,7 +72,11 @@ struct Args {
     #[arg(long = "reading", value_enum, default_value_t = ReadingFormat::Hiragana)]
     reading: ReadingFormat,
 
-    /// Only include content words (exclude particles and auxiliary verbs)
+    /// Include grammatical particles (助詞) and auxiliary verbs (助動詞) (default: false, clean vocabulary only)
+    #[arg(long = "include-particles", visible_alias = "include-grammar", default_value_t = false)]
+    include_particles: bool,
+
+    /// Filter to content words only (nouns, verbs, adjectives, adverbs) [default behavior]
     #[arg(long = "content-only", default_value_t = false)]
     content_only: bool,
 
@@ -155,7 +159,7 @@ fn main() -> Result<()> {
     println!("Target cumulative percentage: {:.1}%", args.target_percentage);
     println!("Min occurrences in whole novel: {}", args.min_book_count);
     println!("Pronunciation: {:?}", args.reading);
-    println!("Content words only: {}", args.content_only);
+    println!("Grammar filtering: {}", if args.include_particles { "Particles/auxiliaries included" } else { "Clean vocabulary only (particles, affixes, contractions excluded)" });
     println!("Hide previously seen words: {}", hide_previous_words);
     println!("------------------------------------------------------------");
 
@@ -223,7 +227,7 @@ fn main() -> Result<()> {
 
     // 3. Initialize tokenizer
     let reading_in_hiragana = matches!(args.reading, ReadingFormat::Hiragana);
-    let include_particles = !args.content_only;
+    let include_particles = args.include_particles;
 
     println!("Initializing Japanese morphological tokenizer (Lindera + UniDic)...");
     let mut tokenizer = JapaneseTokenizer::new(

@@ -67,7 +67,12 @@ impl JapaneseTokenizer {
                 continue;
             }
 
-            // Filter out particles and auxiliaries if not requested
+            // Filter out bound affixes (suffixes and prefixes) which cannot stand as independent words
+            if pos == "接尾辞" || pos == "接頭辞" {
+                continue;
+            }
+
+            // Filter out particles and auxiliaries by default unless requested
             if !self.include_particles && (pos == "助詞" || pos == "助動詞") {
                 continue;
             }
@@ -133,6 +138,11 @@ impl JapaneseTokenizer {
 
             // Filter out empty, whitespace, pure punctuation, symbols, or standalone dashes/ellipses
             if !is_valid_word(&base_word) {
+                continue;
+            }
+
+            // Filter out spurious colloquial contractions, slang fragments, archaic auxiliaries, and single-kana fragments
+            if is_problematic_word(&base_word, &pos) {
                 continue;
             }
 
@@ -255,3 +265,43 @@ pub fn is_valid_word(s: &str) -> bool {
 
     true
 }
+
+pub fn is_problematic_word(word: &str, pos: &str) -> bool {
+    // 1. Bound affixes (prefixes and suffixes) cannot stand alone as independent words
+    if pos == "接尾辞" || pos == "接頭辞" {
+        return true;
+    }
+
+    // 2. Single-character hiragana words (in Japanese text, almost all single-kana words
+    // are particles, auxiliaries, or noise fragments, causing false homophone lookups in flashcard dictionaries)
+    if word.chars().count() == 1 && word.chars().all(is_hiragana) {
+        return true;
+    }
+
+    // 3. Problematic words across Categories 1 to 4
+    match word {
+        // Category 1: Colloquial Verb Contractions (口語縮約形・補助動詞)
+        "てる" | "でる" | "とく" | "どく" | "ちゃう" | "ちまう" | "じゃう" | "じまう"
+        | "でく" | "てく" | "とる" | "とれる" | "とける" | "たげる"
+        | "てらっしゃる" | "てらしゃる" | "でらっしゃる" | "でらしゃる"
+        | "しめる" | "よる" | "はる" | "やがる" | "たがる" => true,
+
+        // Category 2: Colloquial Slang & Speech Particles (口語短縮・音変化)
+        "もん" | "っつう" | "つう" | "っちゅう" | "ちゅう" | "ちゃ" | "じゃ" | "ん"
+        | "っす" | "でちゅ" | "みてえ" | "みてぇ" | "みたく"
+        | "そりゃ" | "こりゃ" | "ありゃ" | "トコ" | "とこ" | "っけ" | "っと" => true,
+
+        // Category 3: Archaic & Classical Grammar Auxiliaries (文語助動詞・古典語尾)
+        "まじ" | "む" | "べし" | "まい" | "ぬ" | "ず" | "り" | "き" | "る" | "ど" => true,
+
+        // Category 4: Bound Suffixes/Prefixes & Kinship/Phrase Fragments (接頭辞・接尾辞・語の分断)
+        "っぽい" | "ぽい" | "やすい" | "にくい" | "づらい" | "がたい" | "くさい"
+        | "がましい" | "ったらしい" | "たらしい" | "げ" | "だらけ" | "っぱなし"
+        | "がち" | "まとい" | "ごかし" | "ぶり" | "め" | "さ" | "み" | "がる" | "ぶる"
+        | "ら" | "たち" | "ども" | "ちゃん" | "さん" | "さま" | "お" | "ご"
+        | "じい" | "とう" | "おじ" | "おば" | "ま" | "い" => true,
+
+        _ => false,
+    }
+}
+
