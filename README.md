@@ -320,6 +320,4 @@ Within each chapter, vocabulary is sorted using a multi-level priority:
 | `--ratio-scale` | | `log` | Y-axis scale of the normalized ratio plot: `log` or `linear` |
 | `--words-scale` | | `log` | Y-axis scale of the filtered word count plot: `log` or `linear` |
 | `--chars-scale` | | `linear` | Y-axis scale of the character count plot: `log` or `linear` |
-| `--content-only` | | `false` | Deprecated alias (content words only is now the default) |
 | `--dict-path` | | `None` | Path to optional external MeCab/Lindera dictionary directory |
-| `--scan-scope` | | `full` | `full` (scans whole novel for global counts) or `selected` |

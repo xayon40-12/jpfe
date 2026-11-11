@@ -1,13 +1,9 @@
-use serde::Serialize;
-
-#[derive(Debug, Clone)]
 pub struct Chapter {
     pub index: usize,
     pub title: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
 pub struct WordEntry {
     pub rank: usize,
     pub word: String,
@@ -22,30 +18,15 @@ pub struct WordEntry {
 }
 
 pub fn is_prologue_title(title: &str) -> bool {
-    let trimmed = title.trim().trim_matches(|c: char| {
-        c == '【' || c == '】' || c == '「' || c == '」' || c == '『' || c == '』'
-            || c == '[' || c == ']' || c == '(' || c == ')' || c == '　'
-    });
+    let trimmed = title.trim().trim_matches(&['【', '】', '「', '」', '『', '』', '[', ']', '(', ')', '　'][..]);
     let lower = trimmed.to_lowercase();
-    lower.starts_with("プロローグ")
-        || lower.starts_with("序章")
-        || lower == "序"
-        || lower.starts_with("まえがき")
-        || lower.starts_with("前書き")
-        || lower.starts_with("prologue")
-        || lower.starts_with("intro")
+    ["プロローグ", "序章", "まえがき", "前書き", "prologue", "intro"].iter().any(|p| lower.starts_with(p)) || lower == "序"
 }
 
+/// Number chapters from 0 when the book opens with a prologue, otherwise from 1.
 pub fn adjust_chapter_indices(chapters: &mut [Chapter]) {
-    if chapters.is_empty() {
-        return;
-    }
-    let has_prologue = is_prologue_title(&chapters[0].title);
+    let offset = usize::from(!chapters.first().is_some_and(|c| is_prologue_title(&c.title)));
     for (i, ch) in chapters.iter_mut().enumerate() {
-        if has_prologue {
-            ch.index = i; // 0, 1, 2, ...
-        } else {
-            ch.index = i + 1; // 1, 2, 3, ...
-        }
+        ch.index = i + offset;
     }
 }

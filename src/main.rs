@@ -7,15 +7,14 @@ mod statistics;
 mod tokenizer;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
 
 use crate::epub::extract_epub_chapters;
-use crate::exporter::{export_chapter_entries, ExportFormat};
+use crate::exporter::{export_chapter_entries, pad, ExportFormat};
 use crate::frequency::FrequencyAnalyzer;
-use crate::models::Chapter;
 use crate::pdf::extract_pdf_chapters;
 use crate::statistics::{export_statistics, vocabulary_ratio, ChapterStat, ChartScales, Scale};
 use crate::tokenizer::JapaneseTokenizer;
@@ -26,23 +25,11 @@ enum ReadingFormat {
     Katakana,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    Tsv,
-    Csv,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ScanScope {
-    Full,
-    Selected,
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "jpfe",
     author = "Japanese Novel Frequency Analyzer",
-    version = "0.1.0",
+    version,
     about = "Extract word frequencies per chapter from Japanese EPUB or PDF books with base-form lemmatization."
 )]
 struct Args {
@@ -59,7 +46,7 @@ struct Args {
     target_percentage: f64,
 
     /// Number of chapters to output (e.g. 3 for first 3 chapters)
-    #[arg(short = 'n', long = "num-chapters")]
+    #[arg(short = 'n', long = "num-chapters", conflicts_with = "chapters")]
     num_chapters: Option<usize>,
 
     /// Specific chapter numbers or ranges to output (e.g. '1,2,3' or '1-3')
@@ -67,8 +54,8 @@ struct Args {
     chapters: Option<String>,
 
     /// Output file format
-    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Tsv)]
-    format: OutputFormat,
+    #[arg(long = "format", value_enum, default_value_t = ExportFormat::Tsv)]
+    format: ExportFormat,
 
     /// Pronunciation format
     #[arg(long = "reading", value_enum, default_value_t = ReadingFormat::Hiragana)]
@@ -77,10 +64,6 @@ struct Args {
     /// Include grammatical particles (助詞) and auxiliary verbs (助動詞) (default: false, clean vocabulary only)
     #[arg(long = "include-particles", visible_alias = "include-grammar", default_value_t = false)]
     include_particles: bool,
-
-    /// Filter to content words only (nouns, verbs, adjectives, adverbs) [default behavior]
-    #[arg(long = "content-only", default_value_t = false)]
-    content_only: bool,
 
     /// Minimum occurrences across the entire novel to be included (default: 3)
     #[arg(short = 'm', long = "min-book-count", visible_alias = "min-count", default_value_t = 3)]
@@ -98,10 +81,6 @@ struct Args {
     #[arg(long = "dict-path")]
     dict_path: Option<PathBuf>,
 
-    /// Book-wide scanning scope for whole-book frequency and first-appearance chapter calculation
-    #[arg(long = "scan-scope", value_enum, default_value_t = ScanScope::Full)]
-    scan_scope: ScanScope,
-
     /// Y-axis scale of the normalized vocabulary ratio plot
     #[arg(long = "ratio-scale", value_enum, default_value_t = Scale::Log)]
     ratio_scale: Scale,
@@ -115,79 +94,45 @@ struct Args {
     chars_scale: Scale,
 }
 
-fn parse_chapter_selection(
-    spec: &str,
-    min_chapter: usize,
-    max_chapter: usize,
-) -> Result<HashSet<usize>> {
+fn parse_chapter_selection(spec: &str, valid: std::ops::RangeInclusive<usize>) -> Result<HashSet<usize>> {
     let mut selected = HashSet::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (start, end) = part.split_once('-').unwrap_or((part, part));
+        let (start, end): (usize, usize) = (start.trim().parse()?, end.trim().parse()?);
+        if start > end {
+            bail!("Invalid chapter range '{part}': start is after end");
         }
-        if let Some((start_str, end_str)) = part.split_once('-') {
-            let start: usize = start_str.trim().parse()?;
-            let end: usize = end_str.trim().parse()?;
-            for i in start..=end {
-                if i >= min_chapter && i <= max_chapter {
-                    selected.insert(i);
-                }
-            }
-        } else {
-            let num: usize = part.parse()?;
-            if num >= min_chapter && num <= max_chapter {
-                selected.insert(num);
-            }
-        }
+        selected.extend((start..=end).filter(|i| valid.contains(i)));
     }
     Ok(selected)
 }
 
+const RULE: &str = "------------------------------------------------------------";
+const BANNER: &str = "============================================================";
+
 fn main() -> Result<()> {
     let args = Args::parse();
-
     if !args.input.exists() {
         bail!("Input file does not exist: {:?}", args.input);
     }
+    let output_dir = args.output_dir.clone().unwrap_or_else(|| {
+        let name = args.input.file_name().map_or("output".into(), |s| s.to_string_lossy());
+        args.input.parent().unwrap_or(Path::new("")).join(format!("{name}_frequency"))
+    });
+    let hide_previous_words = !args.show_previous_words;
 
-    let output_dir = match args.output_dir {
-        Some(dir) => dir,
-        None => {
-            let parent = args.input.parent().unwrap_or_else(|| std::path::Path::new(""));
-            let file_name = args
-                .input
-                .file_name()
-                .map(|s| s.to_string_lossy())
-                .unwrap_or_else(|| std::borrow::Cow::Borrowed("output"));
-            parent.join(format!("{}_frequency", file_name))
-        }
-    };
-
-    println!("============================================================");
-    println!("  Japanese Novel Word Frequency & Vocabulary Extractor");
-    println!("============================================================");
+    println!("{BANNER}\n  Japanese Novel Word Frequency & Vocabulary Extractor\n{BANNER}");
     println!("Input: {:?}", args.input);
     println!("Output directory: {:?}", output_dir);
-    let hide_previous_words = !args.show_previous_words;
     println!("Target cumulative percentage: {:.1}%", args.target_percentage);
     println!("Min occurrences in whole novel: {}", args.min_book_count);
     println!("Pronunciation: {:?}", args.reading);
     println!("Grammar filtering: {}", if args.include_particles { "Particles/auxiliaries included" } else { "Clean vocabulary only (particles, affixes, contractions excluded)" });
-    println!("Hide previously seen words: {}", hide_previous_words);
-    println!("------------------------------------------------------------");
+    println!("Hide previously seen words: {hide_previous_words}\n{RULE}");
 
     let t0 = Instant::now();
-
-    // 1. Extract chapters from EPUB or PDF
-    let ext = args
-        .input
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let all_chapters: Vec<Chapter> = match ext.as_str() {
+    let ext = args.input.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let chapters = match ext.as_str() {
         "epub" => {
             println!("Reading EPUB structure and chapters...");
             extract_epub_chapters(&args.input)?
@@ -196,265 +141,119 @@ fn main() -> Result<()> {
             println!("Reading PDF and detecting chapter boundaries...");
             extract_pdf_chapters(&args.input)?
         }
-        _ => {
-            bail!("Unsupported file format: '.{}'. Supported formats: epub, pdf", ext);
-        }
+        _ => bail!("Unsupported file format: '.{}'. Supported formats: epub, pdf", ext),
     };
-
-    if all_chapters.is_empty() {
+    // Indices are consecutive (see adjust_chapter_indices)
+    let (Some(first), Some(last)) = (chapters.first(), chapters.last()) else {
         bail!("No chapters could be extracted from {:?}", args.input);
-    }
-
-    let min_chapter_index = all_chapters.iter().map(|ch| ch.index).min().unwrap_or(0);
-    let max_chapter_index = all_chapters.iter().map(|ch| ch.index).max().unwrap_or(0);
-    let pad_width = max_chapter_index.to_string().len().max(2);
-
-    println!("Extracted {} chapters from book in {:?}", all_chapters.len(), t0.elapsed());
-    for ch in all_chapters.iter().take(5) {
-        println!("  [{:>width$}] {} ({} chars)", ch.index, ch.title, ch.text.chars().count(), width = pad_width);
-    }
-    if all_chapters.len() > 5 {
-        println!("  ... and {} more chapters", all_chapters.len() - 5);
-    }
-    println!("------------------------------------------------------------");
-
-    // 2. Determine which chapters to output
-    let selected_indices: HashSet<usize> = if let Some(ref spec) = args.chapters {
-        parse_chapter_selection(spec, min_chapter_index, max_chapter_index)?
-    } else if let Some(n) = args.num_chapters {
-        all_chapters.iter().take(n).map(|ch| ch.index).collect()
-    } else {
-        all_chapters.iter().map(|ch| ch.index).collect()
     };
+    let pad_width = last.index.to_string().len().max(2);
+    let char_counts: Vec<usize> = chapters.iter().map(|ch| ch.text.chars().count()).collect();
 
-    println!("Selected {} chapter(s) for export:", selected_indices.len());
-    let mut selected_chapters_list: Vec<&Chapter> = all_chapters
-        .iter()
-        .filter(|ch| selected_indices.contains(&ch.index))
-        .collect();
-    selected_chapters_list.sort_by_key(|ch| ch.index);
-
-    for ch in &selected_chapters_list {
-        println!("  -> Chapter {:0width$}: {}", ch.index, ch.title, width = pad_width);
+    println!("Extracted {} chapters from book in {:?}", chapters.len(), t0.elapsed());
+    for (ch, chars) in chapters.iter().zip(&char_counts).take(5) {
+        println!("  [{:>pad_width$}] {} ({} chars)", ch.index, ch.title, chars);
     }
-    println!("------------------------------------------------------------");
+    if chapters.len() > 5 {
+        println!("  ... and {} more chapters", chapters.len() - 5);
+    }
+    println!("{RULE}");
 
-    // 3. Initialize tokenizer
-    let reading_in_hiragana = matches!(args.reading, ReadingFormat::Hiragana);
-    let include_particles = args.include_particles;
+    let selected: HashSet<usize> = match (&args.chapters, args.num_chapters) {
+        (Some(spec), _) => parse_chapter_selection(spec, first.index..=last.index)?,
+        (None, Some(n)) => chapters.iter().take(n).map(|ch| ch.index).collect(),
+        (None, None) => chapters.iter().map(|ch| ch.index).collect(),
+    };
+    println!("Selected {} chapter(s) for export:", selected.len());
+    for ch in chapters.iter().filter(|ch| selected.contains(&ch.index)) {
+        println!("  -> Chapter {:0pad_width$}: {}", ch.index, ch.title);
+    }
+    println!("{RULE}");
 
     println!("Initializing Japanese morphological tokenizer (Lindera + UniDic)...");
-    let mut tokenizer = JapaneseTokenizer::new(
-        args.dict_path.as_deref(),
-        reading_in_hiragana,
-        include_particles,
-    )?;
+    let reading_in_hiragana = matches!(args.reading, ReadingFormat::Hiragana);
+    let mut tokenizer = JapaneseTokenizer::new(args.dict_path.as_deref(), reading_in_hiragana, args.include_particles)?;
 
-    // 4. Build frequency analyzer across the book
     let t_tokenize = Instant::now();
-    let chapters_to_scan = match args.scan_scope {
-        ScanScope::Full => &all_chapters[..],
-        ScanScope::Selected => {
-            println!("Scanning selected chapters only...");
-            // Use only selected chapters
-            &all_chapters[..] // handled below by filtering if needed
-        }
-    };
-
+    println!("Tokenizing and calculating book-wide vocabulary statistics across {} chapters...", chapters.len());
+    let (analyzer, tokenized_chapters) = FrequencyAnalyzer::build(&mut tokenizer, &chapters)?;
     println!(
-        "Tokenizing and calculating book-wide vocabulary statistics across {} chapters...",
-        chapters_to_scan.len()
-    );
-    let (analyzer, tokenized_chapters) = FrequencyAnalyzer::build(&mut tokenizer, chapters_to_scan)?;
-    println!(
-        "Processed {} total words ({} unique base vocabulary) across entire book in {:?}",
-        analyzer.book_total_words,
-        analyzer.book_word_counts.len(),
+        "Processed {} total words ({} unique base vocabulary) across entire book in {:?}\n{RULE}",
+        analyzer.total_words,
+        analyzer.words.len(),
         t_tokenize.elapsed()
     );
-    println!("------------------------------------------------------------");
 
-    // 5. Analyze and export each selected chapter
-    let export_format = match args.format {
-        OutputFormat::Tsv => ExportFormat::Tsv,
-        OutputFormat::Csv => ExportFormat::Csv,
+    let show_first_seen = args.show_previous_words || args.show_first_appearance;
+    let analyze = |i: usize| {
+        analyzer.analyze_chapter(i, &tokenized_chapters[i], args.target_percentage, args.min_book_count, hide_previous_words)
     };
-    let include_first_appearance_col = args.show_previous_words || args.show_first_appearance;
-
-    let mut total_exported_files = Vec::new();
-
-    // Vocabulary-ratio baseline: the first chapter (index 0 if it is a prologue, otherwise chapter 1)
-    let baseline_chapter = &all_chapters[0];
-    let baseline_ratio = vocabulary_ratio(
-        analyzer
-            .analyze_chapter(
-                &baseline_chapter.title,
-                &tokenized_chapters[0],
-                args.target_percentage,
-                args.min_book_count,
-                hide_previous_words,
-            )
-            .len(),
-        baseline_chapter.text.chars().count(),
-    );
+    // Vocabulary-ratio baseline: the first chapter (the prologue if there is one, otherwise chapter 1)
+    let baseline_ratio = vocabulary_ratio(analyze(0).len(), char_counts[0]);
+    let filter_mode_desc = if hide_previous_words {
+        "New words exported (seen words hidden, ranks preserved with holes)"
+    } else {
+        "Words exported"
+    };
     let mut chapter_stats = Vec::new();
 
-    for (chapter_idx, chapter) in all_chapters.iter().enumerate() {
-        if !selected_indices.contains(&chapter.index) {
-            continue;
-        }
+    for (i, chapter) in chapters.iter().enumerate().filter(|(_, ch)| selected.contains(&ch.index)) {
+        let tokens = &tokenized_chapters[i];
+        let entries = analyze(i);
+        let paths = export_chapter_entries(&output_dir, chapter.index, &chapter.title, &entries, args.format, show_first_seen, pad_width)?;
+        chapter_stats.push(ChapterStat::new(chapter.index, &chapter.title, entries.len(), char_counts[i], baseline_ratio));
+        let unique = tokens.iter().map(|t| t.base_word.as_str()).collect::<HashSet<_>>().len();
 
-        let chapter_tokens = &tokenized_chapters[chapter_idx];
-        let entries = analyzer.analyze_chapter(
-            &chapter.title,
-            chapter_tokens,
-            args.target_percentage,
-            args.min_book_count,
-            hide_previous_words,
-        );
-
-        let export_paths = export_chapter_entries(
-            &output_dir,
-            chapter.index,
-            &chapter.title,
-            &entries,
-            export_format,
-            include_first_appearance_col,
-            pad_width,
-        )?;
-
-        total_exported_files.push(export_paths.full_path.clone());
-
-        chapter_stats.push(ChapterStat::new(
-            chapter.index,
-            &chapter.title,
-            entries.len(),
-            chapter.text.chars().count(),
-            baseline_ratio,
-        ));
-
-        let total_unique_in_ch = {
-            let set: HashSet<&str> = chapter_tokens.iter().map(|t| t.base_word.as_str()).collect();
-            set.len()
-        };
-
-        println!(
-            "Chapter {:0width$}: \"{}\"",
-            chapter.index, chapter.title,
-            width = pad_width
-        );
-        let filter_mode_desc = if hide_previous_words {
-            "New words exported (seen words hidden, ranks preserved with holes)"
-        } else {
-            "Words exported"
-        };
-        println!(
-            "  Tokens: {} | Total unique words: {} | {}: {}",
-            chapter_tokens.len(),
-            total_unique_in_ch,
-            filter_mode_desc,
-            entries.len()
-        );
-        println!("  Full stats: {}", export_paths.full_path.display());
-        println!("  Words list: {}", export_paths.words_path.display());
-
-        // Print top preview
+        println!("Chapter {:0pad_width$}: \"{}\"", chapter.index, chapter.title);
+        println!("  Tokens: {} | Total unique words: {} | {}: {}", tokens.len(), unique, filter_mode_desc, entries.len());
+        println!("  Full stats: {}", paths.full_path.display());
+        println!("  Words list: {}", paths.words_path.display());
         println!("  Vocabulary preview:");
-        if include_first_appearance_col {
-            println!(
-                "    {} {} {} {} {} {} {} {}",
-                pad_display("Rank", 5),
-                pad_display("Word", 12),
-                pad_display("Reading", 14),
-                pad_display("POS", 8),
-                pad_display("Count", 6),
-                pad_display("Chapter%", 9),
-                pad_display("Cumul%", 8),
-                pad_display("First Seen", 12),
-            );
-            for e in entries.iter().take(8) {
-                let first_seen_short: String = e.first_appearance_chapter.chars().take(10).collect();
-                println!(
-                    "    {} {} {} {} {} {} {} {}",
-                    pad_display(&e.rank.to_string(), 5),
-                    pad_display(&e.word, 12),
-                    pad_display(&e.pronunciation, 14),
-                    pad_display(&e.pos, 8),
-                    pad_display(&e.occurrences.to_string(), 6),
-                    pad_display(&e.chapter_percent, 9),
-                    pad_display(&e.cumulative_percent, 8),
-                    pad_display(&first_seen_short, 12),
-                );
-            }
-        } else {
-            println!(
-                "    {} {} {} {} {} {} {}",
-                pad_display("Rank", 5),
-                pad_display("Word", 12),
-                pad_display("Reading", 14),
-                pad_display("POS", 8),
-                pad_display("Count", 6),
-                pad_display("Chapter%", 9),
-                pad_display("Cumul%", 8),
-            );
-            for e in entries.iter().take(8) {
-                println!(
-                    "    {} {} {} {} {} {} {}",
-                    pad_display(&e.rank.to_string(), 5),
-                    pad_display(&e.word, 12),
-                    pad_display(&e.pronunciation, 14),
-                    pad_display(&e.pos, 8),
-                    pad_display(&e.occurrences.to_string(), 6),
-                    pad_display(&e.chapter_percent, 9),
-                    pad_display(&e.cumulative_percent, 8),
-                );
-            }
+        let header = ["Rank", "Word", "Reading", "POS", "Count", "Chapter%", "Cumul%", "First Seen"].map(String::from);
+        let rows = entries.iter().take(8).map(|e| {
+            [
+                e.rank.to_string(), e.word.clone(), e.pronunciation.clone(), e.pos.clone(), e.occurrences.to_string(),
+                e.chapter_percent.clone(), e.cumulative_percent.clone(), e.first_appearance_chapter.chars().take(10).collect(),
+            ]
+        });
+        let columns = if show_first_seen { 8 } else { 7 };
+        for row in std::iter::once(header).chain(rows) {
+            let cells: Vec<String> = row.iter().zip([5, 12, 14, 8, 6, 9, 8, 12]).take(columns).map(|(c, w)| pad(c, w)).collect();
+            println!("    {}", cells.join(" "));
         }
         println!();
     }
 
-    // Export statistics (filtered words / characters, normalized by the first chapter)
     if !chapter_stats.is_empty() {
-        let scales = ChartScales {
-            ratio: args.ratio_scale,
-            words: args.words_scale,
-            characters: args.chars_scale,
-        };
-        let stats_paths = export_statistics(&output_dir, &chapter_stats, export_format, scales)?;
-
-        println!("------------------------------------------------------------");
-        println!("Vocabulary Density Statistics:");
+        let scales = ChartScales { ratio: args.ratio_scale, words: args.words_scale, characters: args.chars_scale };
+        let stats_paths = export_statistics(&output_dir, &chapter_stats, args.format, scales)?;
+        println!("{RULE}\nVocabulary Density Statistics:");
         println!("  Table:     {}", stats_paths.table_path.display());
         println!("  SVG chart: {}", stats_paths.svg_path.display());
-        println!(
-            "  Scales:    Ratio = {:?} | Words = {:?} | Characters = {:?}",
-            scales.ratio, scales.words, scales.characters
-        );
-        println!(
-            "  Baseline:  Ch {:0width$} \"{}\" (raw ratio: {:.6})",
-            baseline_chapter.index,
-            baseline_chapter.title,
-            baseline_ratio,
-            width = pad_width
-        );
-        println!();
+        println!("  Scales:    Ratio = {:?} | Words = {:?} | Characters = {:?}", scales.ratio, scales.words, scales.characters);
+        println!("  Baseline:  Ch {:0pad_width$} \"{}\" (raw ratio: {:.6})\n", first.index, first.title, baseline_ratio);
     }
 
-    println!("============================================================");
-    println!(
-        "Successfully exported {} chapter files in {:?}",
-        total_exported_files.len(),
-        t0.elapsed()
-    );
+    println!("{BANNER}");
+    println!("Successfully exported {} chapter files in {:?}", chapter_stats.len(), t0.elapsed());
     println!("Output directory: {}", std::fs::canonicalize(&output_dir)?.display());
-    println!("============================================================");
-
+    println!("{BANNER}");
     Ok(())
 }
 
-fn pad_display(s: &str, target_width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    let w = s.width();
-    let pad = target_width.saturating_sub(w);
-    format!("{}{}", s, " ".repeat(pad))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_chapter_selection() {
+        let selected = parse_chapter_selection("1, 3-5,9-12", 0..=10).unwrap();
+        assert_eq!(selected, HashSet::from([1, 3, 4, 5, 9, 10]));
+        assert!(parse_chapter_selection("5-3", 0..=10).is_err());
+    }
+
+    #[test]
+    fn chapters_and_num_chapters_conflict() {
+        assert!(Args::try_parse_from(["jpfe", "book.epub", "-c", "1", "-n", "2"]).is_err());
+    }
 }
