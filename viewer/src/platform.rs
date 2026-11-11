@@ -37,6 +37,14 @@ impl Inbox {
     }
 }
 
+/// A message for whoever investigates (the browser console on the web).
+pub fn log(message: &str) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::log_1(&message.into());
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{message}");
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 #[cfg(target_arch = "wasm32")]

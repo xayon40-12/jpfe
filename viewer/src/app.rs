@@ -43,6 +43,51 @@ enum DictionaryState {
     Failed(String),
 }
 
+/// How long the steps of this page load took, shown in the sidebar (loading is slow on some phones).
+struct LoadTimes {
+    started: Instant,
+    /// Total time of each step, in the order they first happened
+    steps: Vec<(&'static str, f64)>,
+    /// When the current download or storage read of the dictionary started
+    fetching_since: Option<Instant>,
+    /// Seconds until the saved books were shown (some may still need analyzing)
+    books: Option<f64>,
+    /// Seconds until the dictionary and every book were ready
+    total: Option<f64>,
+}
+
+impl LoadTimes {
+    fn new() -> Self {
+        Self { started: Instant::now(), steps: Vec::new(), fetching_since: None, books: None, total: None }
+    }
+
+    fn add(&mut self, step: &'static str, seconds: f64) {
+        match self.steps.iter_mut().find(|(s, _)| *s == step) {
+            Some((_, total)) => *total += seconds,
+            None => self.steps.push((step, seconds)),
+        }
+    }
+
+    fn timed<T>(&mut self, step: &'static str, work: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let result = work();
+        self.add(step, start.elapsed().as_secs_f64());
+        result
+    }
+
+    fn fetched(&mut self, step: &'static str) {
+        if let Some(since) = self.fetching_since.take() {
+            self.add(step, since.elapsed().as_secs_f64());
+        }
+    }
+
+    fn summary(&self) -> Option<String> {
+        let steps: Vec<String> = self.steps.iter().map(|(step, s)| format!("{step} {s:.1} s")).collect();
+        let books = self.books.map_or(String::new(), |b| format!("books shown {b:.1} s, "));
+        Some(format!("After start: {books}all ready {:.1} s ({})", self.total?, steps.join(", ")))
+    }
+}
+
 /// Everything remembered between sessions, besides the files and analyses.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -52,11 +97,13 @@ struct SavedState {
     shown: Option<u64>,
     next_id: u64,
     books: Vec<SavedBook>,
+    /// Show load times and storage errors in the sidebar
+    debug: bool,
 }
 
 impl Default for SavedState {
     fn default() -> Self {
-        Self { settings: Settings::default(), log_scales: [true, false, true], shown: None, next_id: 0, books: Vec::new() }
+        Self { settings: Settings::default(), log_scales: [true, false, true], shown: None, next_id: 0, books: Vec::new(), debug: false }
     }
 }
 
@@ -77,6 +124,8 @@ pub struct ViewerApp {
     settings: Settings,
     edited_settings: Settings,
     show_settings: bool,
+    /// Show load times and storage errors in the sidebar
+    debug: bool,
     /// For each book, its words not learned in the other books
     remaining: Option<(StatsKey, Vec<usize>)>,
 
@@ -100,6 +149,7 @@ pub struct ViewerApp {
     plot_rects: Vec<egui::Rect>,
     /// Chapter under the finger while inspecting, found while drawing the last frame
     inspected_chapter: Option<f64>,
+    load_times: LoadTimes,
 }
 
 #[derive(PartialEq)]
@@ -137,6 +187,7 @@ impl ViewerApp {
             settings: Settings::default(),
             edited_settings: Settings::default(),
             show_settings: false,
+            debug: false,
             remaining: None,
             state_loaded: false,
             saved: None,
@@ -149,6 +200,7 @@ impl ViewerApp {
             inspecting: LongPress::default(),
             plot_rects: Vec::new(),
             inspected_chapter: None,
+            load_times: LoadTimes::new(),
         }
     }
 
@@ -183,6 +235,9 @@ impl ViewerApp {
                                 storage::write(&self.inbox, ctx, Key::DictionaryFile(name.clone()), &bytes);
                                 compressed.push((name, bytes));
                                 *received += 1;
+                                if *received == DICTIONARY_FILES.len() {
+                                    self.load_times.fetched("downloading the dictionary");
+                                }
                             }
                             Err(e) => self.dictionary = DictionaryState::Failed(format!("Downloading {name}: {e}")),
                         }
@@ -230,6 +285,7 @@ impl ViewerApp {
                 self.settings = state.settings;
                 self.edited_settings = state.settings;
                 self.log_scales = state.log_scales;
+                self.debug = state.debug;
                 self.wanted_shown = state.shown;
                 self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
                 self.to_restore = state.books.clone();
@@ -247,6 +303,9 @@ impl ViewerApp {
                         Some(bytes) => {
                             compressed.push((name.clone(), bytes));
                             *received += 1;
+                            if *received == DICTIONARY_FILES.len() {
+                                self.load_times.fetched("reading the dictionary");
+                            }
                             // One file at a time, to keep memory low
                             let next = DICTIONARY_FILES.iter().position(|f| *f == name).and_then(|i| DICTIONARY_FILES.get(i + 1));
                             if let Some(next) = next {
@@ -265,7 +324,9 @@ impl ViewerApp {
                 let Some(pos) = self.restoring.iter().position(|b| b.id == id) else { return };
                 let Some(dictionary) = self.dictionary_version() else { return };
                 let key = CacheKey { build: BUILD_ID, dictionary: &dictionary, include_particles: self.settings.include_particles };
-                let book = bytes.and_then(|b| Book::from_analysis(self.restoring[pos].clone(), &b, &key, &self.settings));
+                let saved = self.restoring[pos].clone();
+                let settings = self.settings;
+                let book = self.load_times.timed("restoring books", || bytes.and_then(|b| Book::from_analysis(saved, &b, &key, &settings)));
                 match book {
                     Some(book) => {
                         self.restoring.remove(pos);
@@ -287,15 +348,18 @@ impl ViewerApp {
         }
     }
 
+    /// The dictionary version in use, or being loaded. Cached analyses only need this, not
+    /// the dictionary itself, so books are restored while the dictionary is still unpacked.
     fn dictionary_version(&self) -> Option<String> {
         match &self.dictionary {
-            DictionaryState::Ready { version, .. } => Some(version.clone()),
-            _ => None,
+            DictionaryState::Ready { version, .. } | DictionaryState::Loading { version, .. } => Some(version.clone()),
+            DictionaryState::Checking { .. } | DictionaryState::Failed(_) => None,
         }
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     fn start_download(&mut self, ctx: &egui::Context, version: String) {
+        self.load_times.fetching_since = Some(Instant::now());
         // Also removes files stored by older versions of the app
         storage::remove_dictionary(&self.inbox, ctx);
         #[cfg(target_arch = "wasm32")]
@@ -320,6 +384,16 @@ impl ViewerApp {
 
     /// Get the dictionary ready, restore saved books, and tokenize pending ones, a little per frame.
     fn do_work(&mut self, ctx: &egui::Context) {
+        if self.state_loaded && !self.to_restore.is_empty() && self.dictionary_version().is_some() {
+            for saved in std::mem::take(&mut self.to_restore) {
+                storage::read(&self.inbox, ctx, Key::Analysis(saved.id));
+                self.restoring.push(saved);
+            }
+        }
+        if self.state_loaded && self.to_restore.is_empty() && self.restoring.is_empty() && self.load_times.books.is_none() {
+            self.load_times.books = Some(self.load_times.started.elapsed().as_secs_f64());
+        }
+
         #[cfg(target_arch = "wasm32")]
         if self.prepare_dictionary(ctx) {
             ctx.request_repaint();
@@ -327,17 +401,21 @@ impl ViewerApp {
         }
         let Some(dictionary) = self.dictionary_version() else { return };
 
-        if self.state_loaded && !self.to_restore.is_empty() {
-            for saved in std::mem::take(&mut self.to_restore) {
-                storage::read(&self.inbox, ctx, Key::Analysis(saved.id));
-                self.restoring.push(saved);
+        let all_ready = self.state_loaded && self.to_restore.is_empty() && self.restoring.is_empty() && self.pending.is_empty();
+        if all_ready && self.load_times.total.is_none() {
+            self.load_times.total = Some(self.load_times.started.elapsed().as_secs_f64());
+            if let Some(summary) = self.load_times.summary() {
+                platform::log(&summary);
             }
         }
 
         let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary else { return };
         let Some(book) = self.pending.first_mut() else { return };
         tokenizer.set_include_particles(self.settings.include_particles);
-        match book.step(tokenizer, Instant::now() + WORK_PER_FRAME) {
+        let started = Instant::now();
+        let stepped = book.step(tokenizer, started + WORK_PER_FRAME);
+        self.load_times.add("analyzing books", started.elapsed().as_secs_f64());
+        match stepped {
             Ok(false) => {}
             Ok(true) => {
                 let book = self.pending.remove(0).finish(&self.settings);
@@ -370,7 +448,7 @@ impl ViewerApp {
             DictionaryState::Checking { .. } => true,
             DictionaryState::Loading { version, from_storage, compressed, files, .. } => {
                 if let Some((name, bytes)) = compressed.pop() {
-                    match platform::decompress(&bytes) {
+                    match self.load_times.timed("unpacking", || platform::decompress(&bytes)) {
                         Ok(data) => {
                             files.insert(name, data);
                         }
@@ -379,7 +457,8 @@ impl ViewerApp {
                 } else if files.len() == DICTIONARY_FILES.len() {
                     let (version, mut files) = (version.clone(), std::mem::take(files));
                     log::info!("Dictionary {version} {}", if *from_storage { "from storage" } else { "downloaded" });
-                    self.dictionary = match jpfe::tokenizer::dictionary_from_files(|name| files.remove(name)) {
+                    let dictionary = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::dictionary_from_files(|name| files.remove(name)));
+                    self.dictionary = match dictionary {
                         Ok(dictionary) => DictionaryState::Ready {
                             tokenizer: Box::new(JapaneseTokenizer::with_dictionary(dictionary, true, false)),
                             version,
@@ -395,6 +474,7 @@ impl ViewerApp {
 
     #[cfg(target_arch = "wasm32")]
     fn read_stored_dictionary(&mut self, ctx: &egui::Context, version: String) {
+        self.load_times.fetching_since = Some(Instant::now());
         // The others are read one after the other, as each one arrives
         storage::read(&self.inbox, ctx, Key::DictionaryFile(DICTIONARY_FILES[0].to_string()));
         self.dictionary = DictionaryState::Loading { version, from_storage: true, compressed: Vec::new(), files: HashMap::new(), received: 0 };
@@ -413,6 +493,7 @@ impl ViewerApp {
         SavedState {
             settings: self.settings,
             log_scales: self.log_scales,
+            debug: self.debug,
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
             books,
@@ -501,6 +582,10 @@ impl ViewerApp {
                 ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
                 note(ui, "Changing this analyzes the books again.");
 
+                ui.separator();
+                ui.checkbox(&mut self.debug, "Show debug information");
+                note(ui, "Load times and storage errors, under the Open button.");
+
                 ui.horizontal(|ui| {
                     if ui.button("Restore defaults").clicked() {
                         *s = Settings::default();
@@ -567,9 +652,14 @@ impl ViewerApp {
             }
             DictionaryState::Ready { .. } => {}
         }
+        if let Some(summary) = self.load_times.summary().filter(|_| self.debug) {
+            ui.label(RichText::new(summary).small().color(palette.secondary_text));
+        }
         if let Some(e) = &self.storage_error {
             ui.label(RichText::new("Books cannot be saved in this browser, so they will not be kept.").small().color(palette.secondary_text));
-            ui.label(RichText::new(e).small().color(palette.secondary_text));
+            if self.debug {
+                ui.label(RichText::new(e).small().color(palette.secondary_text));
+            }
         }
         ui.add_space(8.0);
 
