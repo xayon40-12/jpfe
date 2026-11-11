@@ -1,23 +1,16 @@
-mod epub;
-mod exporter;
-mod frequency;
-mod models;
-mod pdf;
-mod statistics;
-mod tokenizer;
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use anyhow::{bail, Result};
 use clap::{Parser, ValueEnum};
 
-use crate::epub::extract_epub_chapters;
-use crate::exporter::{export_chapter_entries, pad, ExportFormat};
-use crate::frequency::FrequencyAnalyzer;
-use crate::pdf::extract_pdf_chapters;
-use crate::statistics::{export_statistics, vocabulary_ratio, ChapterStat, ChartScales, Scale};
-use crate::tokenizer::JapaneseTokenizer;
+use jpfe::epub::extract_epub_chapters;
+use jpfe::exporter::{export_chapter_entries, pad, ExportFormat};
+use jpfe::frequency::FrequencyAnalyzer;
+use jpfe::models::{vocabulary_ratio, ChapterStat};
+use jpfe::pdf::extract_pdf_chapters;
+use jpfe::statistics::{export_statistics, ChartScales, Scale};
+use jpfe::tokenizer::JapaneseTokenizer;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ReadingFormat {

@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use lopdf::content::Content;
 use lopdf::{Document, Object};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use regex::Regex;
 
@@ -30,11 +31,24 @@ const FRONT_MATTER: [&str; 2] = ["注意事項", "目次"];
 
 pub fn extract_pdf_chapters(path: &Path) -> Result<Vec<Chapter>> {
     let doc = Document::load(path).with_context(|| format!("Failed to load PDF file: {:?}", path))?;
-    // Pages are keyed 1..=n in order; extract them in parallel
+    Ok(extract_chapters(&doc))
+}
+
+/// Same as [`extract_pdf_chapters`], from the file's contents (for the web viewer).
+pub fn extract_pdf_chapters_from_bytes(bytes: &[u8]) -> Result<Vec<Chapter>> {
+    Ok(extract_chapters(&Document::load_mem(bytes).context("Failed to load PDF file")?))
+}
+
+fn extract_chapters(doc: &Document) -> Vec<Chapter> {
+    // Pages are keyed 1..=n in order
     let page_ids: Vec<_> = doc.get_pages().into_values().collect();
-    let pages: Vec<Vec<Line>> = page_ids.par_iter().map(|&id| extract_page_lines(&doc, id).unwrap_or_default()).collect();
+    #[cfg(feature = "parallel")]
+    let page_ids = page_ids.par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let page_ids = page_ids.iter();
+    let pages: Vec<Vec<Line>> = page_ids.map(|&id| extract_page_lines(doc, id).unwrap_or_default()).collect();
     let lines: Vec<Line> = pages.into_iter().flatten().collect();
-    Ok(split_chapters(&lines))
+    split_chapters(&lines)
 }
 
 /// Split the book at headings, which may appear anywhere on a page.
@@ -134,7 +148,7 @@ impl OpenChapter {
 }
 
 fn extract_page_lines(doc: &Document, page_id: (u32, u16)) -> Result<Vec<Line>> {
-    let content = Content::decode(&doc.get_page_content(page_id)?)?;
+    let content = Content::decode(&doc.get_page_content(page_id))?;
     // Fonts whose CMap encodes text as UTF-16BE (e.g. UniJIS-UTF16-H, UniJIS-UCS2-H)
     let utf16_fonts: HashSet<Vec<u8>> = doc
         .get_page_fonts(page_id)
@@ -190,7 +204,7 @@ fn extract_page_lines(doc: &Document, page_id: (u32, u16)) -> Result<Vec<Line>> 
 
 fn decode_pdf_string(bytes: &[u8], utf16: bool, out: &mut String) {
     if utf16 && bytes.len().is_multiple_of(2) {
-        let units = bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]]));
+        let units = bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_be_bytes(c));
         out.extend(char::decode_utf16(units).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)));
     } else {
         out.push_str(&String::from_utf8_lossy(bytes));

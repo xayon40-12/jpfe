@@ -108,6 +108,33 @@ Contains chapter-level vocabulary load and density statistics:
 
 ---
 
+## Interactive Viewer (desktop and web)
+
+`viewer/` is an [egui](https://github.com/emilk/egui) app that shows the same three charts live for several books at once:
+
+- **Left panel**: one entry per loaded EPUB/PDF (open them with the button or drop them on the window), each with a **Learned up to (included)** chapter selector. It starts at *Not started*, so loading a book does not mark anything as learned.
+- **Central panel**: pick the book to show. Its word lists leave out every word you have learned in the *other* books (their word lists up to the selected chapter), and an orange vertical line marks your progress in the shown book. Hovering a chapter shows its title and numbers in all three plots.
+- **Download word lists (.zip)**: the shown book's filtered word lists, one `words/chapter_…txt` per chapter, as in the CLI output.
+
+Word lists use the CLI defaults (`-p 99`, `-m 3`, previously seen words hidden). The look follows macOS colors and controls, in light or dark mode depending on the system setting.
+
+### Run it on the desktop
+```bash
+cargo run --release -p jpfe-viewer
+```
+The dictionary is embedded, as in the CLI. Japanese text uses a system font (Hiragino on macOS, Noto Sans CJK on Linux, Yu Gothic / Meiryo on Windows).
+
+### Build the web version
+Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary once (about 35 MB, zstd-compressed) and Noto Sans JP (4 MB).
+```bash
+rustup target add wasm32-unknown-unknown   # once
+./viewer/build-web-assets.sh               # dictionary and font into viewer/assets/ (needs zstd and curl)
+cd viewer && trunk serve --release         # or `trunk build --release` for viewer/dist/
+```
+`.github/workflows/pages.yml` builds and publishes it on every push to `main`. Enable it once in the repository's **Settings → Pages → Source: GitHub Actions**. The published dictionary includes UniDic's BSD license (`assets/dict/UNIDIC-LICENSE.txt`); Noto Sans JP is under the SIL Open Font License.
+
+---
+
 ## Vocabulary Filtering & Excluded Categories (The 5 Filtered Groups)
 
 When preparing vocabulary for flashcard systems (Anki, Yomitan, 10ten, Migaku), automatic dictionary lookups match text strings directly against dictionary headwords. In raw Japanese tokenization, colloquial contractions, bound affixes, and single-kana grammatical particles often get extracted as standalone dictionary words, causing dictionaries to match rare, irrelevant kanji homophones (e.g., `食べてる` extracted as `てる`, which dictionaries look up as **照る** "to shine").

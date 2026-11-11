@@ -1,0 +1,29 @@
+[package]
+name = "jpfe-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive vocabulary statistics for several Japanese books"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+egui_plot = "0.38"
+egui = "0.37"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+anyhow = "1.0"
+log = "0.4"
+web-time = "1.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jpfe = { path = "..", default-features = false, features = ["embed-dict", "parallel"] }
+rfd = "0.18"
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+jpfe = { path = "..", default-features = false }
+ehttp = "0.7"
+ruzstd = "0.9"
+rfd = "0.18"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "Document", "Window", "Element", "HtmlCanvasElement"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"

@@ -21,11 +21,15 @@ pub struct FrequencyAnalyzer {
 
 impl FrequencyAnalyzer {
     pub fn build(tokenizer: &mut JapaneseTokenizer, chapters: &[Chapter]) -> Result<(Self, Vec<Vec<ParsedWord>>)> {
+        let tokenized = chapters.iter().map(|c| tokenizer.tokenize(&c.text)).collect::<Result<Vec<_>>>()?;
+        Ok((Self::from_tokens(chapters, &tokenized), tokenized))
+    }
+
+    /// Book-wide counts from already tokenized chapters (`tokenized[i]` belongs to `chapters[i]`).
+    pub fn from_tokens(chapters: &[Chapter], tokenized: &[Vec<ParsedWord>]) -> Self {
         let mut words: HashMap<String, BookWord> = HashMap::new();
-        let mut tokenized = Vec::with_capacity(chapters.len());
-        for (chapter_pos, chapter) in chapters.iter().enumerate() {
-            let tokens = tokenizer.tokenize(&chapter.text)?;
-            for t in &tokens {
+        for (chapter_pos, (chapter, tokens)) in chapters.iter().zip(tokenized).enumerate() {
+            for t in tokens {
                 if let Some(w) = words.get_mut(&t.base_word) {
                     w.count += 1;
                 } else {
@@ -38,10 +42,9 @@ impl FrequencyAnalyzer {
                     });
                 }
             }
-            tokenized.push(tokens);
         }
         let total_words = tokenized.iter().map(Vec::len).sum();
-        Ok((Self { words, total_words }, tokenized))
+        Self { words, total_words }
     }
 
     pub fn analyze_chapter(

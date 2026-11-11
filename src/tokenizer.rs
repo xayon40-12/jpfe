@@ -2,7 +2,12 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use anyhow::{Context, Result};
-use lindera::dictionary::{load_embedded_dictionary, load_fs_dictionary, DictionaryKind};
+use lindera::dictionary::{load_fs_dictionary, Dictionary};
+use lindera_dictionary::dictionary::{
+    character_definition::CharacterDefinition, connection_cost_matrix::ConnectionCostMatrix, metadata::Metadata,
+    prefix_dictionary::PrefixDictionary, unknown_dictionary::UnknownDictionary,
+};
+use std::sync::Arc;
 use lindera::mode::Mode;
 use lindera::segmenter::Segmenter;
 
@@ -34,19 +39,57 @@ fn is_set(field: &str) -> bool {
     !field.is_empty() && field != "*"
 }
 
+#[cfg(feature = "embed-dict")]
+fn embedded_dictionary() -> Result<Dictionary> {
+    lindera::dictionary::load_embedded_dictionary(lindera::dictionary::DictionaryKind::UniDic)
+        .context("Failed to load embedded UniDic dictionary")
+}
+
+#[cfg(not(feature = "embed-dict"))]
+fn embedded_dictionary() -> Result<Dictionary> {
+    anyhow::bail!("This build has no embedded dictionary; pass a dictionary directory")
+}
+
+/// Files of a compiled lindera dictionary, as found in a dictionary directory.
+pub const DICTIONARY_FILES: [&str; 9] = [
+    "metadata.json", "char_def.bin", "matrix.mtx", "dict.trie", "dict.valsidx",
+    "dict.vals", "dict.wordsidx", "dict.words", "unk.bin",
+];
+
+/// Build a dictionary from the contents of [`DICTIONARY_FILES`] (for the web viewer, which downloads them).
+pub fn dictionary_from_files(mut file: impl FnMut(&str) -> Option<Vec<u8>>) -> Result<Dictionary> {
+    let mut get = |name: &str| file(name).with_context(|| format!("Missing dictionary file {name}"));
+    let metadata = Metadata::load(&get("metadata.json")?)?;
+    metadata.validate_format_version()?;
+    let prefix_dictionary = PrefixDictionary::load(
+        get("dict.trie")?, get("dict.valsidx")?, get("dict.vals")?, get("dict.wordsidx")?, get("dict.words")?,
+    )?;
+    Ok(Dictionary {
+        prefix_dictionary: Arc::new(prefix_dictionary),
+        connection_cost_matrix: Arc::new(ConnectionCostMatrix::load(get("matrix.mtx")?)?),
+        character_definition: Arc::new(CharacterDefinition::load(&get("char_def.bin")?)?),
+        unknown_dictionary: Arc::new(UnknownDictionary::load(&get("unk.bin")?)?),
+        metadata: Arc::new(metadata),
+    })
+}
+
 impl JapaneseTokenizer {
+    /// Tokenizer using the dictionary at `dict_path`, or the embedded UniDic.
     pub fn new(dict_path: Option<&Path>, reading_in_hiragana: bool, include_particles: bool) -> Result<Self> {
         let dictionary = match dict_path {
             Some(p) => load_fs_dictionary(p).with_context(|| format!("Failed to load dictionary from: {:?}", p))?,
-            None => load_embedded_dictionary(DictionaryKind::UniDic)
-                .context("Failed to load embedded UniDic dictionary")?,
+            None => embedded_dictionary()?,
         };
-        Ok(Self {
+        Ok(Self::with_dictionary(dictionary, reading_in_hiragana, include_particles))
+    }
+
+    pub fn with_dictionary(dictionary: Dictionary, reading_in_hiragana: bool, include_particles: bool) -> Self {
+        Self {
             segmenter: Segmenter::new(Mode::Normal, dictionary, None),
             reading_cache: HashMap::new(),
             reading_in_hiragana,
             include_particles,
-        })
+        }
     }
 
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {

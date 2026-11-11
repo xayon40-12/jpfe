@@ -2,3 +2,5 @@
 output*/
 source/
 .DS_Store
+viewer/assets/
+viewer/dist/

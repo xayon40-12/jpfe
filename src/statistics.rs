@@ -10,6 +10,8 @@ use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
 use crate::exporter::{write_table, ExportFormat};
+use crate::chart::{format_count, format_ratio, log_ticks};
+use crate::models::ChapterStat;
 
 /// Y-axis scale of a statistics plot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -33,41 +35,6 @@ pub struct ChartScales {
     pub ratio: Scale,
     pub words: Scale,
     pub characters: Scale,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChapterStat {
-    pub chapter_index: usize,
-    pub title: String,
-    pub filtered_words: usize,
-    pub characters: usize,
-    pub raw_ratio: f64,
-    pub normalized_ratio: f64,
-}
-
-impl ChapterStat {
-    /// `baseline_ratio` is the raw ratio of the reference chapter (prologue, or chapter 1).
-    pub fn new(chapter_index: usize, title: &str, filtered_words: usize, characters: usize, baseline_ratio: f64) -> Self {
-        let raw_ratio = vocabulary_ratio(filtered_words, characters);
-        let normalized_ratio = if baseline_ratio > 0.0 { raw_ratio / baseline_ratio } else { 0.0 };
-        Self {
-            chapter_index,
-            title: title.to_string(),
-            filtered_words,
-            characters,
-            raw_ratio,
-            normalized_ratio,
-        }
-    }
-}
-
-/// Filtered vocabulary words per character.
-pub fn vocabulary_ratio(filtered_words: usize, characters: usize) -> f64 {
-    if characters == 0 {
-        0.0
-    } else {
-        filtered_words as f64 / characters as f64
-    }
 }
 
 pub struct StatisticsExportPaths {
@@ -387,52 +354,10 @@ fn y_bounds(panel: &Panel) -> (f64, f64) {
     }
 }
 
-/// 1-2-5 ticks inside `lo..=hi`, or 1..9 when the range is too narrow for that.
-fn log_ticks(lo: f64, hi: f64) -> Vec<f64> {
-    let ticks = |mantissas: &[f64]| -> Vec<f64> {
-        (lo.log10().floor() as i32..=hi.log10().ceil() as i32)
-            .flat_map(|e| mantissas.iter().map(move |m| m * 10f64.powi(e)))
-            .filter(|v| (lo..=hi).contains(v))
-            .collect()
-    };
-    let ticks_125 = ticks(&[1.0, 2.0, 5.0]);
-    if ticks_125.len() >= 3 {
-        ticks_125
-    } else {
-        ticks(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
-    }
-}
-
-/// Ratio with three significant digits and no trailing zeros (1, 0.5, 0.001).
-fn format_ratio(v: &f64) -> String {
-    if *v <= 0.0 {
-        return "0".to_string();
-    }
-    let decimals = (2 - v.log10().floor() as i32).max(0) as usize;
-    let s = format!("{v:.decimals$}");
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        s
-    }
-}
-
-/// Integer with thousands separators (axis labels are always non-negative counts).
-fn format_count(v: &f64) -> String {
-    let digits = format!("{:.0}", v.max(0.0));
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::vocabulary_ratio;
 
     fn sample() -> Vec<ChapterStat> {
         let baseline = vocabulary_ratio(500, 5000);
@@ -471,28 +396,5 @@ mod tests {
         }
         render_chart(&dir.join("empty.svg"), &[], ChartScales { ratio: Scale::Log, words: Scale::Log, characters: Scale::Log }).unwrap();
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn log_ticks_adapt_to_range() {
-        assert_eq!(log_ticks(0.9, 120.0).len(), 7); // 1 2 5 10 20 50 100
-        assert_eq!(log_ticks(330.0, 650.0).len(), 3); // 400 500 600
-    }
-
-    #[test]
-    fn formats_ratios() {
-        assert_eq!(format_ratio(&1.0), "1");
-        assert_eq!(format_ratio(&0.5), "0.5");
-        assert_eq!(format_ratio(&0.001), "0.001");
-        assert_eq!(format_ratio(&0.6259), "0.626");
-        assert_eq!(format_ratio(&20.0), "20");
-    }
-
-    #[test]
-    fn formats_counts() {
-        assert_eq!(format_count(&0.0), "0");
-        assert_eq!(format_count(&999.0), "999");
-        assert_eq!(format_count(&5398.4), "5,398");
-        assert_eq!(format_count(&12345678.0), "12,345,678");
     }
 }

@@ -1,0 +1,50 @@
+# Builds the web viewer and publishes it to GitHub Pages.
+# One-time setup: repository Settings → Pages → Source: "GitHub Actions".
+name: Deploy viewer to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install trunk and zstd
+        run: |
+          curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.22.1/trunk-x86_64-unknown-linux-gnu.tar.gz \
+            | sudo tar -xz -C /usr/local/bin
+          sudo apt-get install -y zstd
+      - name: Prepare dictionary and font
+        run: ./viewer/build-web-assets.sh
+      - name: Build the web app
+        working-directory: viewer
+        run: trunk build --release
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: viewer/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

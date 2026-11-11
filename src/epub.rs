@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use anyhow::{Context, Result};
@@ -8,7 +9,17 @@ use regex::Regex;
 use crate::models::Chapter;
 
 pub fn extract_epub_chapters(path: &Path) -> Result<Vec<Chapter>> {
-    let mut doc = EpubDoc::new(path).with_context(|| format!("Failed to open EPUB file: {:?}", path))?;
+    let doc = EpubDoc::new(path).with_context(|| format!("Failed to open EPUB file: {:?}", path))?;
+    Ok(extract_chapters(doc))
+}
+
+/// Same as [`extract_epub_chapters`], from the file's contents (for the web viewer).
+pub fn extract_epub_chapters_from_bytes(bytes: Vec<u8>) -> Result<Vec<Chapter>> {
+    let doc = EpubDoc::from_reader(Cursor::new(bytes)).context("Failed to open EPUB file")?;
+    Ok(extract_chapters(doc))
+}
+
+fn extract_chapters<R: Read + Seek>(mut doc: EpubDoc<R>) -> Vec<Chapter> {
 
     // TOC titles by content path (fragment stripped); nested entries override their parents
     fn collect(points: &[NavPoint], titles: &mut HashMap<PathBuf, String>) {
@@ -39,7 +50,7 @@ pub fn extract_epub_chapters(path: &Path) -> Result<Vec<Chapter>> {
         chapters.push(Chapter { index: 0, title, text });
     }
     crate::models::adjust_chapter_indices(&mut chapters);
-    Ok(chapters)
+    chapters
 }
 
 macro_rules! re {

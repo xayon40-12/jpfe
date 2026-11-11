@@ -1,0 +1,5 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Relative URLs, so the site works under https://<user>.github.io/<repo>/
+public_url = "./"

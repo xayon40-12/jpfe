@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use unicode_width::UnicodeWidthStr;
 
-use crate::models::WordEntry;
+use crate::models::{chapter_file_stem, WordEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ExportFormat {
@@ -36,7 +36,7 @@ pub fn export_chapter_entries(
     include_first_appearance_col: bool,
     pad_width: usize,
 ) -> Result<ChapterExportPaths> {
-    let stem = format!("chapter_{:0pad_width$}_{}", chapter_index, sanitize_filename(chapter_title));
+    let stem = chapter_file_stem(chapter_index, chapter_title, pad_width);
     let full_path = output_dir.join("full").join(format!("{stem}.{}", format.extension()));
     let words_path = output_dir.join("words").join(format!("{stem}.txt"));
     for dir in [&full_path, &words_path].map(|p| p.parent().unwrap()) {
@@ -103,17 +103,4 @@ pub fn write_table(path: &Path, rows: &[Vec<String>], format: ExportFormat) -> R
         }
     }
     Ok(())
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let mapped: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '：' | ' ' | '\t' | '　' => '_',
-            _ => c,
-        })
-        .collect();
-    // Collapse runs of underscores and trim them from both ends
-    let collapsed = mapped.split('_').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("_");
-    if collapsed.is_empty() { "chapter".to_string() } else { collapsed }
 }
