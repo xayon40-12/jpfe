@@ -21,6 +21,12 @@ const MIN_PLOT_HEIGHT: f32 = 170.0;
 /// Tokenizing time per frame, so the window keeps redrawing while books load.
 const WORK_PER_FRAME: Duration = Duration::from_millis(25);
 
+/// On touch screens, holding a finger this long (seconds) on a chart without moving it
+/// inspects the chart: the finger then moves the hover instead of scrolling, until it is lifted.
+const LONG_PRESS: f64 = 0.4;
+/// How far (points) the finger may move during the long press.
+const LONG_PRESS_SLOP: f32 = 8.0;
+
 /// Identifies the code that computed a cached analysis (see `build.rs`).
 const BUILD_ID: &str = env!("JPFE_BUILD_ID");
 
@@ -28,7 +34,8 @@ enum DictionaryState {
     /// Web only: waiting for the server's and the stored dictionary versions (`None` = unknown yet)
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     Checking { remote: Option<Option<String>>, stored: Option<Option<String>> },
-    /// Web only: unpacked files of `version`, read from storage or downloaded (`compressed`, to unpack)
+    /// Web only: files of `version`, read from storage or downloaded (`received` compressed ones;
+    /// `compressed` still to unpack, `files` unpacked)
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     Loading { version: String, from_storage: bool, compressed: Vec<(String, Vec<u8>)>, files: HashMap<String, Vec<u8>>, received: usize },
     /// `version` is part of the key of cached analyses
@@ -86,6 +93,13 @@ pub struct ViewerApp {
     /// Version of the dictionary being written to storage, and how many of its files are written
     dictionary_writes: Option<(String, usize)>,
     storage_error: Option<String>,
+
+    /// A long press on a chart is in progress: the finger moves the hover, the page does not scroll
+    inspecting: LongPress,
+    /// Where the charts were drawn in the last frame, where a long press starts inspecting
+    plot_rects: Vec<egui::Rect>,
+    /// Chapter under the finger while inspecting, found while drawing the last frame
+    inspected_chapter: Option<f64>,
 }
 
 #[derive(PartialEq)]
@@ -132,6 +146,9 @@ impl ViewerApp {
             wanted_shown: None,
             dictionary_writes: None,
             storage_error: None,
+            inspecting: LongPress::default(),
+            plot_rects: Vec::new(),
+            inspected_chapter: None,
         }
     }
 
@@ -144,12 +161,13 @@ impl ViewerApp {
                 Incoming::File { name, bytes } => {
                     let id = self.next_id;
                     self.next_id += 1;
-                    match PendingBook::parse(id, &name, bytes.clone(), None) {
-                        Ok(book) => {
-                            storage::write(&self.inbox, ctx, Key::Source(id), bytes);
-                            self.pending.push(book);
+                    storage::write(&self.inbox, ctx, Key::Source(id), &bytes);
+                    match PendingBook::parse(id, &name, bytes, None) {
+                        Ok(book) => self.pending.push(book),
+                        Err(e) => {
+                            storage::remove_book(&self.inbox, ctx, id);
+                            self.errors.push(format!("{e:#}"));
                         }
-                        Err(e) => self.errors.push(format!("{e:#}")),
                     }
                 }
                 Incoming::DictionaryVersion(version) => {
@@ -161,6 +179,8 @@ impl ViewerApp {
                     if let DictionaryState::Loading { compressed, received, from_storage: false, .. } = &mut self.dictionary {
                         match bytes {
                             Ok(bytes) => {
+                                // Stored as downloaded (35 MB in all), and unpacked again on each load
+                                storage::write(&self.inbox, ctx, Key::DictionaryFile(name.clone()), &bytes);
                                 compressed.push((name, bytes));
                                 *received += 1;
                             }
@@ -174,7 +194,7 @@ impl ViewerApp {
                         *written += 1;
                         // Written last, so an interrupted download is never taken as complete
                         if *written == DICTIONARY_FILES.len() {
-                            storage::write(&self.inbox, ctx, Key::DictionaryVersion, version.clone().into_bytes());
+                            storage::write(&self.inbox, ctx, Key::DictionaryVersion, version.as_bytes());
                             self.dictionary_writes = None;
                         }
                     }
@@ -222,10 +242,16 @@ impl ViewerApp {
                 }
             }
             Key::DictionaryFile(name) => {
-                if let DictionaryState::Loading { version, files, from_storage: true, .. } = &mut self.dictionary {
+                if let DictionaryState::Loading { version, compressed, received, from_storage: true, .. } = &mut self.dictionary {
                     match bytes {
                         Some(bytes) => {
-                            files.insert(name, bytes);
+                            compressed.push((name.clone(), bytes));
+                            *received += 1;
+                            // One file at a time, to keep memory low
+                            let next = DICTIONARY_FILES.iter().position(|f| *f == name).and_then(|i| DICTIONARY_FILES.get(i + 1));
+                            if let Some(next) = next {
+                                storage::read(&self.inbox, ctx, Key::DictionaryFile(next.to_string()));
+                            }
                         }
                         // Incomplete cache: download this version instead
                         None => {
@@ -270,6 +296,8 @@ impl ViewerApp {
 
     #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
     fn start_download(&mut self, ctx: &egui::Context, version: String) {
+        // Also removes files stored by older versions of the app
+        storage::remove_dictionary(&self.inbox, ctx);
         #[cfg(target_arch = "wasm32")]
         platform::download_dictionary(&self.inbox, ctx, &version);
         self.dictionary_writes = Some((version.clone(), 0));
@@ -314,7 +342,7 @@ impl ViewerApp {
             Ok(true) => {
                 let book = self.pending.remove(0).finish(&self.settings);
                 let key = CacheKey { build: BUILD_ID, dictionary: &dictionary, include_particles: self.settings.include_particles };
-                storage::write(&self.inbox, ctx, Key::Analysis(book.id), book.analysis_bytes(&key));
+                storage::write(&self.inbox, ctx, Key::Analysis(book.id), &book.analysis_bytes(&key));
                 self.insert_book(book);
             }
             Err(e) => {
@@ -344,7 +372,6 @@ impl ViewerApp {
                 if let Some((name, bytes)) = compressed.pop() {
                     match platform::decompress(&bytes) {
                         Ok(data) => {
-                            storage::write(&self.inbox, ctx, Key::DictionaryFile(name.clone()), data.clone());
                             files.insert(name, data);
                         }
                         Err(e) => self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}")),
@@ -368,9 +395,8 @@ impl ViewerApp {
 
     #[cfg(target_arch = "wasm32")]
     fn read_stored_dictionary(&mut self, ctx: &egui::Context, version: String) {
-        for name in DICTIONARY_FILES {
-            storage::read(&self.inbox, ctx, Key::DictionaryFile(name.to_string()));
-        }
+        // The others are read one after the other, as each one arrives
+        storage::read(&self.inbox, ctx, Key::DictionaryFile(DICTIONARY_FILES[0].to_string()));
         self.dictionary = DictionaryState::Loading { version, from_storage: true, compressed: Vec::new(), files: HashMap::new(), received: 0 };
     }
 
@@ -400,7 +426,7 @@ impl ViewerApp {
         let state = self.current_state();
         if self.saved.as_ref() != Some(&state) {
             if let Ok(json) = serde_json::to_vec(&state) {
-                storage::write(&self.inbox, ctx, Key::State, json);
+                storage::write(&self.inbox, ctx, Key::State, &json);
             }
             self.saved = Some(state);
         }
@@ -524,9 +550,9 @@ impl ViewerApp {
             DictionaryState::Checking { .. } => {
                 ui.add(egui::ProgressBar::new(0.0).text("Checking the dictionary…"));
             }
-            DictionaryState::Loading { files, from_storage: true, .. } => {
+            DictionaryState::Loading { files, received, from_storage: true, .. } => {
                 let text = format!("Loading the saved dictionary ({}/{total})…", files.len());
-                ui.add(egui::ProgressBar::new(files.len() as f32 / total as f32).text(text));
+                ui.add(egui::ProgressBar::new((received + files.len()) as f32 / (2 * total) as f32).text(text));
             }
             DictionaryState::Loading { files, received, .. } => {
                 let text = if *received < total {
@@ -542,8 +568,8 @@ impl ViewerApp {
             DictionaryState::Ready { .. } => {}
         }
         if let Some(e) = &self.storage_error {
-            ui.label(RichText::new("Books cannot be saved in this browser, so they will not be kept.").small().color(palette.secondary_text))
-                .on_hover_text(e);
+            ui.label(RichText::new("Books cannot be saved in this browser, so they will not be kept.").small().color(palette.secondary_text));
+            ui.label(RichText::new(e).small().color(palette.secondary_text));
         }
         ui.add_space(8.0);
 
@@ -719,18 +745,64 @@ impl ViewerApp {
         let card_overhead = 2.0 * 12.0 + 2.0 + 22.0 + 2.0 * ui.spacing().item_spacing.y;
         let header = ui.cursor().top() - top;
         let height = if stacked { MIN_PLOT_HEIGHT } else { ((viewport_height - header - 3.0 * card_overhead) / 3.0).max(MIN_PLOT_HEIGHT) };
+        // While inspecting (touch screens), the finger is not a hover for egui, so the charts draw
+        // the inspected chapter themselves, and a tooltip follows the finger
+        let finger = if self.inspecting.active { ui.ctx().input(|i| i.pointer.latest_pos()) } else { None };
+        let inspect = Inspect { finger, chapter: finger.and(self.inspected_chapter) };
         let mut toggled = None;
+        let mut plot_rects = Vec::with_capacity(metrics.len());
+        let mut inspected = None;
         for (i, metric) in metrics.iter().enumerate() {
             theme::card(palette).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                if metric_plot(ui, metric, chapters, learned_x, height, palette) {
+                let drawn = metric_plot(ui, metric, chapters, learned_x, height, palette, inspect);
+                plot_rects.push(drawn.rect);
+                inspected = inspected.or(drawn.inspected);
+                if drawn.toggle {
                     toggled = Some(i);
                 }
             });
         }
+        self.plot_rects = plot_rects;
+        self.inspected_chapter = inspected;
+        if let (Some(finger), Some(text)) = (finger, inspected.and_then(|x| chapter_text(chapters, x))) {
+            egui::Area::new(egui::Id::unique("inspected-chapter"))
+                .order(egui::Order::Tooltip)
+                .pivot(egui::Align2::CENTER_BOTTOM)
+                .fixed_pos(finger - egui::vec2(0.0, 28.0))
+                .interactable(false)
+                .show(ui.ctx(), |ui| egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(text)));
+        }
         if let Some(i) = toggled {
             self.log_scales[i] = !self.log_scales[i];
         }
+    }
+}
+
+/// On touch screens, a still long press on a chart starts inspecting it, until the finger is lifted.
+#[derive(Default)]
+struct LongPress {
+    active: bool,
+}
+
+impl LongPress {
+    /// Returns how long to wait (seconds) before the current press may become long enough.
+    fn update(&mut self, input: &egui::InputState, charts: &[egui::Rect]) -> Option<f64> {
+        let pointer = &input.pointer;
+        if !pointer.primary_down() {
+            self.active = false;
+            return None;
+        }
+        if self.active || !input.any_touches() {
+            return None;
+        }
+        let (origin, start, pos) = (pointer.press_origin()?, pointer.press_start_time()?, pointer.latest_pos()?);
+        if !charts.iter().any(|r| r.contains(origin)) || origin.distance(pos) > LONG_PRESS_SLOP {
+            return None;
+        }
+        let held = input.time - start;
+        self.active = held >= LONG_PRESS;
+        (!self.active).then_some(LONG_PRESS - held)
     }
 }
 
@@ -747,8 +819,33 @@ struct Metric {
     baseline: Option<f64>,
 }
 
-/// Draws one plot card; returns true when its scale label was clicked.
-fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Option<f64>, height: f32, palette: Palette) -> bool {
+/// A chart being inspected on a touch screen.
+#[derive(Clone, Copy)]
+struct Inspect {
+    /// Where the finger is
+    finger: Option<egui::Pos2>,
+    /// The chapter under it, to mark in every chart
+    chapter: Option<f64>,
+}
+
+struct DrawnPlot {
+    /// The scale label was clicked
+    toggle: bool,
+    rect: egui::Rect,
+    /// Chapter under the finger, if it is on this plot
+    inspected: Option<f64>,
+}
+
+/// Draws one plot card.
+fn metric_plot(
+    ui: &mut Ui,
+    m: &Metric,
+    chapters: &[ChapterStat],
+    learned_x: Option<f64>,
+    height: f32,
+    palette: Palette,
+    inspect: Inspect,
+) -> DrawnPlot {
     let values: Vec<f64> = chapters.iter().map(m.value).collect();
     let (min, max) = values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     let avg = values.iter().sum::<f64>() / values.len().max(1) as f64;
@@ -810,17 +907,22 @@ fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Opt
         .y_axis_formatter(move |mark, _| f(&if log { 10f64.powf(mark.value) } else { mark.value }))
         .label_formatter(move |pos| hover_text(pos, chapters));
     plot = if m.log { plot.y_grid_spacer(log_grid) } else { plot.y_grid_spacer(|input| nice_grid(input, 5.0, 0.0)) };
-    plot.show(ui, |plot_ui| {
+    let shown = plot.show(ui, |plot_ui| {
         if let Some(b) = m.baseline {
             plot_ui.hline(HLine::new("Baseline", to_y(b)).color(palette.secondary_text).style(LineStyle::dashed_loose()).width(1.0));
         }
         if let Some(x) = learned_x {
             plot_ui.vline(VLine::new("Learned up to here", x).color(palette.orange).width(2.0));
         }
+        if let Some(x) = inspect.chapter {
+            plot_ui.vline(VLine::new("Inspected", x).color(palette.secondary_text).width(1.0));
+        }
         plot_ui.line(Line::new(m.short, points.clone()).color(m.color).width(1.8));
         plot_ui.points(Points::new(m.short, points).color(m.color).radius(if chapters.len() <= 60 { 3.0 } else { 1.8 }));
+        let finger = inspect.finger.filter(|&p| plot_ui.response().rect.contains(p));
+        finger.map(|p| plot_ui.plot_from_screen(p).x.round())
     });
-    toggle
+    DrawnPlot { toggle, rect: shown.response.rect, inspected: shown.inner }
 }
 
 /// Every metric of the chapter under the cursor.
@@ -828,6 +930,11 @@ fn hover_text(pos: &HoverPosition<'_>, chapters: &[ChapterStat]) -> Option<Strin
     let x = match pos {
         HoverPosition::NearDataPoint { position, .. } | HoverPosition::Elsewhere { position } => position.x,
     };
+    chapter_text(chapters, x)
+}
+
+/// Every metric of the chapter at `x` on the chapter axis.
+fn chapter_text(chapters: &[ChapterStat], x: f64) -> Option<String> {
     let s = chapters.iter().find(|s| s.chapter_index as f64 == x.round())?;
     Some(format!(
         "{}: {}\nNew words: {}\nCharacters: {}\nNormalized ratio: {}",
@@ -875,14 +982,24 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.handle_incoming(&ctx);
         self.apply_settings(&ctx);
+        if let Some(wait) = ctx.input(|i| self.inspecting.update(i, &self.plot_rects)) {
+            // Nothing else happens while the finger stays still: wake up when the press is long enough
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+        }
         let palette = Palette::of(ui.visuals());
+        // While inspecting a chart, dragging moves the hover instead of scrolling
+        let scrolling = if self.inspecting.active {
+            egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Never, ..Default::default() }
+        } else {
+            egui::scroll_area::ScrollSource::default()
+        };
 
         let content = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::same(18));
         if ui.available_width() < STACK_BELOW_WIDTH {
             // Phones and narrow windows: the books, then the charts, in one scrolling column
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
                 let viewport_height = ui.available_height();
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).scroll_source(scrolling).show(ui, |ui| {
                     egui::Frame::new()
                         .fill(palette.sidebar)
                         .corner_radius(egui::CornerRadius::same(10))
@@ -902,12 +1019,68 @@ impl eframe::App for ViewerApp {
                 });
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
                 let viewport_height = ui.available_height();
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.central(ui, palette, viewport_height, false));
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .scroll_source(scrolling)
+                    .show(ui, |ui| self.central(ui, palette, viewport_height, false));
             });
         }
         self.settings_window(&ctx, palette);
         // After drawing, so the window shows this frame while the slow work runs
         self.do_work(&ctx);
         self.save_state(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, Event, Modifiers, PointerButton, RawInput, TouchDeviceId, TouchId, TouchPhase};
+
+    /// Feeds one frame at `time` and returns whether the chart is being inspected.
+    fn frame(ctx: &egui::Context, press: &mut LongPress, time: f64, events: Vec<Event>) -> bool {
+        let input = RawInput { time: Some(time), events, ..Default::default() };
+        let chart = [egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(300.0, 200.0))];
+        let _ = ctx.run_ui(input, |ui| {
+            ui.ctx().input(|i| press.update(i, &chart));
+        });
+        press.active
+    }
+
+    fn touch(phase: TouchPhase, x: f32, y: f32) -> Vec<Event> {
+        let pos = pos2(x, y);
+        let touch = Event::Touch { device_id: TouchDeviceId(1), id: TouchId(1), phase, pos, force: None };
+        match phase {
+            TouchPhase::Start => vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }, touch],
+            TouchPhase::Move => vec![Event::PointerMoved(pos), touch],
+            _ => vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }, touch, Event::PointerGone],
+        }
+    }
+
+    #[test]
+    fn still_long_press_on_a_chart_inspects_until_released() {
+        let (ctx, mut press) = (egui::Context::default(), LongPress::default());
+        assert!(!frame(&ctx, &mut press, 1.0, touch(TouchPhase::Start, 100.0, 100.0)));
+        assert!(!frame(&ctx, &mut press, 1.2, vec![]));
+        assert!(frame(&ctx, &mut press, 1.5, vec![]));
+        // Dragging keeps inspecting, however far the finger goes
+        assert!(frame(&ctx, &mut press, 1.6, touch(TouchPhase::Move, 250.0, 120.0)));
+        assert!(!frame(&ctx, &mut press, 1.7, touch(TouchPhase::End, 250.0, 120.0)));
+        // A later quick drag scrolls again
+        assert!(!frame(&ctx, &mut press, 3.0, touch(TouchPhase::Start, 100.0, 100.0)));
+        assert!(!frame(&ctx, &mut press, 3.1, touch(TouchPhase::Move, 100.0, 40.0)));
+        assert!(!frame(&ctx, &mut press, 3.6, vec![]));
+    }
+
+    #[test]
+    fn long_press_outside_charts_or_with_a_mouse_does_not_inspect() {
+        let (ctx, mut press) = (egui::Context::default(), LongPress::default());
+        assert!(!frame(&ctx, &mut press, 1.0, touch(TouchPhase::Start, 500.0, 500.0)));
+        assert!(!frame(&ctx, &mut press, 2.0, vec![]));
+
+        let (ctx, mut press) = (egui::Context::default(), LongPress::default());
+        let click = Event::PointerButton { pos: pos2(100.0, 100.0), button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE };
+        assert!(!frame(&ctx, &mut press, 1.0, vec![Event::PointerMoved(pos2(100.0, 100.0)), click]));
+        assert!(!frame(&ctx, &mut press, 2.0, vec![]));
     }
 }

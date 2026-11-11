@@ -34,6 +34,8 @@ web-sys = { version = "0.3", features = [
     "Navigator", "StorageManager", "File", "FileSystemHandle", "FileSystemDirectoryHandle", "FileSystemFileHandle",
     "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemRemoveOptions",
     "FileSystemWritableFileStream", "WritableStream",
+    # Writes through a worker where `createWritable` is missing (Safari)
+    "Worker", "MessageEvent", "console",
 ] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"

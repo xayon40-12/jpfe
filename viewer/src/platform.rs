@@ -161,10 +161,11 @@ mod web {
     }
 
     pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        ruzstd::decoding::StreamingDecoder::new(bytes)
-            .map_err(|e| anyhow!("{e}"))?
-            .read_to_end(&mut out)?;
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(bytes).map_err(|e| anyhow!("{e}"))?;
+        // The frame header gives the size: allocate it once instead of growing (and copying) the buffer
+        let size = decoder.decoder.content_size().min(1 << 30) as usize;
+        let mut out = Vec::with_capacity(size);
+        decoder.read_to_end(&mut out)?;
         Ok(out)
     }
 
