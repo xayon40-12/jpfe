@@ -198,6 +198,11 @@ pub fn is_katakana(c: char) -> bool {
     ('\u{30A1}'..='\u{30FA}').contains(&c) || c == 'ー'
 }
 
+/// Written only in katakana (mostly loanwords such as パソコン); ー and ・ alone do not count.
+pub fn is_katakana_word(word: &str) -> bool {
+    word.chars().any(|c| c != 'ー' && c != '・') && word.chars().all(|c| is_katakana(c) || c == '・')
+}
+
 pub fn katakana_to_hiragana(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -242,6 +247,17 @@ pub fn is_problematic_word(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_katakana_words() {
+        assert!(is_katakana_word("パソコン"));
+        assert!(is_katakana_word("スーパー"));
+        assert!(is_katakana_word("ツインデス・スコルピオ"));
+        assert!(!is_katakana_word("ー"));
+        assert!(!is_katakana_word("お嬢様"));
+        assert!(!is_katakana_word("ドン引き"));
+        assert!(!is_katakana_word("ひらがな"));
+    }
 
     #[test]
     fn marks_alone_are_not_words() {

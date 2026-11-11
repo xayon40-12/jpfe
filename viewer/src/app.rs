@@ -215,6 +215,9 @@ impl ViewerApp {
                 ui.checkbox(&mut s.hide_previous_words, "Only words new to the book");
                 note(ui, "Leave out words already listed in an earlier chapter of the same book.");
 
+                ui.checkbox(&mut s.hide_katakana_words, "Leave out katakana-only words");
+                note(ui, "Mostly loanwords such as パソコン or エルフ, which are often easy to guess.");
+
                 ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
                 note(ui, "Changing this analyzes the books again.");
 

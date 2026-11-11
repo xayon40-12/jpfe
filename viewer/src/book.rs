@@ -8,7 +8,7 @@ use jpfe::epub::extract_epub_chapters_from_bytes;
 use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer};
 use jpfe::models::{chapter_file_stem, vocabulary_ratio, Chapter, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters_from_bytes;
-use jpfe::tokenizer::{JapaneseTokenizer, ParsedWord};
+use jpfe::tokenizer::{is_katakana_word, JapaneseTokenizer, ParsedWord};
 use web_time::Instant;
 
 /// Word-list settings, with the same meaning and defaults as the CLI options.
@@ -22,11 +22,19 @@ pub struct Settings {
     pub hide_previous_words: bool,
     /// `--include-particles`; changing it re-tokenizes the books
     pub include_particles: bool,
+    /// Leave out words written only in katakana (mostly loanwords)
+    pub hide_katakana_words: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { target_percentage: 99.0, min_book_count: 3, hide_previous_words: true, include_particles: false }
+        Self {
+            target_percentage: 99.0,
+            min_book_count: 3,
+            hide_previous_words: true,
+            include_particles: false,
+            hide_katakana_words: true,
+        }
     }
 }
 
@@ -201,6 +209,8 @@ fn word_lists(analyzer: &FrequencyAnalyzer, counts: &[ChapterCounts], s: &Settin
                 .analyze_counts(i, c, s.target_percentage, s.min_book_count, s.hide_previous_words)
                 .into_iter()
                 .map(|e| e.word)
+                // Like the CLI's other filters, this leaves the coverage cut-off unchanged
+                .filter(|w| !(s.hide_katakana_words && is_katakana_word(w)))
                 .collect()
         })
         .collect()
@@ -235,7 +245,7 @@ mod tests {
         let pending = PendingBook {
             name: "A".into(),
             chapters,
-            tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
+            tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥", "パン"])],
             learned: Some(1),
         };
         let mut book = pending.finish(&Settings { min_book_count: 1, ..Settings::default() });
@@ -243,8 +253,13 @@ mod tests {
         assert_eq!(book.learned, Some(1));
         book.apply(&Settings { min_book_count: 2, ..Settings::default() });
         assert_eq!(book.words, [vec!["猫"], Vec::<&str>::new()]);
-        book.apply(&Settings { min_book_count: 1, hide_previous_words: false, ..Settings::default() });
-        assert_eq!(book.words[1], ["猫", "鳥"]);
+        let all = Settings { min_book_count: 1, hide_previous_words: false, hide_katakana_words: false, ..Settings::default() };
+        book.apply(&all);
+        assert_eq!(book.words[1], ["猫", "パン", "鳥"]);
+        book.apply(&Settings { min_book_count: 1, hide_katakana_words: true, ..Settings::default() });
+        assert_eq!(book.words[1], ["鳥"]);
+        book.apply(&Settings { min_book_count: 1, hide_katakana_words: false, ..Settings::default() });
+        assert_eq!(book.words[1], ["パン", "鳥"]);
     }
 
     #[test]
