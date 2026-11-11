@@ -7,6 +7,7 @@ use clap::ValueEnum;
 use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::coord::Shift;
 use plotters::prelude::*;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
 
 use crate::exporter::{write_table, ExportFormat};
 
@@ -121,27 +122,57 @@ struct Panel<'a> {
     y_format: fn(&f64) -> String,
 }
 
+impl Panel<'_> {
+    fn is_visible(&self, y: f64) -> bool {
+        self.scale == Scale::Linear || y > 0.0
+    }
+
+    /// "min … · avg … · max …" over the panel's values (which must not be empty).
+    fn summary(&self) -> String {
+        let ys = || self.points.iter().map(|&(_, y)| y);
+        let min = ys().fold(f64::INFINITY, f64::min);
+        let max = ys().fold(f64::NEG_INFINITY, f64::max);
+        let avg = ys().sum::<f64>() / self.points.len() as f64;
+        let f = self.y_format;
+        format!("min {} · avg {} · max {}", f(&min), f(&avg), f(&max))
+    }
+}
+
+/// Pixel geometry of a drawn panel, used to place the hover overlay.
+struct PanelLayout {
+    plot_x: Range<i32>,
+    plot_y: Range<i32>,
+    /// Per chapter: x pixel, and y pixel when the point is drawn.
+    points: Vec<(i32, Option<i32>)>,
+}
+
+const WIDTH: u32 = 1200;
+const HEADER_HEIGHT: u32 = 100;
+const PANEL_HEIGHT: u32 = 340;
+
 const BLUE: RGBColor = RGBColor(37, 99, 235);
 const TEAL: RGBColor = RGBColor(13, 148, 136);
 const PURPLE: RGBColor = RGBColor(124, 58, 237);
 const AMBER: RGBColor = RGBColor(217, 119, 6);
+const SLATE: RGBColor = RGBColor(71, 85, 105);
 
-/// Render three stacked plots sharing the chapter axis:
+/// Render a summary header and three stacked plots sharing the chapter axis:
 /// normalized vocabulary ratio (top), filtered word count, and character count (bottom).
+/// Hovering a chapter highlights its points and shows its numbers as a tooltip.
 pub fn render_chart(path: &Path, stats: &[ChapterStat], scales: ChartScales) -> Result<()> {
-    let root = SVGBackend::new(path, (1200, 1050)).into_drawing_area();
-    root.fill(&WHITE)?;
-    let root = root.titled("Vocabulary statistics per chapter", ("sans-serif", 26))?;
+    let mut svg = String::new();
+    let overlay = draw_chart(&mut svg, stats, scales)?;
+    let end = svg.rfind("</svg>").context("plotters output has no closing </svg> tag")?;
+    svg.insert_str(end, &overlay);
+    fs::write(path, svg)?;
+    Ok(())
+}
 
-    let (Some(first), Some(last)) = (stats.first(), stats.last()) else {
-        root.present()?;
-        return Ok(());
-    };
-    let x_range = first.chapter_index as f64 - 0.5..last.chapter_index as f64 + 0.5;
+/// Draw the chart into `svg` with plotters and return the hover overlay to append to it.
+fn draw_chart(svg: &mut String, stats: &[ChapterStat], scales: ChartScales) -> Result<String> {
     let series = |f: fn(&ChapterStat) -> f64| -> Vec<(f64, f64)> {
         stats.iter().map(|s| (s.chapter_index as f64, f(s))).collect()
     };
-
     let panels = [
         Panel {
             caption: "New vocabulary density: filtered words per character, relative to the first chapter",
@@ -172,30 +203,61 @@ pub fn render_chart(path: &Path, stats: &[ChapterStat], scales: ChartScales) -> 
         },
     ];
 
-    let areas = root.split_evenly((panels.len(), 1));
-    for (i, (panel, area)) in panels.iter().zip(&areas).enumerate() {
-        let is_bottom = i == panels.len() - 1;
-        let (lo, hi) = y_bounds(panel);
-        match panel.scale {
-            Scale::Linear => draw_panel(area, x_range.clone(), lo..hi, panel, is_bottom)?,
-            Scale::Log => {
-                let y_range = (lo..hi).log_scale().with_key_points(log_ticks(lo, hi));
-                draw_panel(area, x_range.clone(), y_range, panel, is_bottom)?
-            }
+    let height = HEADER_HEIGHT + PANEL_HEIGHT * panels.len() as u32;
+    let root = SVGBackend::with_string(svg, (WIDTH, height)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let (header, body) = root.split_vertically(HEADER_HEIGHT);
+
+    // Header: title and per-plot summary statistics
+    let centered = |size: f64, style: FontStyle, color: RGBColor| {
+        ("sans-serif", size, style)
+            .into_font()
+            .color(&color)
+            .pos(Pos::new(HPos::Center, VPos::Top))
+    };
+    let title = format!("Vocabulary statistics per chapter · {} chapters", stats.len());
+    header.draw(&Text::new(title, (WIDTH as i32 / 2, 14), centered(26.0, FontStyle::Bold, BLACK)))?;
+    if !stats.is_empty() {
+        for (i, panel) in panels.iter().enumerate() {
+            let x = (WIDTH as usize * (2 * i + 1) / (2 * panels.len())) as i32;
+            header.draw(&Text::new(panel.y_desc, (x, 54), centered(15.0, FontStyle::Bold, panel.color)))?;
+            header.draw(&Text::new(panel.summary(), (x, 75), centered(14.0, FontStyle::Normal, SLATE)))?;
         }
     }
 
+    let (Some(first), Some(last)) = (stats.first(), stats.last()) else {
+        root.present()?;
+        return Ok(String::new());
+    };
+    let x_range = first.chapter_index as f64 - 0.5..last.chapter_index as f64 + 0.5;
+
+    let areas = body.split_evenly((panels.len(), 1));
+    let mut layouts = Vec::with_capacity(panels.len());
+    for (i, (panel, area)) in panels.iter().zip(&areas).enumerate() {
+        let is_bottom = i == panels.len() - 1;
+        let (lo, hi) = y_bounds(panel);
+        layouts.push(match panel.scale {
+            Scale::Linear => draw_panel(area, x_range.clone(), lo..hi, lo, panel, is_bottom)?,
+            Scale::Log => {
+                let y_range = (lo..hi).log_scale().with_key_points(log_ticks(lo, hi));
+                draw_panel(area, x_range.clone(), y_range, lo, panel, is_bottom)?
+            }
+        });
+    }
+
     root.present()?;
-    Ok(())
+    Ok(hover_overlay(stats, &panels, &layouts))
 }
 
+/// Draw one panel; `y_anchor` is any in-range y value, used to locate undrawn points' x pixel.
 fn draw_panel<Y>(
     area: &DrawingArea<SVGBackend, Shift>,
     x_range: Range<f64>,
     y_range: Y,
+    y_anchor: f64,
     panel: &Panel,
     is_bottom: bool,
-) -> Result<()>
+) -> Result<PanelLayout>
 where
     Y: AsRangedCoord<Value = f64>,
     Y::CoordDescType: ValueFormatter<f64>,
@@ -235,15 +297,73 @@ where
     }
 
     // Non-positive values cannot be shown on a log axis.
+    let visible = panel.points.iter().copied().filter(|&(_, y)| panel.is_visible(y));
+    chart.draw_series(
+        LineSeries::new(visible, panel.color.stroke_width(2)).point_size(if panel.points.len() <= 60 { 3 } else { 2 }),
+    )?;
+
+    let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
     let points = panel
         .points
         .iter()
-        .copied()
-        .filter(|&(_, y)| panel.scale == Scale::Linear || y > 0.0);
-    chart.draw_series(
-        LineSeries::new(points, panel.color.stroke_width(2)).point_size(if panel.points.len() <= 60 { 3 } else { 2 }),
-    )?;
-    Ok(())
+        .map(|&(x, y)| {
+            let shown = panel.is_visible(y);
+            let (px, py) = chart.backend_coord(&(x, if shown { y } else { y_anchor }));
+            (px, shown.then_some(py))
+        })
+        .collect();
+    Ok(PanelLayout { plot_x, plot_y, points })
+}
+
+/// One full-height hover band per chapter, highlighting its points and carrying a `<title>` tooltip.
+fn hover_overlay(stats: &[ChapterStat], panels: &[Panel], layouts: &[PanelLayout]) -> String {
+    let (Some(top), Some(bottom)) = (layouts.first(), layouts.last()) else {
+        return String::new();
+    };
+    let centers: Vec<i32> = top.points.iter().map(|&(x, _)| x).collect();
+    let (y0, y1) = (top.plot_y.start, bottom.plot_y.end);
+
+    let mut svg = String::from(
+        "<style>\
+         .hover rect { fill: #0f172a; fill-opacity: 0; }\
+         .hover:hover rect { fill-opacity: 0.06; }\
+         .hover circle { visibility: hidden; }\
+         .hover:hover circle { visibility: visible; }\
+         </style>\n",
+    );
+    for (i, s) in stats.iter().enumerate() {
+        let left = if i == 0 { top.plot_x.start } else { (centers[i - 1] + centers[i]) / 2 };
+        let right = centers.get(i + 1).map_or(top.plot_x.end, |&next| (centers[i] + next) / 2);
+        let tooltip = format!(
+            "Chapter {}: {}\nNormalized ratio: {:.4}\nRaw ratio: {:.6}\nWords: {}\nCharacters: {}",
+            s.chapter_index,
+            s.title,
+            s.normalized_ratio,
+            s.raw_ratio,
+            format_count(&(s.filtered_words as f64)),
+            format_count(&(s.characters as f64)),
+        );
+        svg.push_str(&format!(
+            "<g class=\"hover\"><title>{}</title><rect x=\"{left}\" y=\"{y0}\" width=\"{}\" height=\"{}\"/>",
+            xml_escape(&tooltip),
+            right - left,
+            y1 - y0,
+        ));
+        for (panel, layout) in panels.iter().zip(layouts) {
+            if let (x, Some(y)) = layout.points[i] {
+                let RGBColor(r, g, b) = panel.color;
+                svg.push_str(&format!(
+                    "<circle cx=\"{x}\" cy=\"{y}\" r=\"5\" fill=\"white\" stroke=\"#{r:02x}{g:02x}{b:02x}\" stroke-width=\"2.5\"/>"
+                ));
+            }
+        }
+        svg.push_str("</g>\n");
+    }
+    svg
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Padded y-range covering the panel's values (and its baseline, if any).
@@ -345,6 +465,9 @@ mod tests {
             assert!(svg.contains("New vocabulary density"));
             assert!(svg.contains("Filtered words exported"));
             assert!(svg.contains("Chapter length"));
+            assert!(svg.contains("<title>Chapter 0: プロローグ &lt;Intro&gt;"));
+            assert!(svg.contains("min 0 · avg 267 · max 500"));
+            assert!(svg.trim_end().ends_with("</svg>"));
         }
         render_chart(&dir.join("empty.svg"), &[], ChartScales { ratio: Scale::Log, words: Scale::Log, characters: Scale::Log }).unwrap();
         fs::remove_dir_all(&dir).unwrap();

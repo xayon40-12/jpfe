@@ -103,6 +103,8 @@ Contains chapter-level vocabulary load and density statistics:
   1. **Normalized vocabulary ratio** relative to the baseline chapter, with a dashed `1` baseline. Log scale by default (`--ratio-scale linear` to change).
   2. **Filtered words exported** per chapter. Log scale by default (`--words-scale linear` to change).
   3. **Character count** per chapter (bottom). Linear scale by default (`--chars-scale log` to change).
+  - A header shows the chapter count and the min / average / max of each metric.
+  - Hovering a chapter highlights its points in all three plots and shows a tooltip with its title, ratios, word count and character count (when the SVG is opened in a browser).
 
 ---
 
