@@ -61,6 +61,8 @@ pub fn apply(ctx: &egui::Context) {
             (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
         ]
         .into();
+        // Like native apps: text is not selectable, so it does not take clicks meant for what is around it
+        style.interaction.selectable_labels = false;
         let spacing = &mut style.spacing;
         spacing.item_spacing = egui::vec2(8.0, 8.0);
         spacing.button_padding = egui::vec2(10.0, 4.0);

@@ -670,52 +670,60 @@ impl ViewerApp {
             for (i, book) in self.books.iter_mut().enumerate() {
                 let selected = i == self.shown;
                 let others_learned = any_learned && remaining[i] < book.words.iter().map(Vec::len).sum();
-                let mut frame = theme::card(palette);
-                if selected {
-                    frame = frame.stroke(egui::Stroke::new(1.5, palette.accent));
-                }
-                frame.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let name = ui.add(egui::Label::new(RichText::new(&book.name).strong()).truncate().sense(egui::Sense::click()));
-                        if name.clicked() {
-                            self.shown = i;
-                            self.wanted_shown = None;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Remove this book").clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    });
-                    let total: usize = book.words.iter().map(Vec::len).sum();
-                    ui.label(
-                        RichText::new(format!("{} chapters · {} words to learn", book.chapters.len(), format_count(&(total as f64))))
-                            .small()
-                            .color(palette.secondary_text),
-                    );
-                    if others_learned {
-                        ui.label(
-                            RichText::new(format!("{} left after your other books", format_count(&(remaining[i] as f64))))
-                                .small()
-                                .color(palette.accent),
-                        );
+                // The whole card selects the book; its button and chapter selector take their own clicks
+                let card = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                    let hovered = ui.response().hovered();
+                    let mut frame = theme::card(palette);
+                    if selected {
+                        frame = frame.stroke(egui::Stroke::new(1.5, palette.accent));
+                    } else if hovered {
+                        frame = frame.stroke(egui::Stroke::new(1.0, palette.accent.linear_multiply(0.5)));
                     }
-                    ui.label(RichText::new("Learned up to (included)").small().color(palette.secondary_text));
-                    let selected_text = book.learned.map_or("Not started".to_string(), |pos| book.chapter_label(pos));
-                    egui::ComboBox::from_id_salt(("learned", i))
-                        .width(ui.available_width())
-                        .height(400.0)
-                        .truncate()
-                        .selected_text(selected_text)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut book.learned, None, "Not started");
-                            for pos in 0..book.chapters.len() {
-                                let label = book.chapter_label(pos);
-                                ui.selectable_value(&mut book.learned, Some(pos), label);
-                            }
+                    frame.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(RichText::new(&book.name).strong()).truncate());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Remove this book").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
                         });
+                        let total: usize = book.words.iter().map(Vec::len).sum();
+                        ui.label(
+                            RichText::new(format!("{} chapters · {} words to learn", book.chapters.len(), format_count(&(total as f64))))
+                                .small()
+                                .color(palette.secondary_text),
+                        );
+                        if others_learned {
+                            ui.label(
+                                RichText::new(format!("{} left after your other books", format_count(&(remaining[i] as f64))))
+                                    .small()
+                                    .color(palette.accent),
+                            );
+                        }
+                        ui.label(RichText::new("Learned up to (included)").small().color(palette.secondary_text));
+                        let selected_text = book.learned.map_or("Not started".to_string(), |pos| book.chapter_label(pos));
+                        egui::ComboBox::from_id_salt(("learned", i))
+                            .width(ui.available_width())
+                            .height(400.0)
+                            .truncate()
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                list_rows(ui, |ui| {
+                                    ui.selectable_value(&mut book.learned, None, "Not started");
+                                    for pos in 0..book.chapters.len() {
+                                        let label = book.chapter_label(pos);
+                                        ui.selectable_value(&mut book.learned, Some(pos), label);
+                                    }
+                                });
+                            });
+                    });
                 });
+                if card.response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    self.shown = i;
+                    self.wanted_shown = None;
+                }
                 ui.add_space(6.0);
             }
             for book in &self.pending {
@@ -786,9 +794,11 @@ impl ViewerApp {
                 .truncate()
                 .selected_text(&names[shown])
                 .show_ui(ui, |ui| {
-                    for (i, name) in names.iter().enumerate() {
-                        ui.selectable_value(&mut shown, i, name);
-                    }
+                    list_rows(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            ui.selectable_value(&mut shown, i, name);
+                        }
+                    });
                 });
             let button = theme::primary_button("Download word lists (.zip)", palette);
             download = if stacked {
@@ -867,6 +877,12 @@ impl ViewerApp {
             self.log_scales[i] = !self.log_scales[i];
         }
     }
+}
+
+/// Rows of a drop-down list that fill its width with no gaps, so a click anywhere on a row selects it.
+fn list_rows(ui: &mut Ui, rows: impl FnOnce(&mut Ui)) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), rows);
 }
 
 /// On touch screens, a still long press on a chart starts inspecting it, until the finger is lifted.
