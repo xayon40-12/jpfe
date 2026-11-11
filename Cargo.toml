@@ -23,6 +23,8 @@ cli = ["embed-dict", "parallel", "dep:clap", "dep:plotters", "dep:csv", "dep:uni
 embed-dict = ["lindera/embed-unidic"]
 # Extract PDF pages on several threads
 parallel = ["dep:rayon", "lopdf/rayon"]
+# Serialize chapters and word counts (the viewer caches them)
+serde = ["dep:serde"]
 
 [dependencies]
 lindera = { version = "6.2.0", default-features = false }
@@ -32,6 +34,7 @@ regex = "1.13"
 anyhow = "1.0"
 lopdf = { version = "0.47", default-features = false }
 rayon = { version = "1.12", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
 csv = { version = "1.4", optional = true }
 unicode-width = { version = "0.2.3", optional = true }

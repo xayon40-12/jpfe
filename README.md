@@ -118,6 +118,8 @@ Contains chapter-level vocabulary load and density statistics:
 
 Each book entry also shows how many of its words are left once the words learned in your other books are removed. **⚙ Settings** changes how the word lists are built, with the same meaning and defaults as the CLI options: coverage target (`-p 99`), minimum occurrences in the book (`-m 3`), only words new to the book (opposite of `--show-previous-words`), leaving out katakana-only words (on by default; viewer only), and including particles and auxiliary verbs (`--include-particles`, which analyzes the books again). The look follows macOS colors and controls, in light or dark mode depending on the system setting.
 
+Imported books, your progress in each, the settings and the plot scales are remembered: in the browser's private storage (OPFS) on the web, and in the user data folder (e.g. `~/Library/Application Support/jpfe-viewer`) on the desktop. Each book's analysis is cached too, and reused only by the same build of the viewer with the same dictionary; after an update, books are analyzed again from their stored file.
+
 ### Run it on the desktop
 ```bash
 cargo run --release -p jpfe-viewer
@@ -125,7 +127,7 @@ cargo run --release -p jpfe-viewer
 The dictionary is embedded, as in the CLI. Japanese text uses a system font (Hiragino on macOS, Noto Sans CJK on Linux, Yu Gothic / Meiryo on Windows).
 
 ### Build the web version
-Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary once (about 35 MB, zstd-compressed) and Noto Sans JP (4 MB).
+Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary (about 35 MB, zstd-compressed) and Noto Sans JP (4 MB), and keeps the unpacked dictionary in browser storage. On later visits it only fetches `assets/dict/version.txt` and downloads the dictionary again when that version changed.
 ```bash
 rustup target add wasm32-unknown-unknown   # once
 ./viewer/build-web-assets.sh               # dictionary and font into viewer/assets/ (needs zstd and curl)

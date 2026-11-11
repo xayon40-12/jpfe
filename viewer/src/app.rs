@@ -4,11 +4,13 @@ use egui::{Color32, RichText, Ui};
 use egui_plot::{GridInput, GridMark, HLine, HoverPosition, Line, LineStyle, Plot, Points, VLine};
 use jpfe::chart::{format_count, format_ratio, log_ticks};
 use jpfe::models::ChapterStat;
-use jpfe::tokenizer::JapaneseTokenizer;
+use jpfe::tokenizer::{JapaneseTokenizer, DICTIONARY_FILES};
+use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
 
-use crate::book::{Book, BookStats, PendingBook, Settings};
+use crate::book::{Book, BookStats, CacheKey, PendingBook, SavedBook, Settings};
 use crate::platform::{self, Inbox, Incoming};
+use crate::storage::{self, Key};
 use crate::theme::{self, Palette};
 
 /// Below this window width the books and the charts are stacked in one column (phones).
@@ -19,11 +21,36 @@ const MIN_PLOT_HEIGHT: f32 = 170.0;
 /// Tokenizing time per frame, so the window keeps redrawing while books load.
 const WORK_PER_FRAME: Duration = Duration::from_millis(25);
 
+/// Identifies the code that computed a cached analysis (see `build.rs`).
+const BUILD_ID: &str = env!("JPFE_BUILD_ID");
+
 enum DictionaryState {
-    /// Web only: compressed files still to unpack, and the unpacked ones
-    Loading { compressed: Vec<(String, Vec<u8>)>, files: HashMap<String, Vec<u8>>, received: usize },
-    Ready(Box<JapaneseTokenizer>),
+    /// Web only: waiting for the server's and the stored dictionary versions (`None` = unknown yet)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Checking { remote: Option<Option<String>>, stored: Option<Option<String>> },
+    /// Web only: unpacked files of `version`, read from storage or downloaded (`compressed`, to unpack)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Loading { version: String, from_storage: bool, compressed: Vec<(String, Vec<u8>)>, files: HashMap<String, Vec<u8>>, received: usize },
+    /// `version` is part of the key of cached analyses
+    Ready { tokenizer: Box<JapaneseTokenizer>, version: String },
     Failed(String),
+}
+
+/// Everything remembered between sessions, besides the files and analyses.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedState {
+    settings: Settings,
+    log_scales: [bool; 3],
+    shown: Option<u64>,
+    next_id: u64,
+    books: Vec<SavedBook>,
+}
+
+impl Default for SavedState {
+    fn default() -> Self {
+        Self { settings: Settings::default(), log_scales: [true, false, true], shown: None, next_id: 0, books: Vec::new() }
+    }
 }
 
 pub struct ViewerApp {
@@ -45,6 +72,20 @@ pub struct ViewerApp {
     show_settings: bool,
     /// For each book, its words not learned in the other books
     remaining: Option<(StatsKey, Vec<usize>)>,
+
+    /// The saved state has been read; until then nothing is saved, so it is not overwritten
+    state_loaded: bool,
+    /// Last state written to storage
+    saved: Option<SavedState>,
+    next_id: u64,
+    /// Saved books waiting for the dictionary, then the ones whose analysis or file is being read
+    to_restore: Vec<SavedBook>,
+    restoring: Vec<SavedBook>,
+    /// Saved shown book, selected once it is restored
+    wanted_shown: Option<u64>,
+    /// Version of the dictionary being written to storage, and how many of its files are written
+    dictionary_writes: Option<(String, usize)>,
+    storage_error: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -58,11 +99,16 @@ impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let inbox = Inbox::default();
-        platform::load_assets(&inbox, &cc.egui_ctx);
+        let ctx = &cc.egui_ctx;
+        platform::load_assets(&inbox, ctx);
+        storage::read(&inbox, ctx, Key::State);
         let dictionary = match platform::embedded_tokenizer() {
-            Some(Ok(tokenizer)) => DictionaryState::Ready(Box::new(tokenizer)),
+            Some(Ok(tokenizer)) => DictionaryState::Ready { tokenizer: Box::new(tokenizer), version: "embedded".into() },
             Some(Err(e)) => DictionaryState::Failed(e.to_string()),
-            None => DictionaryState::Loading { compressed: Vec::new(), files: HashMap::new(), received: 0 },
+            None => {
+                storage::read(&inbox, ctx, Key::DictionaryVersion);
+                DictionaryState::Checking { remote: None, stored: None }
+            }
         };
         Self {
             inbox,
@@ -78,18 +124,41 @@ impl ViewerApp {
             edited_settings: Settings::default(),
             show_settings: false,
             remaining: None,
+            state_loaded: false,
+            saved: None,
+            next_id: 0,
+            to_restore: Vec::new(),
+            restoring: Vec::new(),
+            wanted_shown: None,
+            dictionary_writes: None,
+            storage_error: None,
         }
     }
 
     fn handle_incoming(&mut self, ctx: &egui::Context) {
+        let mut deferred = Vec::new();
         for message in self.inbox.drain() {
             match message {
-                Incoming::File { name, bytes } => match PendingBook::parse(&name, bytes) {
-                    Ok(book) => self.pending.push(book),
-                    Err(e) => self.errors.push(format!("{e:#}")),
-                },
+                // New books get ids after the saved ones, so wait for the saved state
+                Incoming::File { .. } if !self.state_loaded => deferred.push(message),
+                Incoming::File { name, bytes } => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    match PendingBook::parse(id, &name, bytes.clone(), None) {
+                        Ok(book) => {
+                            storage::write(&self.inbox, ctx, Key::Source(id), bytes);
+                            self.pending.push(book);
+                        }
+                        Err(e) => self.errors.push(format!("{e:#}")),
+                    }
+                }
+                Incoming::DictionaryVersion(version) => {
+                    if let DictionaryState::Checking { remote, .. } = &mut self.dictionary {
+                        *remote = Some(version);
+                    }
+                }
                 Incoming::DictionaryFile { name, bytes } => {
-                    if let DictionaryState::Loading { compressed, received, .. } = &mut self.dictionary {
+                    if let DictionaryState::Loading { compressed, received, from_storage: false, .. } = &mut self.dictionary {
                         match bytes {
                             Ok(bytes) => {
                                 compressed.push((name, bytes));
@@ -98,6 +167,22 @@ impl ViewerApp {
                             Err(e) => self.dictionary = DictionaryState::Failed(format!("Downloading {name}: {e}")),
                         }
                     }
+                }
+                Incoming::Stored { key, bytes } => self.handle_stored(ctx, key, bytes),
+                Incoming::Written(Key::DictionaryFile(_)) => {
+                    if let Some((version, written)) = &mut self.dictionary_writes {
+                        *written += 1;
+                        // Written last, so an interrupted download is never taken as complete
+                        if *written == DICTIONARY_FILES.len() {
+                            storage::write(&self.inbox, ctx, Key::DictionaryVersion, version.clone().into_bytes());
+                            self.dictionary_writes = None;
+                        }
+                    }
+                }
+                Incoming::Written(_) => {}
+                Incoming::StorageError(e) => {
+                    log::warn!("Storage: {e}");
+                    self.storage_error.get_or_insert(e);
                 }
                 Incoming::Font { name, bytes, primary } => {
                     let priority = if primary { egui::epaint::text::FontPriority::Highest } else { egui::epaint::text::FontPriority::Lowest };
@@ -109,53 +194,216 @@ impl ViewerApp {
                 Incoming::Error(e) => self.errors.push(e),
             }
         }
+        for message in deferred {
+            self.inbox.push(message);
+        }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             platform::read_dropped(&self.inbox, file, ctx);
         }
     }
 
-    /// Unpack the dictionary and tokenize pending books, a little per frame.
+    fn handle_stored(&mut self, ctx: &egui::Context, key: Key, bytes: Option<Vec<u8>>) {
+        match key {
+            Key::State => {
+                let state: SavedState = bytes.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                self.settings = state.settings;
+                self.edited_settings = state.settings;
+                self.log_scales = state.log_scales;
+                self.wanted_shown = state.shown;
+                self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
+                self.to_restore = state.books.clone();
+                self.saved = Some(state);
+                self.state_loaded = true;
+            }
+            Key::DictionaryVersion => {
+                if let DictionaryState::Checking { stored, .. } = &mut self.dictionary {
+                    *stored = Some(bytes.and_then(|b| String::from_utf8(b).ok()).map(|v| v.trim().to_string()));
+                }
+            }
+            Key::DictionaryFile(name) => {
+                if let DictionaryState::Loading { version, files, from_storage: true, .. } = &mut self.dictionary {
+                    match bytes {
+                        Some(bytes) => {
+                            files.insert(name, bytes);
+                        }
+                        // Incomplete cache: download this version instead
+                        None => {
+                            let version = version.clone();
+                            self.start_download(ctx, version);
+                        }
+                    }
+                }
+            }
+            Key::Analysis(id) => {
+                let Some(pos) = self.restoring.iter().position(|b| b.id == id) else { return };
+                let Some(dictionary) = self.dictionary_version() else { return };
+                let key = CacheKey { build: BUILD_ID, dictionary: &dictionary, include_particles: self.settings.include_particles };
+                let book = bytes.and_then(|b| Book::from_analysis(self.restoring[pos].clone(), &b, &key, &self.settings));
+                match book {
+                    Some(book) => {
+                        self.restoring.remove(pos);
+                        self.insert_book(book);
+                    }
+                    // Missing, or made by another build or dictionary: analyze the book again
+                    None => storage::read(&self.inbox, ctx, Key::Source(id)),
+                }
+            }
+            Key::Source(id) => {
+                let Some(pos) = self.restoring.iter().position(|b| b.id == id) else { return };
+                let saved = self.restoring.remove(pos);
+                match bytes.map(|b| PendingBook::parse(saved.id, &saved.file_name, b, saved.learned)) {
+                    Some(Ok(book)) => self.pending.push(book),
+                    Some(Err(e)) => self.errors.push(format!("{e:#}")),
+                    None => self.errors.push(format!("{}: the stored file is missing; open it again", saved.name)),
+                }
+            }
+        }
+    }
+
+    fn dictionary_version(&self) -> Option<String> {
+        match &self.dictionary {
+            DictionaryState::Ready { version, .. } => Some(version.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+    fn start_download(&mut self, ctx: &egui::Context, version: String) {
+        #[cfg(target_arch = "wasm32")]
+        platform::download_dictionary(&self.inbox, ctx, &version);
+        self.dictionary_writes = Some((version.clone(), 0));
+        self.dictionary = DictionaryState::Loading { version, from_storage: false, compressed: Vec::new(), files: HashMap::new(), received: 0 };
+    }
+
+    /// Add a ready book, keeping import order and the shown book.
+    fn insert_book(&mut self, book: Book) {
+        let shown_id = self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id));
+        self.books.push(book);
+        self.books.sort_by_key(|b| b.id);
+        if let Some(pos) = shown_id.and_then(|id| self.books.iter().position(|b| b.id == id)) {
+            self.shown = pos;
+            if self.wanted_shown == Some(self.books[pos].id) {
+                self.wanted_shown = None;
+            }
+        }
+        self.generation += 1;
+    }
+
+    /// Get the dictionary ready, restore saved books, and tokenize pending ones, a little per frame.
     fn do_work(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
-        if let DictionaryState::Loading { compressed, files, received } = &mut self.dictionary {
-            if let Some((name, bytes)) = compressed.pop() {
-                match platform::decompress(&bytes) {
-                    Ok(data) => {
-                        files.insert(name, data);
-                    }
-                    Err(e) => self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}")),
-                }
-                ctx.request_repaint();
-                return;
-            }
-            if *received == jpfe::tokenizer::DICTIONARY_FILES.len() && files.len() == *received {
-                let mut files = std::mem::take(files);
-                self.dictionary = match jpfe::tokenizer::dictionary_from_files(|name| files.remove(name)) {
-                    Ok(dictionary) => DictionaryState::Ready(Box::new(JapaneseTokenizer::with_dictionary(dictionary, true, false))),
-                    Err(e) => DictionaryState::Failed(format!("{e:#}")),
-                };
-                ctx.request_repaint();
-                return;
+        if self.prepare_dictionary(ctx) {
+            ctx.request_repaint();
+            return;
+        }
+        let Some(dictionary) = self.dictionary_version() else { return };
+
+        if self.state_loaded && !self.to_restore.is_empty() {
+            for saved in std::mem::take(&mut self.to_restore) {
+                storage::read(&self.inbox, ctx, Key::Analysis(saved.id));
+                self.restoring.push(saved);
             }
         }
 
-        let DictionaryState::Ready(tokenizer) = &mut self.dictionary else { return };
+        let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary else { return };
         let Some(book) = self.pending.first_mut() else { return };
         tokenizer.set_include_particles(self.settings.include_particles);
         match book.step(tokenizer, Instant::now() + WORK_PER_FRAME) {
             Ok(false) => {}
             Ok(true) => {
                 let book = self.pending.remove(0).finish(&self.settings);
-                self.books.push(book);
-                self.generation += 1;
+                let key = CacheKey { build: BUILD_ID, dictionary: &dictionary, include_particles: self.settings.include_particles };
+                storage::write(&self.inbox, ctx, Key::Analysis(book.id), book.analysis_bytes(&key));
+                self.insert_book(book);
             }
             Err(e) => {
                 let book = self.pending.remove(0);
-                self.errors.push(format!("{}: {e:#}", book.name));
+                self.errors.push(format!("{}: {e:#}", book.saved.name));
             }
         }
         ctx.request_repaint();
+    }
+
+    /// Web: pick the stored or the downloaded dictionary, and unpack it; true while busy.
+    #[cfg(target_arch = "wasm32")]
+    fn prepare_dictionary(&mut self, ctx: &egui::Context) -> bool {
+        match &mut self.dictionary {
+            DictionaryState::Checking { remote: Some(remote), stored: Some(stored) } => {
+                match (remote.clone(), stored.clone()) {
+                    // Same as the stored one, or offline with a stored one: no download
+                    (Some(remote), Some(stored)) if remote == stored => self.read_stored_dictionary(ctx, stored),
+                    (None, Some(stored)) => self.read_stored_dictionary(ctx, stored),
+                    (Some(remote), _) => self.start_download(ctx, remote),
+                    (None, None) => self.dictionary = DictionaryState::Failed("could not download it".into()),
+                }
+                true
+            }
+            DictionaryState::Checking { .. } => true,
+            DictionaryState::Loading { version, from_storage, compressed, files, .. } => {
+                if let Some((name, bytes)) = compressed.pop() {
+                    match platform::decompress(&bytes) {
+                        Ok(data) => {
+                            storage::write(&self.inbox, ctx, Key::DictionaryFile(name.clone()), data.clone());
+                            files.insert(name, data);
+                        }
+                        Err(e) => self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}")),
+                    }
+                } else if files.len() == DICTIONARY_FILES.len() {
+                    let (version, mut files) = (version.clone(), std::mem::take(files));
+                    log::info!("Dictionary {version} {}", if *from_storage { "from storage" } else { "downloaded" });
+                    self.dictionary = match jpfe::tokenizer::dictionary_from_files(|name| files.remove(name)) {
+                        Ok(dictionary) => DictionaryState::Ready {
+                            tokenizer: Box::new(JapaneseTokenizer::with_dictionary(dictionary, true, false)),
+                            version,
+                        },
+                        Err(e) => DictionaryState::Failed(format!("{e:#}")),
+                    };
+                }
+                true
+            }
+            DictionaryState::Ready { .. } | DictionaryState::Failed(_) => false,
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_stored_dictionary(&mut self, ctx: &egui::Context, version: String) {
+        for name in DICTIONARY_FILES {
+            storage::read(&self.inbox, ctx, Key::DictionaryFile(name.to_string()));
+        }
+        self.dictionary = DictionaryState::Loading { version, from_storage: true, compressed: Vec::new(), files: HashMap::new(), received: 0 };
+    }
+
+    /// Everything to remember, written whenever it changes.
+    fn current_state(&self) -> SavedState {
+        let mut books: Vec<SavedBook> = self
+            .books
+            .iter()
+            .map(Book::saved)
+            .chain(self.pending.iter().map(|b| b.saved.clone()))
+            .chain(self.restoring.iter().chain(&self.to_restore).cloned())
+            .collect();
+        books.sort_by_key(|b| b.id);
+        SavedState {
+            settings: self.settings,
+            log_scales: self.log_scales,
+            shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
+            next_id: self.next_id,
+            books,
+        }
+    }
+
+    fn save_state(&mut self, ctx: &egui::Context) {
+        if !self.state_loaded {
+            return;
+        }
+        let state = self.current_state();
+        if self.saved.as_ref() != Some(&state) {
+            if let Ok(json) = serde_json::to_vec(&state) {
+                storage::write(&self.inbox, ctx, Key::State, json);
+            }
+            self.saved = Some(state);
+        }
     }
 
     /// Rebuild the word lists once the edited settings differ, but not while a slider is dragged.
@@ -271,9 +519,16 @@ impl ViewerApp {
         }
         ui.label(RichText::new("You can also drop files on the window.").small().color(palette.secondary_text));
 
+        let total = DICTIONARY_FILES.len();
         match &self.dictionary {
+            DictionaryState::Checking { .. } => {
+                ui.add(egui::ProgressBar::new(0.0).text("Checking the dictionary…"));
+            }
+            DictionaryState::Loading { files, from_storage: true, .. } => {
+                let text = format!("Loading the saved dictionary ({}/{total})…", files.len());
+                ui.add(egui::ProgressBar::new(files.len() as f32 / total as f32).text(text));
+            }
             DictionaryState::Loading { files, received, .. } => {
-                let total = jpfe::tokenizer::DICTIONARY_FILES.len();
                 let text = if *received < total {
                     format!("Downloading the dictionary ({received}/{total})…")
                 } else {
@@ -284,7 +539,11 @@ impl ViewerApp {
             DictionaryState::Failed(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, format!("Dictionary unavailable: {e}"));
             }
-            DictionaryState::Ready(_) => {}
+            DictionaryState::Ready { .. } => {}
+        }
+        if let Some(e) = &self.storage_error {
+            ui.label(RichText::new("Books cannot be saved in this browser, so they will not be kept.").small().color(palette.secondary_text))
+                .on_hover_text(e);
         }
         ui.add_space(8.0);
 
@@ -305,6 +564,7 @@ impl ViewerApp {
                         let name = ui.add(egui::Label::new(RichText::new(&book.name).strong()).truncate().sense(egui::Sense::click()));
                         if name.clicked() {
                             self.shown = i;
+                            self.wanted_shown = None;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Remove this book").clicked() {
@@ -345,10 +605,21 @@ impl ViewerApp {
             for book in &self.pending {
                 theme::card(palette).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(&book.name).strong());
-                    let waiting = !matches!(self.dictionary, DictionaryState::Ready(_));
+                    ui.label(RichText::new(&book.saved.name).strong());
+                    let waiting = !matches!(self.dictionary, DictionaryState::Ready { .. });
                     let text = if waiting { "Waiting for the dictionary…" } else { "Analyzing chapters…" };
                     ui.add(egui::ProgressBar::new(book.progress()).text(text));
+                });
+                ui.add_space(6.0);
+            }
+            for saved in self.restoring.iter().chain(&self.to_restore) {
+                theme::card(palette).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(&saved.name).strong());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Restoring…").small().color(palette.secondary_text));
+                    });
                 });
                 ui.add_space(6.0);
             }
@@ -362,7 +633,8 @@ impl ViewerApp {
             }
         }
         if let Some(i) = remove {
-            self.books.remove(i);
+            let book = self.books.remove(i);
+            storage::remove_book(&self.inbox, ui.ctx(), book.id);
             self.generation += 1;
             if self.shown > i {
                 self.shown -= 1;
@@ -409,6 +681,9 @@ impl ViewerApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.add(button).clicked()).inner
             };
         });
+        if shown != self.shown {
+            self.wanted_shown = None;
+        }
         self.shown = shown;
         let learned_x = self.books[shown].learned.map(|pos| self.books[shown].chapters[pos].index as f64);
         let others_learning = self.books.iter().enumerate().any(|(i, b)| i != shown && b.learned.is_some());
@@ -633,5 +908,6 @@ impl eframe::App for ViewerApp {
         self.settings_window(&ctx, palette);
         // After drawing, so the window shows this frame while the slow work runs
         self.do_work(&ctx);
+        self.save_state(&ctx);
     }
 }

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::io::{Cursor, Write};
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 use jpfe::epub::extract_epub_chapters_from_bytes;
 use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer};
 use jpfe::models::{chapter_file_stem, vocabulary_ratio, Chapter, ChapterStat};
@@ -12,7 +13,8 @@ use jpfe::tokenizer::{is_katakana_word, JapaneseTokenizer, ParsedWord};
 use web_time::Instant;
 
 /// Word-list settings, with the same meaning and defaults as the CLI options.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     /// `--target-percentage`: each chapter's list stops once its words cover this share of the chapter
     pub target_percentage: f64,
@@ -44,7 +46,48 @@ pub struct ChapterInfo {
     pub characters: usize,
 }
 
+/// What a cached analysis was computed with; it is only reused when all of these match.
+pub struct CacheKey<'a> {
+    /// Hash of the viewer's and the library's code
+    pub build: &'a str,
+    pub dictionary: &'a str,
+    pub include_particles: bool,
+}
+
+/// A book as remembered between sessions (its file and analysis are stored separately).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedBook {
+    pub id: u64,
+    pub name: String,
+    pub file_name: String,
+    pub learned: Option<usize>,
+}
+
+/// Stored analysis. Field order matters: `CachedAnalysisRef` encodes the same fields with postcard.
+#[derive(Deserialize)]
+struct CachedAnalysis {
+    build: String,
+    dictionary: String,
+    include_particles: bool,
+    chapters: Vec<Chapter>,
+    analyzer: FrequencyAnalyzer,
+    counts: Vec<ChapterCounts>,
+}
+
+#[derive(Serialize)]
+struct CachedAnalysisRef<'a> {
+    build: &'a str,
+    dictionary: &'a str,
+    include_particles: bool,
+    chapters: &'a [Chapter],
+    analyzer: &'a FrequencyAnalyzer,
+    counts: &'a [ChapterCounts],
+}
+
 pub struct Book {
+    /// Key of the book in storage; also its position, as ids grow in import order
+    pub id: u64,
+    pub file_name: String,
     pub name: String,
     pub chapters: Vec<ChapterInfo>,
     /// The extracted chapters, to tokenize them again when the tokenizer setting changes
@@ -58,6 +101,46 @@ pub struct Book {
 }
 
 impl Book {
+    fn new(saved: SavedBook, texts: Vec<Chapter>, analyzer: FrequencyAnalyzer, counts: Vec<ChapterCounts>, settings: &Settings) -> Self {
+        let words = word_lists(&analyzer, &counts, settings);
+        let chapters = texts
+            .iter()
+            .map(|c| ChapterInfo { index: c.index, characters: c.text.chars().count(), title: c.title.clone() })
+            .collect();
+        let SavedBook { id, name, file_name, learned } = saved;
+        // A new build may find fewer chapters than when the progress was saved
+        let learned = learned.map(|pos| pos.min(texts.len().saturating_sub(1)));
+        Book { id, file_name, name, chapters, texts, analyzer, counts, words, learned }
+    }
+
+    pub fn saved(&self) -> SavedBook {
+        SavedBook { id: self.id, name: self.name.clone(), file_name: self.file_name.clone(), learned: self.learned }
+    }
+
+    /// The analysis, to store and reuse with the same `key`.
+    pub fn analysis_bytes(&self, key: &CacheKey) -> Vec<u8> {
+        let cached = CachedAnalysisRef {
+            build: key.build,
+            dictionary: key.dictionary,
+            include_particles: key.include_particles,
+            chapters: &self.texts,
+            analyzer: &self.analyzer,
+            counts: &self.counts,
+        };
+        postcard::to_allocvec(&cached).unwrap_or_default()
+    }
+
+    /// The book from a stored analysis, if it was made with the same `key`.
+    pub fn from_analysis(saved: SavedBook, bytes: &[u8], key: &CacheKey, settings: &Settings) -> Option<Self> {
+        let cached: CachedAnalysis = postcard::from_bytes(bytes).ok()?;
+        let matches = cached.build == key.build
+            && cached.dictionary == key.dictionary
+            && cached.include_particles == key.include_particles
+            && cached.chapters.len() == cached.counts.len()
+            && !cached.chapters.is_empty();
+        matches.then(|| Self::new(saved, cached.chapters, cached.analyzer, cached.counts, settings))
+    }
+
     /// Words of every chapter up to and including the learned one.
     pub fn learned_words(&self) -> impl Iterator<Item = &str> {
         let count = self.learned.map_or(0, |pos| pos + 1);
@@ -71,7 +154,8 @@ impl Book {
 
     /// Start over from the chapter texts, keeping the reader's progress.
     pub fn retokenize(self) -> PendingBook {
-        PendingBook { name: self.name, chapters: self.texts, tokens: Vec::new(), learned: self.learned }
+        let saved = self.saved();
+        PendingBook { saved, chapters: self.texts, tokens: Vec::new() }
     }
 
     /// Words learned in every book but `book`.
@@ -143,15 +227,14 @@ impl BookStats {
 /// A book being tokenized a few chapters per frame, so the window stays responsive
 /// (the web version has no threads).
 pub struct PendingBook {
-    pub name: String,
+    /// Id, names and the reader's progress, kept when a book is tokenized again
+    pub saved: SavedBook,
     chapters: Vec<Chapter>,
     tokens: Vec<Vec<ParsedWord>>,
-    /// Progress kept when a loaded book is tokenized again
-    learned: Option<usize>,
 }
 
 impl PendingBook {
-    pub fn parse(file_name: &str, bytes: Vec<u8>) -> Result<Self> {
+    pub fn parse(id: u64, file_name: &str, bytes: Vec<u8>, learned: Option<usize>) -> Result<Self> {
         let lower = file_name.to_lowercase();
         let chapters = if lower.ends_with(".epub") {
             extract_epub_chapters_from_bytes(bytes)?
@@ -164,7 +247,8 @@ impl PendingBook {
             bail!("{file_name}: no chapters found");
         }
         let name = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem).to_string();
-        Ok(Self { name, chapters, tokens: Vec::new(), learned: None })
+        let saved = SavedBook { id, name, file_name: file_name.to_string(), learned };
+        Ok(Self { saved, chapters, tokens: Vec::new() })
     }
 
     /// Tokenize again from the first chapter (after a tokenizer setting changed).
@@ -190,13 +274,7 @@ impl PendingBook {
     pub fn finish(self, settings: &Settings) -> Book {
         let analyzer = FrequencyAnalyzer::from_tokens(&self.chapters, &self.tokens);
         let counts: Vec<ChapterCounts> = self.tokens.iter().map(|t| ChapterCounts::new(t)).collect();
-        let words = word_lists(&analyzer, &counts, settings);
-        let chapters = self
-            .chapters
-            .iter()
-            .map(|c| ChapterInfo { index: c.index, characters: c.text.chars().count(), title: c.title.clone() })
-            .collect();
-        Book { name: self.name, chapters, texts: self.chapters, analyzer, counts, words, learned: self.learned }
+        Book::new(self.saved, self.chapters, analyzer, counts, settings)
     }
 }
 
@@ -223,6 +301,8 @@ mod tests {
 
     fn book(name: &str, words: &[&[&str]]) -> Book {
         Book {
+            id: 0,
+            file_name: format!("{name}.epub"),
             name: name.to_string(),
             chapters: (0..words.len())
                 .map(|i| ChapterInfo { index: i, title: format!("第{i}話"), characters: 100 })
@@ -243,10 +323,9 @@ mod tests {
     fn settings_change_the_word_lists() {
         let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
         let pending = PendingBook {
-            name: "A".into(),
+            saved: SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(1) },
             chapters,
             tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥", "パン"])],
-            learned: Some(1),
         };
         let mut book = pending.finish(&Settings { min_book_count: 1, ..Settings::default() });
         assert_eq!(book.words, [vec!["猫", "犬"], vec!["鳥"]]);
@@ -260,6 +339,34 @@ mod tests {
         assert_eq!(book.words[1], ["鳥"]);
         book.apply(&Settings { min_book_count: 1, hide_katakana_words: false, ..Settings::default() });
         assert_eq!(book.words[1], ["パン", "鳥"]);
+    }
+
+    #[test]
+    fn reuses_analysis_only_with_the_same_key() {
+        let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
+        let pending = PendingBook {
+            saved: SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
+            chapters,
+            tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
+        };
+        let settings = Settings { min_book_count: 1, ..Settings::default() };
+        let book = pending.finish(&settings);
+        let key = CacheKey { build: "b1", dictionary: "d1", include_particles: false };
+        let bytes = book.analysis_bytes(&key);
+
+        let restored = Book::from_analysis(book.saved(), &bytes, &key, &settings).unwrap();
+        assert_eq!(restored.words, book.words);
+        assert_eq!(restored.saved(), book.saved());
+        assert_eq!(restored.chapters.len(), 2);
+
+        for other in [
+            CacheKey { build: "b2", ..key },
+            CacheKey { dictionary: "d2", ..key },
+            CacheKey { include_particles: true, ..key },
+        ] {
+            assert!(Book::from_analysis(book.saved(), &bytes, &other, &settings).is_none());
+        }
+        assert!(Book::from_analysis(book.saved(), b"not an analysis", &key, &settings).is_none());
     }
 
     #[test]

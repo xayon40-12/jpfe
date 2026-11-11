@@ -3,12 +3,22 @@
 
 use std::sync::{Arc, Mutex};
 
-/// Results of dialogs and downloads, which arrive outside of the UI code.
+use crate::storage::Key;
+
+/// Results of dialogs, downloads and storage, which arrive outside of the UI code.
 pub enum Incoming {
     File { name: String, bytes: Vec<u8> },
-    /// A zstd-compressed dictionary file (web only)
+    /// Version of the dictionary on the server, `None` if it could not be fetched (web only)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    DictionaryVersion(Option<String>),
+    /// A downloaded, zstd-compressed dictionary file (web only)
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     DictionaryFile { name: String, bytes: Result<Vec<u8>, String> },
+    /// Contents read from storage, `None` if missing
+    Stored { key: Key, bytes: Option<Vec<u8>> },
+    /// A storage write finished
+    Written(Key),
+    StorageError(String),
     /// A font to add; the primary one draws Latin text too, the others only fill in missing glyphs
     Font { name: String, bytes: Vec<u8>, primary: bool },
     Error(String),
@@ -111,17 +121,15 @@ mod web {
         None
     }
 
-    /// Download the dictionary files and the font.
+    /// Download the font, and ask the server which dictionary version it has.
     pub fn load_assets(inbox: &Inbox, ctx: &egui::Context) {
-        for name in DICTIONARY_FILES {
+        {
             let (inbox, ctx) = (inbox.clone(), ctx.clone());
-            ehttp::fetch(ehttp::Request::get(format!("assets/dict/{name}.zst")), move |result| {
-                let bytes = match result {
-                    Ok(r) if r.ok => Ok(r.bytes),
-                    Ok(r) => Err(format!("HTTP {} {}", r.status, r.status_text)),
-                    Err(e) => Err(e),
-                };
-                inbox.push(Incoming::DictionaryFile { name: name.to_string(), bytes });
+            // The query avoids a stale HTTP-cached answer
+            let url = format!("assets/dict/version.txt?t={}", js_sys::Date::now() as u64);
+            ehttp::fetch(ehttp::Request::get(url), move |result| {
+                let version = result.ok().filter(|r| r.ok).and_then(|r| r.text().map(|t| t.trim().to_string()));
+                inbox.push(Incoming::DictionaryVersion(version.filter(|v| !v.is_empty())));
                 ctx.request_repaint();
             });
         }
@@ -133,6 +141,23 @@ mod web {
             }
             ctx.request_repaint();
         });
+    }
+
+    /// Download the compressed dictionary files of `version`.
+    pub fn download_dictionary(inbox: &Inbox, ctx: &egui::Context, version: &str) {
+        for name in DICTIONARY_FILES {
+            let (inbox, ctx) = (inbox.clone(), ctx.clone());
+            // The version in the URL avoids getting older files from the HTTP cache
+            ehttp::fetch(ehttp::Request::get(format!("assets/dict/{name}.zst?v={version}")), move |result| {
+                let bytes = match result {
+                    Ok(r) if r.ok => Ok(r.bytes),
+                    Ok(r) => Err(format!("HTTP {} {}", r.status, r.status_text)),
+                    Err(e) => Err(e),
+                };
+                inbox.push(Incoming::DictionaryFile { name: name.to_string(), bytes });
+                ctx.request_repaint();
+            });
+        }
     }
 
     pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {

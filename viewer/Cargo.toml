@@ -12,18 +12,28 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 anyhow = "1.0"
 log = "0.4"
 web-time = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-jpfe = { path = "..", default-features = false, features = ["embed-dict", "parallel"] }
+jpfe = { path = "..", default-features = false, features = ["embed-dict", "parallel", "serde"] }
 rfd = "0.18"
 env_logger = "0.11"
+dirs = "7"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-jpfe = { path = "..", default-features = false }
+jpfe = { path = "..", default-features = false, features = ["serde"] }
 ehttp = "0.7"
 ruzstd = "0.9"
 rfd = "0.18"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "Document", "Window", "Element", "HtmlCanvasElement"] }
+web-sys = { version = "0.3", features = [
+    "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement", "Document", "Window", "Element", "HtmlCanvasElement",
+    # Origin private file system, for the cache
+    "Navigator", "StorageManager", "File", "FileSystemHandle", "FileSystemDirectoryHandle", "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemRemoveOptions",
+    "FileSystemWritableFileStream", "WritableStream",
+] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"

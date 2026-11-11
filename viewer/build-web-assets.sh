@@ -16,6 +16,8 @@ for f in metadata.json char_def.bin matrix.mtx dict.trie dict.valsidx dict.vals 
   zstd -19 -q -f "$dict/$f" -o "$out/dict/$f.zst"
 done
 tar -xzOf "$dict/../unidic-mecab-2.1.2.tar.gz" unidic-mecab-2.1.2/BSD > "$out/dict/UNIDIC-LICENSE.txt"
+# The viewer keeps the unpacked dictionary in browser storage and downloads it again only when this changes
+cat "$out"/dict/*.zst | { command -v sha256sum >/dev/null && sha256sum || shasum -a 256; } | cut -c1-16 > "$out/dict/version.txt"
 
 font=https://github.com/notofonts/noto-cjk/raw/main/Sans/SubsetOTF/JP/NotoSansJP-Regular.otf
 [ -f "$out/NotoSansJP-Regular.otf" ] || curl -fsSL -o "$out/NotoSansJP-Regular.otf" "$font"

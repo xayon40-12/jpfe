@@ -5,6 +5,7 @@ use crate::models::{Chapter, WordEntry};
 use crate::tokenizer::{JapaneseTokenizer, ParsedWord};
 
 /// Book-wide data of one base word (pronunciation, POS and first chapter come from its first occurrence).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BookWord {
     pub count: usize,
     pub pronunciation: String,
@@ -15,6 +16,7 @@ pub struct BookWord {
 }
 
 /// Occurrences of each base word in one chapter.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChapterCounts {
     pub total: usize,
     pub counts: HashMap<String, usize>,
@@ -30,6 +32,7 @@ impl ChapterCounts {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrequencyAnalyzer {
     pub words: HashMap<String, BookWord>,
     pub total_words: usize,

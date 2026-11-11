@@ -3,6 +3,7 @@
 mod app;
 mod book;
 mod platform;
+mod storage;
 mod theme;
 
 #[cfg(not(target_arch = "wasm32"))]
