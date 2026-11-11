@@ -92,6 +92,11 @@ impl JapaneseTokenizer {
         }
     }
 
+    /// Whether particles (助詞) and auxiliary verbs (助動詞) are kept.
+    pub fn set_include_particles(&mut self, include: bool) {
+        self.include_particles = include;
+    }
+
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
         let Self { segmenter, reading_cache, reading_in_hiragana, include_particles } = self;
         let mut words = Vec::new();

@@ -7,7 +7,7 @@ use jpfe::models::ChapterStat;
 use jpfe::tokenizer::JapaneseTokenizer;
 use web_time::{Duration, Instant};
 
-use crate::book::{Book, BookStats, PendingBook};
+use crate::book::{Book, BookStats, PendingBook, Settings};
 use crate::platform::{self, Inbox, Incoming};
 use crate::theme::{self, Palette};
 
@@ -34,6 +34,12 @@ pub struct ViewerApp {
     stats: Option<(StatsKey, BookStats)>,
     /// Log scale for each plot, in display order (words, characters, density)
     log_scales: [bool; 3],
+    /// Settings the word lists are built with, and the ones being edited in the settings window
+    settings: Settings,
+    edited_settings: Settings,
+    show_settings: bool,
+    /// For each book, its words not learned in the other books
+    remaining: Option<(StatsKey, Vec<usize>)>,
 }
 
 #[derive(PartialEq)]
@@ -63,6 +69,10 @@ impl ViewerApp {
             generation: 0,
             stats: None,
             log_scales: [true, false, true],
+            settings: Settings::default(),
+            edited_settings: Settings::default(),
+            show_settings: false,
+            remaining: None,
         }
     }
 
@@ -127,10 +137,11 @@ impl ViewerApp {
 
         let DictionaryState::Ready(tokenizer) = &mut self.dictionary else { return };
         let Some(book) = self.pending.first_mut() else { return };
+        tokenizer.set_include_particles(self.settings.include_particles);
         match book.step(tokenizer, Instant::now() + WORK_PER_FRAME) {
             Ok(false) => {}
             Ok(true) => {
-                let book = self.pending.remove(0).finish();
+                let book = self.pending.remove(0).finish(&self.settings);
                 self.books.push(book);
                 self.generation += 1;
             }
@@ -142,6 +153,85 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    /// Rebuild the word lists once the edited settings differ, but not while a slider is dragged.
+    fn apply_settings(&mut self, ctx: &egui::Context) {
+        if self.edited_settings == self.settings || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let retokenize = self.edited_settings.include_particles != self.settings.include_particles;
+        self.settings = self.edited_settings;
+        if retokenize {
+            for book in &mut self.pending {
+                book.restart();
+            }
+            let books: Vec<PendingBook> = self.books.drain(..).map(Book::retokenize).collect();
+            self.pending.splice(0..0, books);
+        } else {
+            for book in &mut self.books {
+                book.apply(&self.settings);
+            }
+        }
+        self.generation += 1;
+    }
+
+    fn progress_key(&self, shown: usize) -> StatsKey {
+        StatsKey { generation: self.generation, shown, learned: self.books.iter().map(|b| b.learned).collect() }
+    }
+
+    /// Words of each book not learned in the other books, recomputed when books or progress change.
+    fn remaining_counts(&mut self) -> Vec<usize> {
+        let key = self.progress_key(0);
+        if self.remaining.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.remaining = Some((key, Book::remaining_counts(&self.books)));
+        }
+        self.remaining.as_ref().map(|(_, r)| r.clone()).unwrap_or_default()
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context, palette: Palette) {
+        let mut open = self.show_settings;
+        egui::Window::new("Word list settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::LEFT_TOP, [300.0, 48.0])
+            .show(ctx, |ui| {
+                // Slider tracks use the control fill, which is white on the white window
+                ui.visuals_mut().widgets.inactive.bg_fill = palette.separator;
+                ui.spacing_mut().slider_width = 240.0;
+                let s = &mut self.edited_settings;
+                let note = |ui: &mut Ui, text: &str| {
+                    ui.label(RichText::new(text).small().color(palette.secondary_text));
+                    ui.add_space(4.0);
+                };
+                ui.label("Coverage target");
+                ui.add(egui::Slider::new(&mut s.target_percentage, 50.0..=100.0).suffix(" %").fixed_decimals(1));
+                note(ui, "Each chapter's list stops once its words cover this share of the chapter's words.");
+
+                ui.label("Minimum occurrences in the book");
+                ui.add(egui::Slider::new(&mut s.min_book_count, 1..=20));
+                note(ui, "Words that appear fewer times in the whole book are left out.");
+
+                ui.checkbox(&mut s.hide_previous_words, "Only words new to the book");
+                note(ui, "Leave out words already listed in an earlier chapter of the same book.");
+
+                ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
+                note(ui, "Changing this analyzes the books again.");
+
+                ui.horizontal(|ui| {
+                    if ui.button("Restore defaults").clicked() {
+                        *s = Settings::default();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(theme::primary_button("Done", palette)).clicked() {
+                            self.show_settings = false;
+                        }
+                    });
+                });
+            });
+        self.show_settings &= open;
+    }
+
     /// Recompute the shown book's statistics if the books or progress changed.
     fn refresh_stats(&mut self) {
         if self.books.is_empty() {
@@ -149,11 +239,7 @@ impl ViewerApp {
             return;
         }
         self.shown = self.shown.min(self.books.len() - 1);
-        let key = StatsKey {
-            generation: self.generation,
-            shown: self.shown,
-            learned: self.books.iter().map(|b| b.learned).collect(),
-        };
+        let key = self.progress_key(self.shown);
         if self.stats.as_ref().is_none_or(|(k, _)| *k != key) {
             self.stats = Some((key, Book::stats(&self.books, self.shown)));
         }
@@ -161,7 +247,15 @@ impl ViewerApp {
 
     fn sidebar(&mut self, ui: &mut Ui, palette: Palette) {
         ui.add_space(4.0);
-        ui.label(RichText::new("Books").heading());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Books").heading());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = ui.add(egui::Button::new("⚙ Settings").selected(self.show_settings));
+                if button.on_hover_text("Coverage target, minimum count and other word list settings").clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+            });
+        });
         ui.add_space(2.0);
         if ui.add(theme::primary_button("Open EPUB or PDF…", palette)).clicked() {
             platform::pick_files(&self.inbox, ui.ctx());
@@ -185,10 +279,13 @@ impl ViewerApp {
         }
         ui.add_space(8.0);
 
+        let remaining = self.remaining_counts();
         let mut remove = None;
         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+            let any_learned = self.books.iter().any(|b| b.learned.is_some());
             for (i, book) in self.books.iter_mut().enumerate() {
                 let selected = i == self.shown;
+                let others_learned = any_learned && remaining[i] < book.words.iter().map(Vec::len).sum();
                 let mut frame = theme::card(palette);
                 if selected {
                     frame = frame.stroke(egui::Stroke::new(1.5, palette.accent));
@@ -212,6 +309,13 @@ impl ViewerApp {
                             .small()
                             .color(palette.secondary_text),
                     );
+                    if others_learned {
+                        ui.label(
+                            RichText::new(format!("{} left after your other books", format_count(&(remaining[i] as f64))))
+                                .small()
+                                .color(palette.accent),
+                        );
+                    }
                     ui.label(RichText::new("Learned up to (included)").small().color(palette.secondary_text));
                     let selected_text = book.learned.map_or("Not started".to_string(), |pos| book.chapter_label(pos));
                     egui::ComboBox::from_id_salt(("learned", i))
@@ -316,9 +420,9 @@ impl ViewerApp {
         let chapters = &stats.chapters;
         let [words_log, characters_log, density_log] = self.log_scales;
         let metrics = [
-            Metric { title: "New words to learn", short: "Words", log: words_log, color: palette.teal, value: |s| s.filtered_words as f64, format: format_count, baseline: None },
-            Metric { title: "Chapter length (characters)", short: "Characters", log: characters_log, color: palette.purple, value: |s| s.characters as f64, format: format_count, baseline: None },
-            Metric { title: "Vocabulary density: new words ÷ characters, relative to the first chapter", short: "Density", log: density_log, color: palette.blue, value: |s| s.normalized_ratio, format: format_ratio, baseline: Some(1.0) },
+            Metric { title: "New words to learn", hint: None, short: "Words", log: words_log, color: palette.teal, value: |s| s.filtered_words as f64, format: format_count, baseline: None },
+            Metric { title: "Chapter length (characters)", hint: None, short: "Characters", log: characters_log, color: palette.purple, value: |s| s.characters as f64, format: format_count, baseline: None },
+            Metric { title: "Vocabulary density", hint: Some("New words ÷ characters, relative to the first chapter"), short: "Density", log: density_log, color: palette.blue, value: |s| s.normalized_ratio, format: format_ratio, baseline: Some(1.0) },
         ];
         // Each card adds its margins, border, title row and the spacing after it
         let card_overhead = 2.0 * 12.0 + 2.0 + 22.0 + 2.0 * ui.spacing().item_spacing.y;
@@ -340,6 +444,8 @@ impl ViewerApp {
 
 struct Metric {
     title: &'static str,
+    /// Shown when hovering the title
+    hint: Option<&'static str>,
     short: &'static str,
     log: bool,
     color: Color32,
@@ -357,7 +463,10 @@ fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Opt
     let f = m.format;
     let mut toggle = false;
     ui.horizontal(|ui| {
-        ui.label(RichText::new(m.title).strong());
+        let title = ui.label(RichText::new(m.title).strong());
+        if let Some(hint) = m.hint {
+            title.on_hover_text(hint);
+        }
         let (scale, other) = if m.log { ("log scale", "linear") } else { ("linear scale", "log") };
         let button = egui::Button::new(RichText::new(format!("{scale} ⇄")).small().color(palette.accent)).frame(false);
         toggle = ui
@@ -392,6 +501,9 @@ fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Opt
         .allow_boxed_zoom(false)
         .y_axis_min_width(48.0)
         .show_grid([false, true])
+        // Same chapter range in every plot, even when a log plot cannot show its zero values
+        .include_x(chapters.first().map_or(0.0, |c| c.chapter_index as f64 - 0.5))
+        .include_x(chapters.last().map_or(1.0, |c| c.chapter_index as f64 + 0.5))
         .x_grid_spacer(|input| nice_grid(input, 12.0, 1.0))
         .x_axis_formatter(|mark, _| if mark.value.fract() == 0.0 { format!("{:.0}", mark.value) } else { String::new() })
         .y_axis_formatter(move |mark, _| f(&if log { 10f64.powf(mark.value) } else { mark.value }))
@@ -461,6 +573,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_incoming(&ctx);
+        self.apply_settings(&ctx);
         let palette = Palette::of(ui.visuals());
 
         egui::Panel::left("books")
@@ -471,6 +584,7 @@ impl eframe::App for ViewerApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::same(18)))
             .show(ui, |ui| self.central(ui, palette));
+        self.settings_window(&ctx, palette);
         // After drawing, so the window shows this frame while the slow work runs
         self.do_work(&ctx);
     }

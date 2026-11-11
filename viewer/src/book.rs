@@ -5,15 +5,30 @@ use std::io::{Cursor, Write};
 
 use anyhow::{bail, Result};
 use jpfe::epub::extract_epub_chapters_from_bytes;
-use jpfe::frequency::FrequencyAnalyzer;
+use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer};
 use jpfe::models::{chapter_file_stem, vocabulary_ratio, Chapter, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters_from_bytes;
 use jpfe::tokenizer::{JapaneseTokenizer, ParsedWord};
 use web_time::Instant;
 
-/// Same word-list settings as the CLI defaults.
-const TARGET_PERCENTAGE: f64 = 99.0;
-const MIN_BOOK_COUNT: usize = 3;
+/// Word-list settings, with the same meaning and defaults as the CLI options.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settings {
+    /// `--target-percentage`: each chapter's list stops once its words cover this share of the chapter
+    pub target_percentage: f64,
+    /// `--min-book-count`: words seen fewer times in the whole book are left out
+    pub min_book_count: usize,
+    /// Opposite of `--show-previous-words`: only list words new to the book
+    pub hide_previous_words: bool,
+    /// `--include-particles`; changing it re-tokenizes the books
+    pub include_particles: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { target_percentage: 99.0, min_book_count: 3, hide_previous_words: true, include_particles: false }
+    }
+}
 
 pub struct ChapterInfo {
     pub index: usize,
@@ -24,7 +39,11 @@ pub struct ChapterInfo {
 pub struct Book {
     pub name: String,
     pub chapters: Vec<ChapterInfo>,
-    /// Words to learn in each chapter, as in the CLI's `words/` files (only words new to the book).
+    /// The extracted chapters, to tokenize them again when the tokenizer setting changes
+    texts: Vec<Chapter>,
+    analyzer: FrequencyAnalyzer,
+    counts: Vec<ChapterCounts>,
+    /// Words to learn in each chapter, as in the CLI's `words/` files.
     pub words: Vec<Vec<String>>,
     /// Position of the last chapter whose words the reader has learned; `None` before the first one.
     pub learned: Option<usize>,
@@ -37,6 +56,31 @@ impl Book {
         self.words.iter().take(count).flatten().map(String::as_str)
     }
 
+    /// Rebuild the word lists for new settings.
+    pub fn apply(&mut self, settings: &Settings) {
+        self.words = word_lists(&self.analyzer, &self.counts, settings);
+    }
+
+    /// Start over from the chapter texts, keeping the reader's progress.
+    pub fn retokenize(self) -> PendingBook {
+        PendingBook { name: self.name, chapters: self.texts, tokens: Vec::new(), learned: self.learned }
+    }
+
+    /// Words learned in every book but `book`.
+    fn known_elsewhere(books: &[Book], book: usize) -> HashSet<&str> {
+        books.iter().enumerate().filter(|&(i, _)| i != book).flat_map(|(_, b)| b.learned_words()).collect()
+    }
+
+    /// For each book, how many of its words are not learned in the other books.
+    pub fn remaining_counts(books: &[Book]) -> Vec<usize> {
+        (0..books.len())
+            .map(|i| {
+                let known = Self::known_elsewhere(books, i);
+                books[i].words.iter().flatten().filter(|w| !known.contains(w.as_str())).count()
+            })
+            .collect()
+    }
+
     pub fn chapter_label(&self, pos: usize) -> String {
         let c = &self.chapters[pos];
         format!("{}: {}", c.index, c.title)
@@ -44,12 +88,7 @@ impl Book {
 
     /// Words of each chapter, minus the words already learned in the other books.
     pub fn stats(books: &[Book], shown: usize) -> BookStats {
-        let known: HashSet<&str> = books
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != shown)
-            .flat_map(|(_, b)| b.learned_words())
-            .collect();
+        let known = Self::known_elsewhere(books, shown);
         let book = &books[shown];
         let words: Vec<Vec<String>> = book
             .words
@@ -99,6 +138,8 @@ pub struct PendingBook {
     pub name: String,
     chapters: Vec<Chapter>,
     tokens: Vec<Vec<ParsedWord>>,
+    /// Progress kept when a loaded book is tokenized again
+    learned: Option<usize>,
 }
 
 impl PendingBook {
@@ -115,7 +156,12 @@ impl PendingBook {
             bail!("{file_name}: no chapters found");
         }
         let name = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem).to_string();
-        Ok(Self { name, chapters, tokens: Vec::new() })
+        Ok(Self { name, chapters, tokens: Vec::new(), learned: None })
+    }
+
+    /// Tokenize again from the first chapter (after a tokenizer setting changed).
+    pub fn restart(&mut self) {
+        self.tokens.clear();
     }
 
     pub fn progress(&self) -> f32 {
@@ -133,27 +179,31 @@ impl PendingBook {
         Ok(self.tokens.len() == self.chapters.len())
     }
 
-    pub fn finish(self) -> Book {
+    pub fn finish(self, settings: &Settings) -> Book {
         let analyzer = FrequencyAnalyzer::from_tokens(&self.chapters, &self.tokens);
-        let words = self
-            .tokens
-            .iter()
-            .enumerate()
-            .map(|(i, tokens)| {
-                analyzer
-                    .analyze_chapter(i, tokens, TARGET_PERCENTAGE, MIN_BOOK_COUNT, true)
-                    .into_iter()
-                    .map(|e| e.word)
-                    .collect()
-            })
-            .collect();
+        let counts: Vec<ChapterCounts> = self.tokens.iter().map(|t| ChapterCounts::new(t)).collect();
+        let words = word_lists(&analyzer, &counts, settings);
         let chapters = self
             .chapters
-            .into_iter()
-            .map(|c| ChapterInfo { index: c.index, characters: c.text.chars().count(), title: c.title })
+            .iter()
+            .map(|c| ChapterInfo { index: c.index, characters: c.text.chars().count(), title: c.title.clone() })
             .collect();
-        Book { name: self.name, chapters, words, learned: None }
+        Book { name: self.name, chapters, texts: self.chapters, analyzer, counts, words, learned: self.learned }
     }
+}
+
+fn word_lists(analyzer: &FrequencyAnalyzer, counts: &[ChapterCounts], s: &Settings) -> Vec<Vec<String>> {
+    counts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            analyzer
+                .analyze_counts(i, c, s.target_percentage, s.min_book_count, s.hide_previous_words)
+                .into_iter()
+                .map(|e| e.word)
+                .collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -167,9 +217,42 @@ mod tests {
             chapters: (0..words.len())
                 .map(|i| ChapterInfo { index: i, title: format!("第{i}話"), characters: 100 })
                 .collect(),
+            texts: Vec::new(),
+            analyzer: FrequencyAnalyzer::from_tokens(&[], &[]),
+            counts: Vec::new(),
             words: words.iter().map(|ws| ws.iter().map(|w| w.to_string()).collect()).collect(),
             learned: None,
         }
+    }
+
+    fn tokens(words: &[&str]) -> Vec<ParsedWord> {
+        words.iter().map(|w| ParsedWord { base_word: w.to_string(), pronunciation: String::new(), pos: "名詞".into() }).collect()
+    }
+
+    #[test]
+    fn settings_change_the_word_lists() {
+        let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
+        let pending = PendingBook {
+            name: "A".into(),
+            chapters,
+            tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
+            learned: Some(1),
+        };
+        let mut book = pending.finish(&Settings { min_book_count: 1, ..Settings::default() });
+        assert_eq!(book.words, [vec!["猫", "犬"], vec!["鳥"]]);
+        assert_eq!(book.learned, Some(1));
+        book.apply(&Settings { min_book_count: 2, ..Settings::default() });
+        assert_eq!(book.words, [vec!["猫"], Vec::<&str>::new()]);
+        book.apply(&Settings { min_book_count: 1, hide_previous_words: false, ..Settings::default() });
+        assert_eq!(book.words[1], ["猫", "鳥"]);
+    }
+
+    #[test]
+    fn counts_words_left_after_other_books() {
+        let mut books = vec![book("A", &[&["猫", "犬"], &["鳥"]]), book("B", &[&["猫", "空"]])];
+        assert_eq!(Book::remaining_counts(&books), [3, 2]);
+        books[1].learned = Some(0);
+        assert_eq!(Book::remaining_counts(&books), [2, 2]);
     }
 
     #[test]

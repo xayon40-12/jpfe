@@ -14,6 +14,22 @@ pub struct BookWord {
     pub first_chapter_title: String,
 }
 
+/// Occurrences of each base word in one chapter.
+pub struct ChapterCounts {
+    pub total: usize,
+    pub counts: HashMap<String, usize>,
+}
+
+impl ChapterCounts {
+    pub fn new(tokens: &[ParsedWord]) -> Self {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for token in tokens {
+            *counts.entry(token.base_word.clone()).or_default() += 1;
+        }
+        Self { total: tokens.len(), counts }
+    }
+}
+
 pub struct FrequencyAnalyzer {
     pub words: HashMap<String, BookWord>,
     pub total_words: usize,
@@ -55,15 +71,24 @@ impl FrequencyAnalyzer {
         min_book_count: usize,
         hide_previous_words: bool,
     ) -> Vec<WordEntry> {
-        let chapter_total = chapter_tokens.len() as f64;
-        let mut chapter_counts: HashMap<&str, usize> = HashMap::new();
-        for token in chapter_tokens {
-            *chapter_counts.entry(&token.base_word).or_default() += 1;
-        }
+        let counts = ChapterCounts::new(chapter_tokens);
+        self.analyze_counts(chapter_pos, &counts, target_percentage, min_book_count, hide_previous_words)
+    }
+
+    /// Same as [`Self::analyze_chapter`], from the chapter's word counts.
+    pub fn analyze_counts(
+        &self,
+        chapter_pos: usize,
+        chapter: &ChapterCounts,
+        target_percentage: f64,
+        min_book_count: usize,
+        hide_previous_words: bool,
+    ) -> Vec<WordEntry> {
+        let chapter_total = chapter.total as f64;
 
         // Sort descending by chapter count, then by whole book count, then alphabetical
         let mut sorted: Vec<(&str, usize, &BookWord)> =
-            chapter_counts.into_iter().map(|(w, c)| (w, c, &self.words[w])).collect();
+            chapter.counts.iter().map(|(w, &c)| (w.as_str(), c, &self.words[w])).collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.count.cmp(&a.2.count)).then(a.0.cmp(b.0)));
 
         let mut entries = Vec::new();

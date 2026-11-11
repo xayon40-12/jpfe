@@ -94,6 +94,8 @@ fn visuals(dark: bool) -> Visuals {
     v.selection.bg_fill = p.accent.linear_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0, p.accent);
     v.striped = false;
+    // Sliders: blue filled part, like macOS
+    v.slider_trailing_fill = true;
     v.indent_has_left_vline = false;
     v.collapsing_header_frame = false;
 
