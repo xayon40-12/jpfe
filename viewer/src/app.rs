@@ -32,6 +32,8 @@ pub struct ViewerApp {
     /// Bumped whenever books are added or removed, to invalidate `stats`
     generation: u64,
     stats: Option<(StatsKey, BookStats)>,
+    /// Log scale for each plot, in display order (words, characters, density)
+    log_scales: [bool; 3],
 }
 
 #[derive(PartialEq)]
@@ -60,6 +62,7 @@ impl ViewerApp {
             shown: 0,
             generation: 0,
             stats: None,
+            log_scales: [true, false, true],
         }
     }
 
@@ -311,19 +314,26 @@ impl ViewerApp {
         }
 
         let chapters = &stats.chapters;
+        let [words_log, characters_log, density_log] = self.log_scales;
         let metrics = [
-            Metric { title: "New vocabulary density, relative to the first chapter", short: "Ratio", log: true, color: palette.blue, value: |s| s.normalized_ratio, format: format_ratio, baseline: Some(1.0) },
-            Metric { title: "New words to learn", short: "Words", log: true, color: palette.teal, value: |s| s.filtered_words as f64, format: format_count, baseline: None },
-            Metric { title: "Chapter length (characters)", short: "Characters", log: false, color: palette.purple, value: |s| s.characters as f64, format: format_count, baseline: None },
+            Metric { title: "New words to learn", short: "Words", log: words_log, color: palette.teal, value: |s| s.filtered_words as f64, format: format_count, baseline: None },
+            Metric { title: "Chapter length (characters)", short: "Characters", log: characters_log, color: palette.purple, value: |s| s.characters as f64, format: format_count, baseline: None },
+            Metric { title: "Vocabulary density: new words ÷ characters, relative to the first chapter", short: "Density", log: density_log, color: palette.blue, value: |s| s.normalized_ratio, format: format_ratio, baseline: Some(1.0) },
         ];
         // Each card adds its margins, border, title row and the spacing after it
         let card_overhead = 2.0 * 12.0 + 2.0 + 22.0 + 2.0 * ui.spacing().item_spacing.y;
         let height = ((ui.available_height() - 3.0 * card_overhead) / 3.0).max(120.0);
+        let mut toggled = None;
         for (i, metric) in metrics.iter().enumerate() {
             theme::card(palette).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                metric_plot(ui, i, metric, chapters, learned_x, height, palette);
+                if metric_plot(ui, metric, chapters, learned_x, height, palette) {
+                    toggled = Some(i);
+                }
             });
+        }
+        if let Some(i) = toggled {
+            self.log_scales[i] = !self.log_scales[i];
         }
     }
 }
@@ -339,14 +349,22 @@ struct Metric {
     baseline: Option<f64>,
 }
 
-fn metric_plot(ui: &mut Ui, i: usize, m: &Metric, chapters: &[ChapterStat], learned_x: Option<f64>, height: f32, palette: Palette) {
+/// Draws one plot card; returns true when its scale label was clicked.
+fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Option<f64>, height: f32, palette: Palette) -> bool {
     let values: Vec<f64> = chapters.iter().map(m.value).collect();
     let (min, max) = values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     let avg = values.iter().sum::<f64>() / values.len().max(1) as f64;
     let f = m.format;
+    let mut toggle = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new(m.title).strong());
-        ui.label(RichText::new(if m.log { "log scale" } else { "linear scale" }).small().color(palette.secondary_text));
+        let (scale, other) = if m.log { ("log scale", "linear") } else { ("linear scale", "log") };
+        let button = egui::Button::new(RichText::new(format!("{scale} ⇄")).small().color(palette.accent)).frame(false);
+        toggle = ui
+            .add(button)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("Switch to a {other} scale"))
+            .clicked();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(format!("min {} · avg {} · max {}", f(&min), f(&avg), f(&max))).small().color(palette.secondary_text));
         });
@@ -363,7 +381,8 @@ fn metric_plot(ui: &mut Ui, i: usize, m: &Metric, chapters: &[ChapterStat], lear
 
     let link = egui::Id::unique("chapter-axis");
     let log = m.log;
-    let mut plot = Plot::new(("metric", i))
+    // The scale is part of the id, so switching it resets the y range
+    let mut plot = Plot::new(("metric", m.short, m.log))
         .height(height)
         .link_axis(link, [true, false])
         .link_cursor(link, [true, false])
@@ -388,6 +407,7 @@ fn metric_plot(ui: &mut Ui, i: usize, m: &Metric, chapters: &[ChapterStat], lear
         plot_ui.line(Line::new(m.short, points.clone()).color(m.color).width(1.8));
         plot_ui.points(Points::new(m.short, points).color(m.color).radius(if chapters.len() <= 60 { 3.0 } else { 1.8 }));
     });
+    toggle
 }
 
 /// Every metric of the chapter under the cursor.

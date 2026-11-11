@@ -113,7 +113,7 @@ Contains chapter-level vocabulary load and density statistics:
 `viewer/` is an [egui](https://github.com/emilk/egui) app that shows the same three charts live for several books at once:
 
 - **Left panel**: one entry per loaded EPUB/PDF (open them with the button or drop them on the window), each with a **Learned up to (included)** chapter selector. It starts at *Not started*, so loading a book does not mark anything as learned.
-- **Central panel**: pick the book to show. Its word lists leave out every word you have learned in the *other* books (their word lists up to the selected chapter), and an orange vertical line marks your progress in the shown book. Hovering a chapter shows its title and numbers in all three plots.
+- **Central panel**: pick the book to show. Its word lists leave out every word you have learned in the *other* books (their word lists up to the selected chapter), and an orange vertical line marks your progress in the shown book. The plots are, from top to bottom: new words to learn, chapter length, and vocabulary density (the first divided by the second, relative to the first chapter). Click a plot's "log scale" / "linear scale" label to switch its scale. Hovering a chapter shows its title and numbers in all three plots.
 - **Download word lists (.zip)**: the shown book's filtered word lists, one `words/chapter_…txt` per chapter, as in the CLI output.
 
 Word lists use the CLI defaults (`-p 99`, `-m 3`, previously seen words hidden). The look follows macOS colors and controls, in light or dark mode depending on the system setting.
