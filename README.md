@@ -54,17 +54,19 @@ By default, files are exported to a folder adjacent to the input file named `<fi
 │   ├── chapter_000_prologue.tsv
 │   ├── chapter_001_chapter_one.tsv
 │   └── chapter_002_chapter_two.tsv
-└── words/
-    ├── chapter_000_prologue.txt
-    ├── chapter_001_chapter_one.txt
-    └── chapter_002_chapter_two.txt
+├── words/
+│   ├── chapter_000_prologue.txt
+│   ├── chapter_001_chapter_one.txt
+│   └── chapter_002_chapter_two.txt
+└── statistics/
+    ├── vocabulary_ratio.tsv
+    └── vocabulary_ratio.svg
 ```
 
 ### 1. `words/` Directory
 Contains a clean, single-column text file per chapter with one dictionary-form word per line:
 ```text
 母親
-よ
 父親
 方
 これ
@@ -87,6 +89,20 @@ Contains visually aligned tab-separated (`.tsv`) or comma-separated (`.csv`) fil
 | `book_occurrences` | Total occurrences across the entire novel | `88` |
 | `book_percent` | Relative frequency across the entire novel (percentage) | `0.0058%` |
 | `first_appearance_chapter`* | Chapter where word is first encountered (*included when showing all words) | `第一話` |
+
+### 3. `statistics/` Directory
+Contains chapter-level vocabulary load and density statistics:
+- **`vocabulary_ratio.tsv`** (or `.csv`): Clean column table tracking the ratio of filtered vocabulary words divided by character count for each chapter, normalized relative to the Prologue (or Chapter 1 if no prologue):
+  - `chapter`: Chapter index
+  - `title`: Chapter title
+  - `filtered_words`: Number of vocabulary words exported to the chapter's `words/` file
+  - `characters`: Total character count of the chapter
+  - `raw_ratio`: Raw vocabulary load per character (`filtered_words / characters`)
+  - `normalized_ratio`: Normalized ratio relative to Chapter 0 / baseline (`raw_ratio / baseline_ratio`, baseline = `1.000000`)
+- **`vocabulary_ratio.svg`**: Vector chart (rendered with [`plotters`](https://crates.io/crates/plotters)) made of three stacked plots sharing the chapter axis, each with its own left vertical axis:
+  1. **Normalized vocabulary ratio** relative to the baseline chapter, with a dashed `1` baseline. Log scale by default (`--ratio-scale linear` to change).
+  2. **Filtered words exported** per chapter. Log scale by default (`--words-scale linear` to change).
+  3. **Character count** per chapter (bottom). Linear scale by default (`--chars-scale log` to change).
 
 ---
 
@@ -299,6 +315,9 @@ Within each chapter, vocabulary is sorted using a multi-level priority:
 | `--chapters` | `-c` | *(all)* | Specific chapters to export (e.g. `1,2,3` or `1-4`) |
 | `--format` | | `tsv` | Full stats table format: `tsv` or `csv` |
 | `--reading` | | `hiragana` | Reading pronunciation format: `hiragana` or `katakana` |
+| `--ratio-scale` | | `log` | Y-axis scale of the normalized ratio plot: `log` or `linear` |
+| `--words-scale` | | `log` | Y-axis scale of the filtered word count plot: `log` or `linear` |
+| `--chars-scale` | | `linear` | Y-axis scale of the character count plot: `log` or `linear` |
 | `--content-only` | | `false` | Deprecated alias (content words only is now the default) |
 | `--dict-path` | | `None` | Path to optional external MeCab/Lindera dictionary directory |
 | `--scan-scope` | | `full` | `full` (scans whole novel for global counts) or `selected` |

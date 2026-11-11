@@ -16,3 +16,4 @@ anyhow = "1.0"
 lopdf = "0.42"
 rayon = "1.10"
 unicode-width = "0.2"
+plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series", "point_series"] }

@@ -37,10 +37,7 @@ pub fn export_chapter_entries(
         .with_context(|| format!("Failed to create words output directory: {:?}", words_dir))?;
 
     let sanitized_title = sanitize_filename(chapter_title);
-    let extension = match format {
-        ExportFormat::Tsv => "tsv",
-        ExportFormat::Csv => "csv",
-    };
+    let extension = format.extension();
 
     // 1. Build table rows (omitting redundant frequency decimals, keeping percentages)
     let mut header = vec![
@@ -87,44 +84,7 @@ pub fn export_chapter_entries(
     );
     let full_path = full_dir.join(&full_filename);
 
-    match format {
-        ExportFormat::Csv => {
-            let file = File::create(&full_path)
-                .with_context(|| format!("Failed to create output file: {:?}", full_path))?;
-            let mut writer = WriterBuilder::new()
-                .delimiter(b',')
-                .has_headers(false)
-                .from_writer(file);
-            for row in &rows {
-                writer.write_record(row)?;
-            }
-            writer.flush()?;
-        }
-        ExportFormat::Tsv => {
-            // Calculate column widths based on East Asian Display Width
-            let num_cols = rows[0].len();
-            let mut col_widths = vec![0; num_cols];
-            for row in &rows {
-                for (i, cell) in row.iter().enumerate() {
-                    col_widths[i] = col_widths[i].max(cell.width());
-                }
-            }
-
-            let mut file = File::create(&full_path)
-                .with_context(|| format!("Failed to create output file: {:?}", full_path))?;
-
-            for row in &rows {
-                let mut padded_parts = Vec::with_capacity(num_cols);
-                for (i, cell) in row.iter().enumerate() {
-                    let cell_w = cell.width();
-                    let pad = col_widths[i].saturating_sub(cell_w);
-                    padded_parts.push(format!("{}{}", cell, " ".repeat(pad)));
-                }
-                writeln!(file, "{}", padded_parts.join("\t"))?;
-            }
-            file.flush()?;
-        }
-    }
+    write_table(&full_path, &rows, format)?;
 
     // 3. Export single-column words text file
     let words_filename = format!(
@@ -145,6 +105,49 @@ pub fn export_chapter_entries(
         full_path,
         words_path,
     })
+}
+
+impl ExportFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Tsv => "tsv",
+            ExportFormat::Csv => "csv",
+        }
+    }
+}
+
+/// Write `rows` (header included) as CSV, or as TSV padded to East Asian display width.
+pub fn write_table(path: &Path, rows: &[Vec<String>], format: ExportFormat) -> Result<()> {
+    let file = File::create(path).with_context(|| format!("Failed to create output file: {:?}", path))?;
+    match format {
+        ExportFormat::Csv => {
+            let mut writer = WriterBuilder::new().has_headers(false).from_writer(file);
+            for row in rows {
+                writer.write_record(row)?;
+            }
+            writer.flush()?;
+        }
+        ExportFormat::Tsv => {
+            let num_cols = rows.first().map_or(0, Vec::len);
+            let mut col_widths = vec![0; num_cols];
+            for row in rows {
+                for (width, cell) in col_widths.iter_mut().zip(row) {
+                    *width = (*width).max(cell.width());
+                }
+            }
+            let mut file = std::io::BufWriter::new(file);
+            for row in rows {
+                let padded: Vec<String> = row
+                    .iter()
+                    .zip(&col_widths)
+                    .map(|(cell, &w)| format!("{}{}", cell, " ".repeat(w.saturating_sub(cell.width()))))
+                    .collect();
+                writeln!(file, "{}", padded.join("\t"))?;
+            }
+            file.flush()?;
+        }
+    }
+    Ok(())
 }
 
 fn sanitize_filename(name: &str) -> String {

@@ -3,6 +3,7 @@ mod exporter;
 mod frequency;
 mod models;
 mod pdf;
+mod statistics;
 mod tokenizer;
 
 use std::collections::HashSet;
@@ -16,6 +17,7 @@ use crate::exporter::{export_chapter_entries, ExportFormat};
 use crate::frequency::FrequencyAnalyzer;
 use crate::models::Chapter;
 use crate::pdf::extract_pdf_chapters;
+use crate::statistics::{export_statistics, vocabulary_ratio, ChapterStat, ChartScales, Scale};
 use crate::tokenizer::JapaneseTokenizer;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -99,6 +101,18 @@ struct Args {
     /// Book-wide scanning scope for whole-book frequency and first-appearance chapter calculation
     #[arg(long = "scan-scope", value_enum, default_value_t = ScanScope::Full)]
     scan_scope: ScanScope,
+
+    /// Y-axis scale of the normalized vocabulary ratio plot
+    #[arg(long = "ratio-scale", value_enum, default_value_t = Scale::Log)]
+    ratio_scale: Scale,
+
+    /// Y-axis scale of the filtered word count plot
+    #[arg(long = "words-scale", value_enum, default_value_t = Scale::Log)]
+    words_scale: Scale,
+
+    /// Y-axis scale of the chapter character count plot
+    #[arg(long = "chars-scale", value_enum, default_value_t = Scale::Linear)]
+    chars_scale: Scale,
 }
 
 fn parse_chapter_selection(
@@ -269,6 +283,22 @@ fn main() -> Result<()> {
 
     let mut total_exported_files = Vec::new();
 
+    // Vocabulary-ratio baseline: the first chapter (index 0 if it is a prologue, otherwise chapter 1)
+    let baseline_chapter = &all_chapters[0];
+    let baseline_ratio = vocabulary_ratio(
+        analyzer
+            .analyze_chapter(
+                &baseline_chapter.title,
+                &tokenized_chapters[0],
+                args.target_percentage,
+                args.min_book_count,
+                hide_previous_words,
+            )
+            .len(),
+        baseline_chapter.text.chars().count(),
+    );
+    let mut chapter_stats = Vec::new();
+
     for (chapter_idx, chapter) in all_chapters.iter().enumerate() {
         if !selected_indices.contains(&chapter.index) {
             continue;
@@ -294,6 +324,14 @@ fn main() -> Result<()> {
         )?;
 
         total_exported_files.push(export_paths.full_path.clone());
+
+        chapter_stats.push(ChapterStat::new(
+            chapter.index,
+            &chapter.title,
+            entries.len(),
+            chapter.text.chars().count(),
+            baseline_ratio,
+        ));
 
         let total_unique_in_ch = {
             let set: HashSet<&str> = chapter_tokens.iter().map(|t| t.base_word.as_str()).collect();
@@ -372,6 +410,33 @@ fn main() -> Result<()> {
                 );
             }
         }
+        println!();
+    }
+
+    // Export statistics (filtered words / characters, normalized by the first chapter)
+    if !chapter_stats.is_empty() {
+        let scales = ChartScales {
+            ratio: args.ratio_scale,
+            words: args.words_scale,
+            characters: args.chars_scale,
+        };
+        let stats_paths = export_statistics(&output_dir, &chapter_stats, export_format, scales)?;
+
+        println!("------------------------------------------------------------");
+        println!("Vocabulary Density Statistics:");
+        println!("  Table:     {}", stats_paths.table_path.display());
+        println!("  SVG chart: {}", stats_paths.svg_path.display());
+        println!(
+            "  Scales:    Ratio = {:?} | Words = {:?} | Characters = {:?}",
+            scales.ratio, scales.words, scales.characters
+        );
+        println!(
+            "  Baseline:  Ch {:0width$} \"{}\" (raw ratio: {:.6})",
+            baseline_chapter.index,
+            baseline_chapter.title,
+            baseline_ratio,
+            width = pad_width
+        );
         println!();
     }
 
