@@ -5,6 +5,13 @@ name: Deploy viewer to GitHub Pages
 on:
   push:
     branches: [main]
+    # Only when something the site is built from changes
+    paths:
+      - "src/**"
+      - "viewer/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -21,17 +28,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The dictionary and font only change with the lindera version (in Cargo.lock) or the script
+      - name: Restore dictionary and font
+        id: assets
+        uses: actions/cache@v6
+        with:
+          path: viewer/assets
+          key: web-assets-${{ hashFiles('Cargo.lock', 'viewer/build-web-assets.sh') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Install trunk and zstd
+      - name: Install trunk
         run: |
           curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.22.1/trunk-x86_64-unknown-linux-gnu.tar.gz \
             | sudo tar -xz -C /usr/local/bin
-          sudo apt-get install -y zstd
       - name: Prepare dictionary and font
-        run: ./viewer/build-web-assets.sh
+        if: steps.assets.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y zstd
+          ./viewer/build-web-assets.sh
       - name: Build the web app
         working-directory: viewer
         run: trunk build --release

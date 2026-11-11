@@ -131,7 +131,7 @@ rustup target add wasm32-unknown-unknown   # once
 ./viewer/build-web-assets.sh               # dictionary and font into viewer/assets/ (needs zstd and curl)
 cd viewer && trunk serve --release         # or `trunk build --release` for viewer/dist/
 ```
-`.github/workflows/pages.yml` builds and publishes it on every push to `main`. Enable it once in the repository's **Settings → Pages → Source: GitHub Actions**. The published dictionary includes UniDic's BSD license (`assets/dict/UNIDIC-LICENSE.txt`); Noto Sans JP is under the SIL Open Font License.
+`.github/workflows/pages.yml` builds and publishes it when a push to `main` changes the code (or when started from the Actions tab). It caches the compiled dependencies and the dictionary, which is only rebuilt when `Cargo.lock` or `build-web-assets.sh` changes. Enable it once in the repository's **Settings → Pages → Source: GitHub Actions**. The published dictionary includes UniDic's BSD license (`assets/dict/UNIDIC-LICENSE.txt`); Noto Sans JP is under the SIL Open Font License.
 
 ---
 
