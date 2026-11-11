@@ -11,6 +11,11 @@ use crate::book::{Book, BookStats, PendingBook, Settings};
 use crate::platform::{self, Inbox, Incoming};
 use crate::theme::{self, Palette};
 
+/// Below this window width the books and the charts are stacked in one column (phones).
+const STACK_BELOW_WIDTH: f32 = 760.0;
+/// Below this the charts stop shrinking and the page scrolls.
+const MIN_PLOT_HEIGHT: f32 = 170.0;
+
 /// Tokenizing time per frame, so the window keeps redrawing while books load.
 const WORK_PER_FRAME: Duration = Duration::from_millis(25);
 
@@ -194,11 +199,12 @@ impl ViewerApp {
             .collapsible(false)
             .resizable(false)
             .default_width(380.0)
-            .anchor(egui::Align2::LEFT_TOP, [300.0, 48.0])
+            .max_width(ctx.content_rect().width() - 24.0)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
             .show(ctx, |ui| {
                 // Slider tracks use the control fill, which is white on the white window
                 ui.visuals_mut().widgets.inactive.bg_fill = palette.separator;
-                ui.spacing_mut().slider_width = 240.0;
+                ui.spacing_mut().slider_width = (ui.available_width() - 90.0).clamp(120.0, 240.0);
                 let s = &mut self.edited_settings;
                 let note = |ui: &mut Ui, text: &str| {
                     ui.label(RichText::new(text).small().color(palette.secondary_text));
@@ -284,7 +290,7 @@ impl ViewerApp {
 
         let remaining = self.remaining_counts();
         let mut remove = None;
-        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        {
             let any_learned = self.books.iter().any(|b| b.learned.is_some());
             for (i, book) in self.books.iter_mut().enumerate() {
                 let selected = i == self.shown;
@@ -354,7 +360,7 @@ impl ViewerApp {
                     self.errors.clear();
                 }
             }
-        });
+        }
         if let Some(i) = remove {
             self.books.remove(i);
             self.generation += 1;
@@ -364,10 +370,13 @@ impl ViewerApp {
         }
     }
 
-    fn central(&mut self, ui: &mut Ui, palette: Palette) {
+    /// `viewport_height` is the visible height (the content scrolls when it does not fit).
+    /// When `stacked`, the plots get a fixed height instead of filling the window.
+    fn central(&mut self, ui: &mut Ui, palette: Palette, viewport_height: f32, stacked: bool) {
+        let top = ui.cursor().top();
         if self.books.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() / 3.0);
+                ui.add_space(if stacked { 16.0 } else { viewport_height / 3.0 });
                 ui.label(RichText::new("No books yet").heading());
                 ui.label(RichText::new("Open one or more EPUB or PDF files to see their vocabulary statistics.").color(palette.secondary_text));
                 ui.add_space(8.0);
@@ -382,10 +391,10 @@ impl ViewerApp {
         let names: Vec<String> = self.books.iter().map(|b| b.name.clone()).collect();
         let mut shown = self.shown.min(names.len() - 1);
         let mut download = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Statistics for").color(palette.secondary_text));
             egui::ComboBox::from_id_salt("shown")
-                .width(320.0)
+                .width(ui.available_width().min(320.0))
                 .truncate()
                 .selected_text(&names[shown])
                 .show_ui(ui, |ui| {
@@ -393,9 +402,12 @@ impl ViewerApp {
                         ui.selectable_value(&mut shown, i, name);
                     }
                 });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                download = ui.add(theme::primary_button("Download word lists (.zip)", palette)).clicked();
-            });
+            let button = theme::primary_button("Download word lists (.zip)", palette);
+            download = if stacked {
+                ui.add(button).clicked()
+            } else {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.add(button).clicked()).inner
+            };
         });
         self.shown = shown;
         let learned_x = self.books[shown].learned.map(|pos| self.books[shown].chapters[pos].index as f64);
@@ -427,9 +439,11 @@ impl ViewerApp {
             Metric { title: "Chapter length (characters)", hint: None, short: "Characters", log: characters_log, color: palette.purple, value: |s| s.characters as f64, format: format_count, baseline: None },
             Metric { title: "Vocabulary density", hint: Some("New words ÷ characters, relative to the first chapter"), short: "Density", log: density_log, color: palette.blue, value: |s| s.normalized_ratio, format: format_ratio, baseline: Some(1.0) },
         ];
-        // Each card adds its margins, border, title row and the spacing after it
+        // Fill the window with the three cards, each adding its margins, border, title row and
+        // the spacing after it; below a minimum height the page scrolls instead
         let card_overhead = 2.0 * 12.0 + 2.0 + 22.0 + 2.0 * ui.spacing().item_spacing.y;
-        let height = ((ui.available_height() - 3.0 * card_overhead) / 3.0).max(120.0);
+        let header = ui.cursor().top() - top;
+        let height = if stacked { MIN_PLOT_HEIGHT } else { ((viewport_height - header - 3.0 * card_overhead) / 3.0).max(MIN_PLOT_HEIGHT) };
         let mut toggled = None;
         for (i, metric) in metrics.iter().enumerate() {
             theme::card(palette).show(ui, |ui| {
@@ -465,7 +479,9 @@ fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Opt
     let avg = values.iter().sum::<f64>() / values.len().max(1) as f64;
     let f = m.format;
     let mut toggle = false;
-    ui.horizontal(|ui| {
+    let wide = ui.available_width() > 640.0;
+    let summary = RichText::new(format!("min {} · avg {} · max {}", f(&min), f(&avg), f(&max))).small().color(palette.secondary_text);
+    ui.horizontal_wrapped(|ui| {
         let title = ui.label(RichText::new(m.title).strong());
         if let Some(hint) = m.hint {
             title.on_hover_text(hint);
@@ -477,10 +493,13 @@ fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Opt
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(format!("Switch to a {other} scale"))
             .clicked();
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(format!("min {} · avg {} · max {}", f(&min), f(&avg), f(&max))).small().color(palette.secondary_text));
-        });
+        if wide {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(summary.clone()));
+        }
     });
+    if !wide {
+        ui.label(summary);
+    }
 
     // Log axes plot log10 of the values; non-positive values cannot be shown there
     let to_y = |v: f64| if m.log { v.log10() } else { v };
@@ -491,23 +510,27 @@ fn metric_plot(ui: &mut Ui, m: &Metric, chapters: &[ChapterStat], learned_x: Opt
         .map(|(s, &v)| [s.chapter_index as f64, to_y(v)])
         .collect();
 
-    let link = egui::Id::unique("chapter-axis");
     let log = m.log;
+    let x_ticks = (ui.available_width() as f64 / 70.0).clamp(3.0, 12.0);
     // The scale is part of the id, so switching it resets the y range
     let mut plot = Plot::new(("metric", m.short, m.log))
         .height(height)
-        .link_axis(link, [true, false])
-        .link_cursor(link, [true, false])
-        .allow_zoom([true, false])
-        .allow_drag([true, false])
-        .allow_scroll([true, false])
+        // Hover only: no panning or zooming, and drags go to the page (scrolling on touch screens)
+        .sense(egui::Sense::hover())
+        .allow_zoom(false)
+        .allow_drag(false)
+        .allow_scroll(false)
         .allow_boxed_zoom(false)
+        .allow_double_click_reset(false)
+        .allow_axis_zoom_drag(false)
+        .link_cursor(egui::Id::unique("chapter-cursor"), [true, false])
         .y_axis_min_width(48.0)
         .show_grid([false, true])
         // Same chapter range in every plot, even when a log plot cannot show its zero values
         .include_x(chapters.first().map_or(0.0, |c| c.chapter_index as f64 - 0.5))
         .include_x(chapters.last().map_or(1.0, |c| c.chapter_index as f64 + 0.5))
-        .x_grid_spacer(|input| nice_grid(input, 12.0, 1.0))
+        // About one chapter label per 70 points, so labels stay readable on phones
+        .x_grid_spacer(move |input| nice_grid(input, x_ticks, 1.0))
         .x_axis_formatter(|mark, _| if mark.value.fract() == 0.0 { format!("{:.0}", mark.value) } else { String::new() })
         .y_axis_formatter(move |mark, _| f(&if log { 10f64.powf(mark.value) } else { mark.value }))
         .label_formatter(move |pos| hover_text(pos, chapters));
@@ -579,14 +602,34 @@ impl eframe::App for ViewerApp {
         self.apply_settings(&ctx);
         let palette = Palette::of(ui.visuals());
 
-        egui::Panel::left("books")
-            .resizable(true)
-            .default_size(290.0)
-            .frame(egui::Frame::new().fill(palette.sidebar).inner_margin(egui::Margin::same(14)))
-            .show(ui, |ui| self.sidebar(ui, palette));
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::same(18)))
-            .show(ui, |ui| self.central(ui, palette));
+        let content = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::same(18));
+        if ui.available_width() < STACK_BELOW_WIDTH {
+            // Phones and narrow windows: the books, then the charts, in one scrolling column
+            egui::CentralPanel::default().frame(content).show(ui, |ui| {
+                let viewport_height = ui.available_height();
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    egui::Frame::new()
+                        .fill(palette.sidebar)
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| self.sidebar(ui, palette));
+                    ui.add_space(12.0);
+                    self.central(ui, palette, viewport_height, true);
+                });
+            });
+        } else {
+            egui::Panel::left("books")
+                .resizable(true)
+                .default_size(290.0)
+                .frame(egui::Frame::new().fill(palette.sidebar).inner_margin(egui::Margin::same(14)))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.sidebar(ui, palette));
+                });
+            egui::CentralPanel::default().frame(content).show(ui, |ui| {
+                let viewport_height = ui.available_height();
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.central(ui, palette, viewport_height, false));
+            });
+        }
         self.settings_window(&ctx, palette);
         // After drawing, so the window shows this frame while the slow work runs
         self.do_work(&ctx);
