@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use anyhow::{Context, Result};
 use lindera::dictionary::{load_fs_dictionary, Dictionary};
+use lindera_dictionary::builder::DictionaryBuilder;
 use lindera_dictionary::dictionary::{
     character_definition::CharacterDefinition, connection_cost_matrix::ConnectionCostMatrix, metadata::Metadata,
     prefix_dictionary::PrefixDictionary, unknown_dictionary::UnknownDictionary,
@@ -34,6 +35,24 @@ const KANA_LEMMAS: [(&str, &str, &str); 6] = [
     ("無い", "ない", "ナイ"),
     ("良い", "いい", "イイ"),
 ];
+
+/// UniDic verbs that are not dictionary headwords, mapped to the word a learner looks up: (lemma, word, reading).
+/// UniDic lists some causative/passive forms as verbs of their own (研ぎ澄ませる), and makes up positive
+/// verbs for expressions only used in the negative (計り知れない is split as 計り知れる + ない).
+const DERIVED_LEMMAS: [(&str, &str, &str); 9] = [
+    ("研ぎ澄ませる", "研ぎ澄ます", "トギスマス"),
+    ("張り巡らせる", "張り巡らす", "ハリメグラス"),
+    ("習わせる", "習う", "ナラウ"),
+    ("紛らわせる", "紛らわす", "マギラワス"),
+    ("魅入られる", "魅入る", "ミイル"),
+    ("窺い知れる", "窺い知る", "ウカガイシル"),
+    ("計り知れる", "計り知れない", "ハカリシレナイ"),
+    ("言い知れる", "言い知れぬ", "イイシレヌ"),
+    ("居た堪れる", "居た堪れない", "イタタマレナイ"),
+];
+
+/// Kanji compounds missing from UniDic (神出鬼没, 図書館), as UniDic rows: see scripts/gen-compounds.py.
+const COMPOUNDS: &str = include_str!("compounds.csv");
 
 fn is_set(field: &str) -> bool {
     !field.is_empty() && field != "*"
@@ -84,8 +103,11 @@ impl JapaneseTokenizer {
     }
 
     pub fn with_dictionary(dictionary: Dictionary, reading_in_hiragana: bool, include_particles: bool) -> Self {
+        let compounds = DictionaryBuilder::new((*dictionary.metadata).clone())
+            .build_user_dict_from_reader(COMPOUNDS.as_bytes())
+            .expect("the embedded compound dictionary is valid");
         Self {
-            segmenter: Segmenter::new(Mode::Normal, dictionary, None),
+            segmenter: Segmenter::new(Mode::Normal, dictionary, Some(compounds)),
             reading_cache: HashMap::new(),
             reading_in_hiragana,
             include_particles,
@@ -119,9 +141,22 @@ impl JapaneseTokenizer {
                 (surface.clone(), raw_reading.to_string())
             } else if pos == "動詞" || pos == "形容詞" {
                 let kana = KANA_LEMMAS.iter().find(|(l, ..)| *l == lemma);
-                match kana {
-                    Some(&(_, w, r)) if surface.chars().all(is_hiragana) => (w.to_string(), r.to_string()),
-                    _ => (adapt_kanji(&surface, lemma), raw_reading.to_string()),
+                let derived = DERIVED_LEMMAS.iter().find(|(l, ..)| *l == lemma);
+                match (kana, derived) {
+                    (Some(&(_, w, r)), _) if surface.chars().all(is_hiragana) => (w.to_string(), r.to_string()),
+                    (_, Some(&(_, w, r))) => (adapt_kanji(&surface, w), r.to_string()),
+                    _ => {
+                        let adapted = adapt_kanji(&surface, lemma);
+                        // Same kanji with other okurigana (抑さえる for 抑える): the surface's own base form is right,
+                        // unless it is pronounced differently (a potential form such as 帰れる)
+                        if adapted != lemma && is_set(orth_base) && kanji_of(orth_base) == kanji_of(&adapted)
+                            && same_pronunciation(field(11), raw_reading)
+                        {
+                            (orth_base.to_string(), raw_reading.to_string())
+                        } else {
+                            (adapted, raw_reading.to_string())
+                        }
+                    }
                 }
             } else {
                 // Prefer surface orthography (e.g. 煙草, ご飯, トラック) over the phonetic lemma
@@ -156,6 +191,15 @@ fn adapt_kanji(surface: &str, lemma: &str) -> String {
         }
         _ => lemma.to_string(),
     }
+}
+
+/// `pron` (with ー for long vowels) is the pronunciation of `reading`.
+fn same_pronunciation(pron: &str, reading: &str) -> bool {
+    pron.chars().count() == reading.chars().count() && pron.chars().zip(reading.chars()).all(|(p, r)| p == r || p == 'ー')
+}
+
+fn kanji_of(s: &str) -> Vec<char> {
+    s.chars().filter(|&c| is_cjk_kanji(c)).collect()
 }
 
 fn resolve_reading(
@@ -267,5 +311,35 @@ mod tests {
         assert!(is_valid_word("スーパー"));
         assert!(is_valid_word("人々"));
         assert!(is_valid_word("abc"));
+    }
+}
+
+#[cfg(all(test, feature = "embed-dict"))]
+mod dictionary_tests {
+    use super::JapaneseTokenizer;
+
+    fn words(text: &str) -> Vec<String> {
+        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
+        tokenizer.tokenize(text).unwrap().into_iter().map(|w| w.base_word).collect()
+    }
+
+    #[test]
+    fn keeps_compounds_whole() {
+        assert_eq!(words("神出鬼没の怪盗"), ["神出鬼没", "怪盗"]);
+        assert_eq!(words("魔法使いになった"), ["魔法使い", "なる"]);
+        assert_eq!(words("魔法使える"), ["魔法", "使う"]);
+        assert_eq!(words("至近距離で"), ["至近距離"]);
+    }
+
+    #[test]
+    fn maps_derived_verbs_to_headwords() {
+        assert_eq!(words("研ぎ澄ませた"), ["研ぎ澄ます"]);
+        assert_eq!(words("計り知れない"), ["計り知れない"]);
+    }
+
+    #[test]
+    fn keeps_okurigana_of_the_surface() {
+        assert_eq!(words("抑えた"), ["抑える"]);
+        assert_eq!(words("治せる"), ["治す"]);
     }
 }
