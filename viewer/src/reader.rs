@@ -587,7 +587,7 @@ impl Reader {
                     // Scrolls when long, and is no taller than its content otherwise (egui's own window
                     // scrolling always takes the maximum height)
                     egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-                        kanji = word_ui(ui, &word.parsed, lookup, body, palette);
+                        kanji = word_ui(ui, &word.parsed, surface, lookup, body, palette);
                     });
                 });
             self.word_popup_rect = shown.map(|s| s.response.rect);
@@ -724,9 +724,9 @@ fn readings_parts<'a>(readings: &[&'a str], palette: Palette) -> Vec<(&'a str, C
     parts
 }
 
-/// The word with its other spellings and its readings, what its conjugation means, then its definitions;
-/// returns a kanji of the word that was clicked.
-fn word_ui(ui: &mut Ui, word: &ParsedWord, lookup: Option<&Lookup>, body: f32, palette: Palette) -> Option<char> {
+/// The word with its other spellings and its readings, the number it counts with its reading (一つ【ひとつ】),
+/// what its conjugation means, then its definitions; returns a kanji of the word that was clicked.
+fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup>, body: f32, palette: Palette) -> Option<char> {
     let mut clicked = None;
     let text_color = ui.visuals().text_color();
     let note = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).size(body * 0.8).color(palette.secondary_text));
@@ -765,6 +765,12 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, lookup: Option<&Lookup>, body: f32, p
             i = end;
         }
     });
+    // A counter: the number it counts as the text writes it, read as a whole (一つ【ひとつ】)
+    if let Some(reading) = &word.written_reading {
+        let mut parts = vec![(surface, ui.visuals().text_color())];
+        parts.extend(readings_parts(&[reading.as_str()], palette));
+        ui.label(colored(ui, &parts, body * 1.1, false));
+    }
     // What the conjugation means (passive or potential (られる), past (た)), in the color of grammar
     if !word.forms.is_empty() {
         ui.label(colored(ui, &[(&word.forms.join(", "), palette.grammar)], body * 0.9, false));

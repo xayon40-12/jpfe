@@ -156,7 +156,7 @@ mod tests {
     use super::*;
 
     fn token(word: &str) -> ParsedWord {
-        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word, endings: Vec::new(), forms: Vec::new(), homograph: None }
+        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word, endings: Vec::new(), forms: Vec::new(), homograph: None, written_reading: None }
     }
 
     fn spelled(word: &str, spelling: &str) -> ParsedWord {

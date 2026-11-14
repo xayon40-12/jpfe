@@ -353,6 +353,7 @@ mod tests {
             endings: Vec::new(),
             forms: Vec::new(),
             homograph: None,
+            written_reading: None,
         };
         words.iter().map(word).collect()
     }
