@@ -192,7 +192,7 @@ impl Book {
             .chapters
             .iter()
             .zip(&words)
-            // No reference chapter: the viewer shows the density itself, not relative to the first chapter
+            // No reference chapter: the viewer computes its own density, per 100 words of the chapter
             .map(|(c, w)| ChapterStat::new(c.index, &c.title, w.len(), c.characters, 0.0))
             .collect();
         // Distinct words, as a chapter's list can repeat earlier ones when previous words are shown
