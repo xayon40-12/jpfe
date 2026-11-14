@@ -45,10 +45,12 @@ pub struct ParsedWord {
     /// Where the word is written in the tokenized text (bytes), with its conjugation endings (数えられる)
     pub span: Range<usize>,
     pub kind: WordKind,
-    /// The conjugation endings written after the word, which UniDic makes words of their own (られる, た, て,
-    /// the ない of 美しくない): part of the word in the text, and grammar in word lists (see [`Self::with_endings`])
-    pub endings: Vec<ParsedWord>,
-    /// What the word's conjugation means, in order ("passive or potential (られる)", "past (た)")
+    /// What UniDic makes words of their own but belongs to the word (see [`Self::with_affixes`]): the polite
+    /// prefix written before it (the お of お二人), and the endings written after it, conjugation endings (られる,
+    /// た, て, the ない of 美しくない) and suffixes (静かさ, 彼ら). Part of the word in the text, and grammar in
+    /// word lists.
+    pub affixes: Vec<ParsedWord>,
+    /// What the word's affixes mean, in order ("polite (お)", "passive or potential (られる)", "past (た)")
     pub forms: Vec<&'static str>,
     /// For a word with the same dictionary form as another word but read differently (the 様 of ようだ, not
     /// the 様 of エミリア様), its reading, which keeps the two apart in counts (see [`Self::key`])
@@ -68,9 +70,9 @@ impl ParsedWord {
         }
     }
 
-    /// The word, then its conjugation endings: what word lists count.
-    pub fn with_endings(&self) -> impl Iterator<Item = &ParsedWord> {
-        std::iter::once(self).chain(&self.endings)
+    /// The word, then its affixes: what word lists count.
+    pub fn with_affixes(&self) -> impl Iterator<Item = &ParsedWord> {
+        std::iter::once(self).chain(&self.affixes)
     }
 
     /// Whether word lists count this word; particles and auxiliary verbs only with `include_particles`.
@@ -488,7 +490,7 @@ impl JapaneseTokenizer {
                     base_word: word,
                     span: token.span.start..tokens[end - 1].span.end,
                     kind: WordKind::Word,
-                    endings: Vec::new(),
+                    affixes: Vec::new(),
                     forms: Vec::new(),
                     homograph: None,
                     written_reading: None,
@@ -581,7 +583,7 @@ impl JapaneseTokenizer {
                             base_word: word,
                             span,
                             kind: WordKind::Word,
-                            endings: Vec::new(),
+                            affixes: Vec::new(),
                             forms: Vec::new(),
                             homograph: None,
                             written_reading: None,
@@ -622,7 +624,7 @@ impl JapaneseTokenizer {
                 spelling,
                 span,
                 kind,
-                endings: Vec::new(),
+                affixes: Vec::new(),
                 forms: Vec::new(),
                 homograph,
                 written_reading: None,
@@ -630,7 +632,7 @@ impl JapaneseTokenizer {
             sources.push(source);
         }
         let (words, sources) = attach_counters(words, sources, &tokens, *reading_in_hiragana);
-        Ok(attach_endings(words, sources, &tokens, *reading_in_hiragana))
+        Ok(attach_prefixes(attach_endings(words, sources, &tokens, *reading_in_hiragana)))
     }
 }
 
@@ -887,9 +889,38 @@ fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[
                 head.forms.push(form);
             }
         }
-        head.endings.push(word);
+        head.affixes.push(word);
         last_token = Some(source.start);
     }
+    attached
+}
+
+/// Puts each polite prefix お or ご into the word after it (お二人 is 二人, ご出席 is 出席, お聞き is 聞く), unless
+/// JMdict has the whole word (お茶, ご飯), which is then already one word.
+fn attach_prefixes(words: Vec<ParsedWord>) -> Vec<ParsedWord> {
+    let mut attached: Vec<ParsedWord> = Vec::with_capacity(words.len());
+    let mut prefix: Option<ParsedWord> = None;
+    for mut word in words {
+        if let Some(mut polite) = prefix.take() {
+            // A word to learn, next to the prefix in the text: not a particle or another interjection (お、お…)
+            if polite.span.end == word.span.start && word.kind == WordKind::Word && !matches!(word.pos.as_str(), "接頭辞" | "感動詞") {
+                word.span.start = polite.span.start;
+                word.forms.insert(0, if polite.spelling == "ご" { "polite (ご)" } else { "polite (お)" });
+                polite.kind = WordKind::Grammar;
+                word.affixes.insert(0, polite);
+                attached.push(word);
+                continue;
+            }
+            attached.push(polite);
+        }
+        let polite = word.pos == "接頭辞" && word.base_word == "御" && matches!(word.spelling.as_str(), "お" | "ご" | "御");
+        if polite {
+            prefix = Some(word);
+        } else {
+            attached.push(word);
+        }
+    }
+    attached.extend(prefix);
     attached
 }
 
@@ -1326,7 +1357,7 @@ mod dictionary_tests {
         words
             .iter()
             .map(|w| {
-                let endings = join(w.endings.iter().map(|e| e.base_word.as_str()).collect());
+                let endings = join(w.affixes.iter().map(|e| e.base_word.as_str()).collect());
                 (text[w.span.clone()].to_string(), w.base_word.clone(), join(w.forms.clone()), endings)
             })
             .collect()
@@ -1415,6 +1446,11 @@ mod dictionary_tests {
         assert_eq!(conjugated("子供達"), one("子供達", "子供", "plural (たち)", "達"));
         assert_eq!(conjugated("候補者たち"), one("候補者たち", "候補者", "plural (たち)", "達"));
         assert_eq!(conjugated("美しさ"), one("美しさ", "美しさ", "", ""));
+        // Polite prefixes, unless JMdict has the whole word
+        assert_eq!(conjugated("お二人"), one("お二人", "二人", "polite (お)", "御"));
+        assert_eq!(conjugated("ご出席"), one("ご出席", "出席", "polite (ご)", "御"));
+        assert_eq!(conjugated("お聞き"), one("お聞き", "聞く", "polite (お)", "御"));
+        assert_eq!(conjugated("お茶"), one("お茶", "お茶", "", ""));
         // Verbs after て, nouns and what follows them stay words of their own
         let written = |text: &str| conjugated(text).into_iter().map(|(w, ..)| w).collect::<Vec<_>>();
         assert_eq!(written("それによって"), ["それ", "に", "よって"]);
@@ -1423,6 +1459,7 @@ mod dictionary_tests {
         assert_eq!(written("勉強した"), ["勉強", "した"]);
         assert_eq!(written("関係なかった"), ["関係", "なかった"]);
         assert_eq!(written("学生だった"), ["学生", "だった"]);
+        assert_eq!(written("お、おじゃま"), ["お", "おじゃま"]);
         // Word lists count the word once, and its endings as grammar
         assert_eq!(words("食べさせられた"), ["食べる"]);
         let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
@@ -1430,7 +1467,7 @@ mod dictionary_tests {
             .tokenize("美しくなかった")
             .unwrap()
             .iter()
-            .flat_map(|w| w.with_endings())
+            .flat_map(|w| w.with_affixes())
             .filter(|w| w.is_listed(true))
             .map(|w| w.base_word.clone())
             .collect();

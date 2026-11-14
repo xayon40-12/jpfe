@@ -35,7 +35,7 @@ impl BookWord {
 }
 
 /// Occurrences of each base word word lists count in one chapter (see [`ParsedWord::is_listed`]), conjugation
-/// endings included (see [`ParsedWord::with_endings`]).
+/// affixes included (see [`ParsedWord::with_affixes`]).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChapterCounts {
     pub total: usize,
@@ -46,7 +46,7 @@ impl ChapterCounts {
     pub fn new(tokens: &[ParsedWord], include_particles: bool) -> Self {
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut total = 0;
-        for token in tokens.iter().flat_map(ParsedWord::with_endings).filter(|t| t.is_listed(include_particles)) {
+        for token in tokens.iter().flat_map(ParsedWord::with_affixes).filter(|t| t.is_listed(include_particles)) {
             *counts.entry(token.key().into_owned()).or_default() += 1;
             total += 1;
         }
@@ -71,7 +71,7 @@ impl FrequencyAnalyzer {
     pub fn from_tokens(chapters: &[Chapter], tokenized: &[Vec<ParsedWord>], include_particles: bool) -> Self {
         let mut words: HashMap<String, BookWord> = HashMap::new();
         for (chapter_pos, (chapter, tokens)) in chapters.iter().zip(tokenized).enumerate() {
-            for t in tokens.iter().flat_map(ParsedWord::with_endings).filter(|t| t.is_listed(include_particles)) {
+            for t in tokens.iter().flat_map(ParsedWord::with_affixes).filter(|t| t.is_listed(include_particles)) {
                 let word = words.entry(t.key().into_owned()).or_insert_with(|| BookWord {
                     count: 0,
                     spellings: Vec::new(),
@@ -156,7 +156,7 @@ mod tests {
     use super::*;
 
     fn token(word: &str) -> ParsedWord {
-        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word, endings: Vec::new(), forms: Vec::new(), homograph: None, written_reading: None }
+        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word, affixes: Vec::new(), forms: Vec::new(), homograph: None, written_reading: None }
     }
 
     fn spelled(word: &str, spelling: &str) -> ParsedWord {
