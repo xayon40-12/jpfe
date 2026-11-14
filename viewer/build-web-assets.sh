@@ -10,8 +10,18 @@ cd "$(dirname "$0")/.."
 
 # Building the CLI compiles the dictionary into lindera-unidic's build directory and extracts JMdict
 cargo build --release -p jpfe
+# The newest build of it, wherever cargo keeps build script outputs: lindera-unidic-<hash>/out before
+# cargo 1.100, lindera-unidic/<hash>/out with its new build directory layout
+dict_words=""
+while IFS= read -r f; do
+  if [ -z "$dict_words" ] || [ "$f" -nt "$dict_words" ]; then dict_words=$f; fi
+done < <(find target/release/build -path '*lindera-unidic*/out/lindera-unidic/dict.words' 2>/dev/null)
+if [ -z "$dict_words" ]; then
+  echo "The compiled UniDic dictionary is missing from target/release/build/" >&2
+  exit 1
+fi
+dict=$(dirname "$dict_words")
 ./scripts/fetch-jmdict.sh
-dict=$(dirname "$(ls -t target/release/build/lindera-unidic-*/out/lindera-unidic/dict.words | head -1)")
 
 out=viewer/assets
 mkdir -p "$out/dict"
