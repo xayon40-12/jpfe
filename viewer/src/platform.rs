@@ -34,6 +34,11 @@ pub enum Incoming {
     Stored { key: Key, bytes: Option<Vec<u8>> },
     /// A storage write finished
     Written(Key),
+    /// Ids of the books something is stored for
+    StoredBooks(Vec<u64>),
+    /// Whether the browser keeps what is stored instead of clearing it when it needs room (web only)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Persistent(bool),
     StorageError(String),
     /// A font to add; the primary one draws Latin text too, the others only fill in missing glyphs
     Font { name: String, bytes: Vec<u8>, primary: bool },

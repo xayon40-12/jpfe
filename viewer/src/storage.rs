@@ -55,6 +55,25 @@ pub fn remove_book(inbox: &Inbox, ctx: &egui::Context, id: u64) {
     imp::remove(inbox.clone(), ctx.clone(), format!("books/{id}"));
 }
 
+/// List the books something is stored for (their `books/{id}` folders); answers with `Incoming::StoredBooks`.
+/// New books must not take their ids, even when the saved state does not list them.
+pub fn list_books(inbox: &Inbox, ctx: &egui::Context) {
+    imp::list_books(inbox.clone(), ctx.clone());
+}
+
+/// Ask the browser to keep what is stored, which it may otherwise clear when it needs room; answers with
+/// `Incoming::Persistent` on the web, and nothing on the desktop, where files are always kept.
+pub fn persist(inbox: &Inbox, ctx: &egui::Context) {
+    imp::persist(inbox.clone(), ctx.clone());
+}
+
+/// Book ids among the names of the `books` folder's entries.
+fn book_ids(names: impl IntoIterator<Item = String>) -> Vec<u64> {
+    let mut ids: Vec<u64> = names.into_iter().filter_map(|name| name.parse().ok()).collect();
+    ids.sort_unstable();
+    ids
+}
+
 fn done(inbox: &Inbox, ctx: &egui::Context, message: Incoming) {
     inbox.push(message);
     ctx.request_repaint();
@@ -87,6 +106,17 @@ mod imp {
         };
         done(&inbox, &ctx, message);
     }
+
+    pub fn list_books(inbox: Inbox, ctx: egui::Context) {
+        let names = root()
+            .and_then(|r| std::fs::read_dir(r.join("books")).ok())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok());
+        done(&inbox, &ctx, Incoming::StoredBooks(super::book_ids(names)));
+    }
+
+    pub fn persist(_inbox: Inbox, _ctx: egui::Context) {}
 
     pub fn remove(inbox: Inbox, ctx: egui::Context, path: String) {
         if let Some(dir) = root().map(|r| r.join(path)) {
@@ -317,6 +347,53 @@ mod imp {
         });
     }
 
+    /// Names of the entries of the `books` folder (none if it does not exist).
+    async fn book_folders() -> Result<Vec<String>, JsValue> {
+        // The parent of "books/" is the `books` folder itself
+        let books = match parent("books/", false).await {
+            Ok((dir, _)) => dir,
+            Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let entries = books.keys();
+        let mut names = Vec::new();
+        loop {
+            let next = JsFuture::from(entries.next()?).await?;
+            if js_sys::Reflect::get(&next, &"done".into())?.as_bool().unwrap_or(true) {
+                return Ok(names);
+            }
+            names.extend(js_sys::Reflect::get(&next, &"value".into())?.as_string());
+        }
+    }
+
+    pub fn list_books(inbox: Inbox, ctx: egui::Context) {
+        spawn_local(async move {
+            let names = match book_folders().await {
+                Ok(names) => names,
+                Err(e) => {
+                    done(&inbox, &ctx, failure("listing", "books", &e));
+                    Vec::new()
+                }
+            };
+            done(&inbox, &ctx, Incoming::StoredBooks(super::book_ids(names)));
+        });
+    }
+
+    pub fn persist(inbox: Inbox, ctx: egui::Context) {
+        spawn_local(async move {
+            let Some(storage) = web_sys::window().map(|w| w.navigator().storage()) else { return };
+            let ask = |promise: Result<js_sys::Promise, JsValue>| async move {
+                JsFuture::from(promise?).await.map(|granted| granted.as_bool().unwrap_or(false))
+            };
+            // Asked only when not granted yet: Firefox asks the user
+            let granted = match ask(storage.persisted()).await {
+                Ok(true) => Ok(true),
+                _ => ask(storage.persist()).await,
+            };
+            done(&inbox, &ctx, Incoming::Persistent(granted.unwrap_or(false)));
+        });
+    }
+
     pub fn remove(inbox: Inbox, ctx: egui::Context, path: String) {
         spawn_local(async move {
             // A missing entry is fine: the book may never have been saved
@@ -326,5 +403,14 @@ mod imp {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn book_ids_are_the_numbered_folders() {
+        let names = ["3", "0", "notes", "12"].map(String::from);
+        assert_eq!(super::book_ids(names), [0, 3, 12]);
     }
 }

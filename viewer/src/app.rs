@@ -166,6 +166,13 @@ pub struct ViewerApp {
 
     /// The saved state has been read; until then nothing is saved, so it is not overwritten
     state_loaded: bool,
+    /// Ids of the books something is stored for, once listed; with the saved state, what new books' ids follow
+    stored_books: Option<Vec<u64>>,
+    /// Ids of the books in the saved state as it was read
+    saved_ids: Vec<u64>,
+    /// Whether the browser keeps what is stored, once asked (asked once there are books to keep)
+    persistent: Option<bool>,
+    persistence_asked: bool,
     /// Last state written to storage
     saved: Option<SavedState>,
     next_id: u64,
@@ -201,6 +208,7 @@ impl ViewerApp {
         let ctx = &cc.egui_ctx;
         platform::load_assets(&inbox, ctx);
         storage::read(&inbox, ctx, Key::State);
+        storage::list_books(&inbox, ctx);
         let dictionary = match platform::embedded_tokenizer() {
             Some(Ok(tokenizer)) => DictionaryState::Ready { tokenizer: Box::new(tokenizer), version: "embedded".into() },
             Some(Err(e)) => DictionaryState::Failed(e.to_string()),
@@ -230,6 +238,10 @@ impl ViewerApp {
             reader_vertical: reader::DEFAULT_VERTICAL,
             lookup: platform::embedded_lookup(),
             state_loaded: false,
+            stored_books: None,
+            saved_ids: Vec::new(),
+            persistent: None,
+            persistence_asked: false,
             saved: None,
             next_id: 0,
             to_restore: Vec::new(),
@@ -248,11 +260,12 @@ impl ViewerApp {
         let mut deferred = Vec::new();
         for message in self.inbox.drain() {
             match message {
-                // New books get ids after the saved ones, so wait for the saved state
-                Incoming::File { .. } if !self.state_loaded => deferred.push(message),
+                // New books get ids after the saved and stored ones, so wait until both are known
+                Incoming::File { .. } if !self.state_loaded || self.stored_books.is_none() => deferred.push(message),
                 Incoming::File { name, bytes } => {
                     let id = self.next_id;
                     self.next_id += 1;
+                    self.ask_persistence(ctx);
                     storage::write(&self.inbox, ctx, Key::Source(id), &bytes);
                     match PendingBook::parse(id, &name, bytes, None) {
                         Ok(book) => self.pending.push(book),
@@ -295,6 +308,14 @@ impl ViewerApp {
                     }
                 }
                 Incoming::Written(_) => {}
+                Incoming::StoredBooks(ids) => {
+                    self.stored_books = Some(ids);
+                    self.books_known();
+                }
+                Incoming::Persistent(granted) => {
+                    platform::log(&format!("Persistent storage {}", if granted { "granted" } else { "refused" }));
+                    self.persistent = Some(granted);
+                }
                 Incoming::StorageError(e) => {
                     log::warn!("Storage: {e}");
                     self.storage_error.get_or_insert(e);
@@ -329,10 +350,15 @@ impl ViewerApp {
                 self.reader_font_size = state.reader_font_size.clamp(*reader::FONT_SIZES.start(), *reader::FONT_SIZES.end());
                 self.reader_vertical = state.reader_vertical;
                 self.wanted_shown = state.shown;
-                self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
+                self.saved_ids = state.books.iter().map(|b| b.id).collect();
+                self.next_id = state.next_id;
+                if !state.books.is_empty() {
+                    self.ask_persistence(ctx);
+                }
                 self.to_restore = state.books.clone();
                 self.saved = Some(state);
                 self.state_loaded = true;
+                self.books_known();
             }
             Key::DictionaryVersion => {
                 if let DictionaryState::Checking { stored, .. } = &mut self.dictionary {
@@ -387,6 +413,25 @@ impl ViewerApp {
                     None => self.errors.push(format!("{}: the stored file is missing; open it again", saved.name)),
                 }
             }
+        }
+    }
+
+    /// Once both the saved state and the stored books are known: the id of the next new book, which is after
+    /// both, and a message about books stored but missing from the saved state (kept, never overwritten).
+    fn books_known(&mut self) {
+        let (true, Some(stored)) = (self.state_loaded, &self.stored_books) else { return };
+        self.next_id = next_book_id(self.next_id, &self.saved_ids, stored);
+        let unlisted: Vec<String> = stored.iter().filter(|id| !self.saved_ids.contains(id)).map(|id| format!("books/{id}")).collect();
+        if !unlisted.is_empty() {
+            let books = if unlisted.len() == 1 { "a book".to_string() } else { format!("{} books", unlisted.len()) };
+            self.errors.push(format!("Files of {books} missing from the book list are kept in this browser's storage: {}", unlisted.join(", ")));
+        }
+    }
+
+    /// Ask the browser to keep the stored books (once).
+    fn ask_persistence(&mut self, ctx: &egui::Context) {
+        if !std::mem::replace(&mut self.persistence_asked, true) {
+            storage::persist(&self.inbox, ctx);
         }
     }
 
@@ -817,6 +862,10 @@ impl ViewerApp {
         }
         if let Some(summary) = self.load_times.summary().filter(|_| self.debug) {
             ui.label(RichText::new(summary).small().color(palette.secondary_text));
+        }
+        if self.debug && self.persistent == Some(false) {
+            let text = "This browser did not grant persistent storage: it may clear the saved books when it needs room.";
+            ui.label(RichText::new(text).small().color(palette.secondary_text));
         }
         if let Some(e) = &self.storage_error {
             ui.label(RichText::new("Books cannot be saved in this browser, so they will not be kept.").small().color(palette.secondary_text));
@@ -1351,10 +1400,28 @@ impl eframe::App for ViewerApp {
     }
 }
 
+/// The id of the next new book: after every id the saved state used (`saved_next`, `saved`) and every book
+/// something is stored for (`stored`), so a new book never takes the files of another.
+fn next_book_id(saved_next: u64, saved: &[u64], stored: &[u64]) -> u64 {
+    saved.iter().chain(stored).map(|id| id + 1).max().unwrap_or(0).max(saved_next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui::{pos2, Event, Modifiers, PointerButton, RawInput, TouchDeviceId, TouchId, TouchPhase};
+
+    #[test]
+    fn new_books_never_take_the_id_of_stored_ones() {
+        // Saved state and storage agree
+        assert_eq!(next_book_id(2, &[0, 1], &[0, 1]), 2);
+        // The saved state is gone or older, but a book is still stored: its files are not overwritten
+        assert_eq!(next_book_id(0, &[], &[0]), 1);
+        assert_eq!(next_book_id(3, &[0], &[0, 5]), 6);
+        // Ids of removed books are not reused either
+        assert_eq!(next_book_id(4, &[1], &[1]), 4);
+        assert_eq!(next_book_id(0, &[], &[]), 0);
+    }
 
     /// Feeds one frame at `time` and returns whether the chart is being inspected.
     fn frame(ctx: &egui::Context, press: &mut LongPress, time: f64, events: Vec<Event>) -> bool {
