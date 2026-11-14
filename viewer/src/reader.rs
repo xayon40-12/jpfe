@@ -1,11 +1,16 @@
 //! The reader: a chapter's text, where clicking a word shows its definitions, and clicking a kanji of that
 //! word shows the kanji's readings and meanings.
+//!
+//! The text is set on a grid, one character per cell: in columns from top to bottom, right to left
+//! (縦書き, the default), or in lines from left to right, top to bottom. egui only lays out horizontal text,
+//! so the reader places every character itself.
 
+use std::f32::consts::FRAC_PI_2;
 use std::ops::{Range, RangeInclusive};
 
 use anyhow::{Context, Result};
-use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, CursorIcon, FontId, Galley, Pos2, Rect, RichText, Sense, Ui};
+use egui::epaint::TextShape;
+use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use jpfe::dictionary::{Definitions, Kanjidic, DEFINITIONS_FILE, KANJI_FILE};
 use jpfe::tokenizer::{is_cjk_kanji, JapaneseTokenizer, ParsedWord};
 
@@ -14,10 +19,19 @@ use crate::theme::Palette;
 
 pub const DEFAULT_FONT_SIZE: f32 = 20.0;
 pub const FONT_SIZES: RangeInclusive<f32> = 10.0..=48.0;
-/// Line height, in font sizes: Japanese text needs more room than egui's default.
-const LINE_HEIGHT: f32 = 1.75;
-/// Widest line, in font sizes (about as many characters).
+/// Vertical text (縦書き) unless the reader picks horizontal text.
+pub const DEFAULT_VERTICAL: bool = true;
+/// Distance from one line (or column) to the next, in font sizes.
+const LINE_PITCH: f32 = 1.75;
+/// Longest horizontal line, in characters.
 const MAX_LINE: f32 = 38.0;
+/// Margin around the text, in font sizes.
+const MARGIN: f32 = 1.0;
+/// Room after the text for the next chapter button, in font sizes.
+const END_SPACE: f32 = 4.0;
+/// Size of the chapter title and of PDF page numbers, in font sizes.
+const TITLE_SCALE: f32 = 1.3;
+const PAGE_NUMBER_SCALE: f32 = 0.5;
 /// Font size change for each notch of the mouse wheel with Shift.
 const WHEEL_ZOOM: f32 = 1.06;
 /// Entries shown at most for a word.
@@ -52,18 +66,24 @@ struct Paragraph {
     span: Range<usize>,
     /// Its words, as positions in `Reader::words`
     words: Range<usize>,
+    /// Its characters as shown, one per cell (see [`full_width`])
+    chars: Vec<char>,
+    /// A page number of a PDF, shown small at the end of its line
+    page_number: bool,
 }
 
 struct Word {
     parsed: ParsedWord,
+    paragraph: usize,
     /// Characters of the word in its paragraph
     chars: Range<usize>,
 }
 
-/// The word whose definitions are shown, in a window opened at `anchor`.
+/// The word whose definitions are shown, in a window whose `pivot` corner is at `anchor`.
 struct WordPopup {
     word: usize,
     anchor: Pos2,
+    pivot: Align2,
     /// Each window gets its own id, so a new one opens at its anchor rather than where the last one was
     id: u64,
 }
@@ -71,6 +91,7 @@ struct WordPopup {
 struct KanjiPopup {
     kanji: char,
     anchor: Pos2,
+    pivot: Align2,
     id: u64,
 }
 
@@ -81,19 +102,215 @@ pub struct ReaderResponse {
     pub chapter: Option<usize>,
 }
 
+/// What the text was laid out for; it is laid out again when any of it changes.
+#[derive(Clone, Copy, PartialEq)]
+struct LayoutKey {
+    size: f32,
+    vertical: bool,
+    /// Room for the characters of a line (a column's height for vertical text)
+    length: f32,
+}
+
+/// A line of horizontal text, or a column of vertical text.
+struct Line {
+    /// The paragraph it shows part of; `None` for the chapter title
+    paragraph: Option<usize>,
+    chars: Range<usize>,
+    /// Cell of its first character (page numbers are set at the end of their line)
+    first_cell: usize,
+    scale: f32,
+    /// Distance from the first line, and thickness of the line (its height, or a column's width)
+    offset: f32,
+    pitch: f32,
+}
+
+struct Layout {
+    key: LayoutKey,
+    lines: Vec<Line>,
+    /// Lines of each paragraph, as positions in `lines`
+    paragraph_lines: Vec<Range<usize>>,
+    /// Thickness of all the lines
+    extent: f32,
+    /// Length of a full line of body text
+    line_length: f32,
+}
+
+impl Layout {
+    /// Where the first line starts: its top-left corner, or its top-right one for vertical text.
+    fn origin(&self, content: Rect) -> Pos2 {
+        let margin = self.key.size * MARGIN;
+        if self.key.vertical {
+            pos2(content.right() - margin, content.top() + margin)
+        } else {
+            // Horizontal text is centered
+            pos2(content.left() + ((content.width() - self.line_length) / 2.0).max(margin), content.top() + margin)
+        }
+    }
+
+    /// Size of everything to scroll through, for a visible area of `view`.
+    fn content_size(&self, view: Vec2) -> Vec2 {
+        let thickness = self.extent + self.key.size * (2.0 * MARGIN + END_SPACE);
+        if self.key.vertical { vec2(thickness.max(view.x), view.y) } else { vec2(view.x, thickness.max(view.y)) }
+    }
+
+    fn cell(&self, line: &Line, cell: usize, origin: Pos2) -> Rect {
+        let size = self.key.size * line.scale;
+        if self.key.vertical {
+            Rect::from_min_size(pos2(origin.x - line.offset - line.pitch, origin.y + cell as f32 * size), vec2(line.pitch, size))
+        } else {
+            Rect::from_min_size(pos2(origin.x + cell as f32 * size, origin.y + line.offset), vec2(size, line.pitch))
+        }
+    }
+
+    /// The paragraph and character at `pos`.
+    fn char_at(&self, pos: Pos2, origin: Pos2) -> Option<(usize, usize)> {
+        let (across, along) = if self.key.vertical { (origin.x - pos.x, pos.y - origin.y) } else { (pos.y - origin.y, pos.x - origin.x) };
+        let line = &self.lines[self.lines.partition_point(|l| l.offset + l.pitch <= across).min(self.lines.len().checked_sub(1)?)];
+        if across < line.offset || along < 0.0 {
+            return None;
+        }
+        let cell = (along / (self.key.size * line.scale)) as usize;
+        let index = line.chars.start + cell.checked_sub(line.first_cell)?;
+        (index < line.chars.end).then_some((line.paragraph?, index))
+    }
+
+    /// Lines that may show in `clip`.
+    fn visible(&self, clip: Rect, origin: Pos2) -> Range<usize> {
+        let (from, to) = if self.key.vertical { (origin.x - clip.right(), origin.x - clip.left()) } else { (clip.top() - origin.y, clip.bottom() - origin.y) };
+        let start = self.lines.partition_point(|l| l.offset + l.pitch < from);
+        start..self.lines.partition_point(|l| l.offset <= to).max(start)
+    }
+
+    /// Rectangles covering the characters `chars` of a paragraph, one for each line they are on.
+    fn rects(&self, paragraph: usize, chars: &Range<usize>, origin: Pos2) -> Vec<Rect> {
+        let lines = self.paragraph_lines.get(paragraph).cloned().unwrap_or_default();
+        self.lines[lines]
+            .iter()
+            .filter_map(|line| {
+                let (start, end) = (chars.start.max(line.chars.start), chars.end.min(line.chars.end));
+                (start < end).then(|| {
+                    let cell = |i: usize| self.cell(line, line.first_cell + i - line.chars.start, origin);
+                    let rect = cell(start).union(cell(end - 1));
+                    // The glyphs' band, not the space between lines
+                    let gap = (line.pitch - self.key.size * line.scale * 1.3) / 2.0;
+                    if self.key.vertical { rect.shrink2(vec2(gap, 0.0)) } else { rect.shrink2(vec2(0.0, gap)) }
+                })
+            })
+            .collect()
+    }
+}
+
+/// Characters that may not start a line: they hang at the end of the previous one (禁則処理).
+fn no_line_start(c: char) -> bool {
+    "、。，．」』）】〕〉》］｝！？ー…‥・：；ゝゞ々ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ".contains(c)
+}
+
+/// Characters that may not end a line: they move to the next one, with what they open.
+fn no_line_end(c: char) -> bool {
+    "「『（【〔〈《［｛".contains(c)
+}
+
+fn is_small_kana(c: char) -> bool {
+    "ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ".contains(c)
+}
+
+/// Half-width letters, digits and signs as full-width characters, so every character fills one cell of
+/// the grid (the text keeps one character for each, so word positions are unchanged).
+fn full_width(c: char) -> char {
+    match c {
+        ' ' => '　',
+        '!'..='~' => char::from_u32(c as u32 + 0xFEE0).unwrap_or(c),
+        _ => c,
+    }
+}
+
+/// Cut a paragraph into lines of `cells` characters, keeping punctuation off the start of a line.
+fn wrap(chars: &[char], cells: usize) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + cells).min(chars.len());
+        if end < chars.len() {
+            // Punctuation and closing brackets hang past the end of the line (two at most)
+            let mut hung = 0;
+            while end < chars.len() && hung < 2 && no_line_start(chars[end]) {
+                end += 1;
+                hung += 1;
+            }
+            if hung == 0 {
+                while end > start + 1 && no_line_end(chars[end - 1]) {
+                    end -= 1;
+                }
+            }
+        }
+        lines.push(start..end);
+        start = end;
+    }
+    if lines.is_empty() {
+        lines.push(0..0);
+    }
+    lines
+}
+
+/// How a character is drawn in vertical text.
+enum VerticalForm {
+    Upright,
+    /// Turned a quarter clockwise: long vowel marks, dashes, ellipses and brackets
+    Rotated,
+    /// Moved by this much (in font sizes) to the top right of its cell: commas, periods and small kana
+    Shifted(f32, f32),
+}
+
+fn vertical_form(c: char) -> VerticalForm {
+    if "ー－―—～〜…‥「」『』（）【】〔〕〈〉《》［］｛｝＜＞＝：；｜→←".contains(c) {
+        VerticalForm::Rotated
+    } else if "、。，．".contains(c) {
+        VerticalForm::Shifted(0.55, -0.55)
+    } else if is_small_kana(c) {
+        VerticalForm::Shifted(0.1, -0.1)
+    } else {
+        VerticalForm::Upright
+    }
+}
+
+/// Draws one character in the middle of its cell.
+fn draw_char(painter: &Painter, c: char, cell: Rect, font: &FontId, color: Color32, vertical: bool) {
+    let galley = painter.layout_no_wrap(c.to_string(), font.clone(), color);
+    let size = galley.size();
+    let mut center = cell.center();
+    if vertical {
+        match vertical_form(c) {
+            VerticalForm::Rotated => {
+                // Turned around its top-left corner, the glyph lies to the left of it
+                let pos = pos2(center.x + size.y / 2.0, center.y - size.x / 2.0);
+                painter.add(TextShape::new(pos, galley, color).with_angle(FRAC_PI_2));
+                return;
+            }
+            VerticalForm::Shifted(x, y) => center += vec2(x, y) * font.size,
+            VerticalForm::Upright => {}
+        }
+    }
+    painter.galley(center - size / 2.0, galley, color);
+}
+
 pub struct Reader {
     pub book: u64,
     pub chapter: usize,
     /// The book's progress when the reader was opened: the reader opens there again once it changes
     pub opened_at: Option<usize>,
     book_name: String,
-    title: String,
+    title: Vec<char>,
     chapters: usize,
     text: String,
     paragraphs: Vec<Paragraph>,
     words: Vec<Word>,
     /// Words are found once the dictionary is ready
     tokenized: bool,
+    layout: Option<Layout>,
+    /// How far into the chapter the reader is (0 to 1), kept when the text is laid out again
+    position: f32,
+    /// Layout and visible size the scroll position was last set for
+    placed_for: Option<(LayoutKey, Vec2)>,
     word_popup: Option<WordPopup>,
     kanji_popup: Option<KanjiPopup>,
     /// Where the word window was in the last frame, to open the kanji window next to it
@@ -104,13 +321,15 @@ pub struct Reader {
 impl Reader {
     pub fn new(book: &Book, chapter: usize) -> Self {
         let text = book.chapter_text(chapter).to_string();
+        let pdf = book.file_name.to_lowercase().ends_with(".pdf");
         let mut at = 0;
         let paragraphs = text
             .split('\n')
             .map(|line| {
                 let span = at..at + line.len();
                 at = span.end + 1;
-                Paragraph { span, words: 0..0 }
+                let page_number = pdf && !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit());
+                Paragraph { span, words: 0..0, chars: line.chars().map(full_width).collect(), page_number }
             })
             .collect();
         Self {
@@ -118,12 +337,15 @@ impl Reader {
             chapter,
             opened_at: book.learned,
             book_name: book.name.clone(),
-            title: book.chapter_label(chapter),
+            title: book.chapter_label(chapter).chars().map(full_width).collect(),
             chapters: book.chapters.len(),
             text,
             paragraphs,
             words: Vec::new(),
             tokenized: false,
+            layout: None,
+            position: 0.0,
+            placed_for: None,
             word_popup: None,
             kanji_popup: None,
             word_popup_rect: None,
@@ -147,7 +369,7 @@ impl Reader {
         };
         parsed.sort_by_key(|w| w.span.start);
         let mut parsed = parsed.into_iter().peekable();
-        for paragraph in &mut self.paragraphs {
+        for (index, paragraph) in self.paragraphs.iter_mut().enumerate() {
             let start = self.words.len();
             let text = &self.text[paragraph.span.clone()];
             // Character positions of the words, counted as they come (they are in order)
@@ -163,18 +385,53 @@ impl Reader {
                 }
                 let (start, end) = (word.span.start - paragraph.span.start, word.span.end - paragraph.span.start);
                 let chars = char_at(start)..char_at(end);
-                self.words.push(Word { parsed: word, chars });
+                self.words.push(Word { parsed: word, paragraph: index, chars });
             }
             paragraph.words = start..self.words.len();
         }
     }
 
-    /// Book name and chapter, for the top bar.
+    /// Book name, for the top bar.
     pub fn book_name(&self) -> &str {
         &self.book_name
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, lookup: Option<&Lookup>, font_size: &mut f32, palette: Palette) -> ReaderResponse {
+    /// The word at a character of a paragraph.
+    fn word_at(&self, paragraph: usize, char: usize) -> Option<usize> {
+        let range = self.paragraphs[paragraph].words.clone();
+        self.words[range.clone()].iter().position(|w| w.chars.contains(&char)).map(|i| range.start + i)
+    }
+
+    fn lay_out(&self, key: LayoutKey) -> Layout {
+        let mut lines = Vec::new();
+        let mut paragraph_lines = Vec::with_capacity(self.paragraphs.len());
+        let mut offset = 0.0;
+        let cells = |scale: f32| ((key.length / (key.size * scale)).floor() as usize).max(4);
+        let mut push = |lines: &mut Vec<Line>, paragraph: Option<usize>, chars: Range<usize>, first_cell: usize, scale: f32| {
+            let pitch = key.size * scale * LINE_PITCH;
+            lines.push(Line { paragraph, chars, first_cell, scale, offset, pitch });
+            offset += pitch;
+        };
+        for chars in wrap(&self.title, cells(TITLE_SCALE)) {
+            push(&mut lines, None, chars, 0, TITLE_SCALE);
+        }
+        push(&mut lines, None, 0..0, 0, 0.5);
+        for (index, paragraph) in self.paragraphs.iter().enumerate() {
+            let first = lines.len();
+            if paragraph.page_number {
+                let len = paragraph.chars.len();
+                push(&mut lines, Some(index), 0..len, cells(PAGE_NUMBER_SCALE).saturating_sub(len), PAGE_NUMBER_SCALE);
+            } else {
+                for chars in wrap(&paragraph.chars, cells(1.0)) {
+                    push(&mut lines, Some(index), chars, 0, 1.0);
+                }
+            }
+            paragraph_lines.push(first..lines.len());
+        }
+        Layout { key, lines, paragraph_lines, extent: offset, line_length: cells(1.0) as f32 * key.size }
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui, lookup: Option<&Lookup>, font_size: &mut f32, vertical: bool, palette: Palette) -> ReaderResponse {
         let mut response = ReaderResponse::default();
         zoom(ui, font_size);
         let size = *font_size;
@@ -185,54 +442,110 @@ impl Reader {
             ui.label(RichText::new("Words can be looked up once the dictionary is ready.").small().color(palette.secondary_text));
         }
 
-        let text_color = ui.visuals().text_color();
-        let mut clicked: Option<Option<(usize, Pos2)>> = None;
-        egui::ScrollArea::vertical()
-            .id_salt(("reader", self.book, self.chapter))
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                // A centered column, no wider than a comfortable line
-                let width = ui.available_width().min(size * MAX_LINE);
-                let margin = (ui.available_width() - width) / 2.0;
-                ui.horizontal(|ui| {
-                    ui.add_space(margin);
-                    ui.vertical(|ui| {
-                        ui.set_width(width);
-                        ui.add_space(size);
-                        ui.label(RichText::new(&self.title).size(size * 1.4).strong());
-                        ui.add_space(size * 0.8);
-                        ui.spacing_mut().item_spacing.y = size * 0.3;
-                        let selected = self.word_popup.as_ref().map(|p| p.word);
-                        for paragraph in &self.paragraphs {
-                            let text = &self.text[paragraph.span.clone()];
-                            if text.trim().is_empty() {
-                                ui.add_space(size * 0.5);
-                                continue;
-                            }
-                            let words = &self.words[paragraph.words.clone()];
-                            let selected = selected.and_then(|w| w.checked_sub(paragraph.words.start)).filter(|&w| w < words.len());
-                            let colors = Highlight { text: text_color, hovered: palette.accent.gamma_multiply(0.12), selected: palette.accent.gamma_multiply(0.28) };
-                            if let Some(click) = paragraph_ui(ui, text, words, size, colors, selected) {
-                                clicked = Some(click.map(|(w, anchor)| (paragraph.words.start + w, anchor)));
-                            }
-                        }
-                        ui.add_space(size);
-                        if self.chapter + 1 < self.chapters {
-                            ui.vertical_centered(|ui| {
-                                let next = egui::Button::new(RichText::new("Next chapter ›").size(size * 0.8));
-                                if ui.add(next).clicked() {
-                                    response.chapter = Some(self.chapter + 1);
-                                }
-                            });
-                        }
-                        ui.add_space(size * 2.0);
-                    });
-                });
+        let view = ui.available_size();
+        let margin = size * MARGIN;
+        // A cell of room for punctuation hanging past the end of a line
+        let length = if vertical { view.y - 2.0 * margin - size } else { (view.x - 2.0 * margin - size).min(size * MAX_LINE) };
+        let key = LayoutKey { size, vertical, length: length.max(size * 4.0) };
+        let mut layout = match self.layout.take() {
+            Some(layout) if layout.key == key => layout,
+            _ => self.lay_out(key),
+        };
+        let content = layout.content_size(view);
+        let scrollable = if vertical { content.x - view.x } else { content.y - view.y }.max(0.0);
+        let mut area = if vertical { egui::ScrollArea::horizontal() } else { egui::ScrollArea::vertical() }
+            .id_salt(("reader", self.book, self.chapter, vertical))
+            .auto_shrink(false);
+        // Keep the place in the chapter when the text is laid out again (vertical text starts on the right)
+        if self.placed_for != Some((key, view)) {
+            self.placed_for = Some((key, view));
+            area = if vertical {
+                area.horizontal_scroll_offset(scrollable * (1.0 - self.position))
+            } else {
+                area.vertical_scroll_offset(scrollable * self.position)
+            };
+        }
+        // The mouse wheel moves through vertical text: down goes on to the next columns, on the left
+        let view_rect = Rect::from_min_size(ui.cursor().min, view);
+        if vertical && ui.rect_contains_pointer(view_rect) {
+            ui.ctx().input_mut(|i| {
+                let delta = i.smooth_scroll_delta;
+                i.smooth_scroll_delta = vec2(delta.x - delta.y, 0.0);
             });
+        }
+
+        let colors = (ui.visuals().text_color(), palette.secondary_text, palette.accent.gamma_multiply(0.12), palette.accent.gamma_multiply(0.28));
+        let selected = self.word_popup.as_ref().map(|p| p.word);
+        let mut clicked: Option<Option<(usize, Pos2, Align2)>> = None;
+        let shown = area.show(ui, |ui| {
+            let (rect, background) = ui.allocate_exact_size(content, Sense::click());
+            let origin = layout.origin(rect);
+            let word_at = |pos: Pos2| layout.char_at(pos, origin).and_then(|(p, c)| self.word_at(p, c));
+            let hovered = background.hover_pos().and_then(word_at);
+            if hovered.is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            let painter = ui.painter();
+            let (text, secondary, hover_fill, selected_fill) = colors;
+            for (word, fill) in [(hovered, hover_fill), (selected, selected_fill)] {
+                if let Some(word) = word.and_then(|w| self.words.get(w)) {
+                    for r in layout.rects(word.paragraph, &word.chars, origin) {
+                        painter.rect_filled(r, 3.0, fill);
+                    }
+                }
+            }
+            for line in &layout.lines[layout.visible(ui.clip_rect(), origin)] {
+                let (chars, color) = match line.paragraph {
+                    None => (&self.title, text),
+                    Some(p) => (&self.paragraphs[p].chars, if self.paragraphs[p].page_number { secondary } else { text }),
+                };
+                let font = FontId::proportional(size * line.scale);
+                for (i, &c) in chars[line.chars.clone()].iter().enumerate() {
+                    if c != '　' {
+                        draw_char(painter, c, layout.cell(line, line.first_cell + i, origin), &font, color, vertical);
+                    }
+                }
+            }
+            if self.chapter + 1 < self.chapters {
+                // After the text: below it, or on its left for vertical text
+                let (area, align) = if vertical {
+                    let right = origin.x - layout.extent - size;
+                    (Rect::from_min_max(pos2(right - size * 12.0, origin.y), pos2(right, origin.y + size * 2.0)), egui::Align::Max)
+                } else {
+                    let top = origin.y + layout.extent + size;
+                    (Rect::from_min_size(pos2(origin.x, top), vec2(layout.line_length, size * 2.0)), egui::Align::Center)
+                };
+                let builder = egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(align));
+                ui.scope_builder(builder, |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Next chapter ›").size(size * 0.8))).clicked() {
+                        response.chapter = Some(self.chapter + 1);
+                    }
+                });
+            }
+            if background.clicked() {
+                // The window opens beside the word: below it, or on its left for vertical text
+                clicked = Some(background.interact_pointer_pos().and_then(word_at).and_then(|w| {
+                    let word = &self.words[w];
+                    let first = *layout.rects(word.paragraph, &word.chars, origin).first()?;
+                    Some(if vertical {
+                        (w, first.left_top() - vec2(6.0, 0.0), Align2::RIGHT_TOP)
+                    } else {
+                        (w, first.left_bottom() + vec2(0.0, 4.0), Align2::LEFT_TOP)
+                    })
+                }));
+            }
+        });
+        let offset = shown.state.clamped_offset();
+        if scrollable > 0.0 {
+            self.position = if vertical { 1.0 - offset.x / scrollable } else { offset.y / scrollable }.clamp(0.0, 1.0);
+        }
+        layout.key = key;
+        self.layout = Some(layout);
+
         match clicked {
-            Some(Some((word, anchor))) => {
+            Some(Some((word, anchor, pivot))) => {
                 self.popups += 1;
-                self.word_popup = Some(WordPopup { word, anchor, id: self.popups });
+                self.word_popup = Some(WordPopup { word, anchor, pivot, id: self.popups });
                 self.kanji_popup = None;
             }
             // A click beside the words closes the windows
@@ -253,6 +566,7 @@ impl Reader {
         if let Some(popup) = &self.word_popup {
             let word = &self.words[popup.word];
             let surface = &self.text[word.parsed.span.clone()];
+            let side = popup.pivot;
             let mut open = true;
             let mut kanji = None;
             let shown = egui::Window::new("Dictionary")
@@ -260,6 +574,7 @@ impl Reader {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .pivot(popup.pivot)
                 .default_pos(popup.anchor)
                 .default_width((body * 20.0).min(max_width))
                 .max_width(max_width)
@@ -275,10 +590,15 @@ impl Reader {
                 self.word_popup = None;
                 self.kanji_popup = None;
             }
-            if let Some(kanji) = kanji {
+            if let (Some(kanji), Some(rect)) = (kanji, self.word_popup_rect) {
                 self.popups += 1;
-                let anchor = self.word_popup_rect.map_or(Pos2::ZERO, |r| r.right_top() + egui::vec2(8.0, 0.0));
-                self.kanji_popup = Some(KanjiPopup { kanji, anchor, id: self.popups });
+                // Next to the word window, on the same side of it as it is of the word
+                let (anchor, pivot) = if side == Align2::RIGHT_TOP {
+                    (rect.left_top() - vec2(8.0, 0.0), Align2::RIGHT_TOP)
+                } else {
+                    (rect.right_top() + vec2(8.0, 0.0), Align2::LEFT_TOP)
+                };
+                self.kanji_popup = Some(KanjiPopup { kanji, anchor, pivot, id: self.popups });
             }
         }
         if let (Some(popup), Some(lookup)) = (&self.kanji_popup, lookup) {
@@ -288,6 +608,7 @@ impl Reader {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
+                .pivot(popup.pivot)
                 .default_pos(popup.anchor)
                 .default_width((body * 16.0).min(max_width))
                 .max_width(max_width)
@@ -306,7 +627,7 @@ impl Reader {
 
 /// Pinching, Cmd/Ctrl + scrolling and Shift + scrolling change the font size.
 fn zoom(ui: &Ui, font_size: &mut f32) {
-    let (zoom, notches) = ui.input(|i| {
+    let (zoom, notches) = ui.ctx().input_mut(|i| {
         let notches: f32 = i
             .events
             .iter()
@@ -324,79 +645,15 @@ fn zoom(ui: &Ui, font_size: &mut f32) {
                 _ => None,
             })
             .sum();
+        // Shift + wheel zooms instead of scrolling sideways
+        if i.modifiers.shift {
+            i.smooth_scroll_delta = Vec2::ZERO;
+        }
         (i.zoom_delta(), notches)
     });
     if zoom != 1.0 || notches != 0.0 {
         *font_size = (*font_size * zoom * WHEEL_ZOOM.powf(notches)).clamp(*FONT_SIZES.start(), *FONT_SIZES.end());
     }
-}
-
-#[derive(Clone, Copy)]
-struct Highlight {
-    text: Color32,
-    hovered: Color32,
-    selected: Color32,
-}
-
-/// Draws a paragraph whose words can be clicked. Returns `Some` when it was clicked: the word clicked
-/// (its position in `words`) and where to open its window, or `None` beside the words.
-fn paragraph_ui(ui: &mut Ui, text: &str, words: &[Word], size: f32, colors: Highlight, selected: Option<usize>) -> Option<Option<(usize, Pos2)>> {
-    let format = TextFormat { font_id: FontId::proportional(size), color: colors.text, line_height: Some(size * LINE_HEIGHT), ..Default::default() };
-    let mut job = LayoutJob::single_section(text.to_string(), format);
-    job.wrap.max_width = ui.available_width();
-    let galley = ui.painter().layout_job(job);
-    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::click());
-    let word_at = |pos: Pos2| char_at(&galley, pos - rect.min).and_then(|c| words.iter().position(|w| w.chars.contains(&c)));
-    let hovered = response.hover_pos().and_then(word_at);
-    if hovered.is_some() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-    }
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        for (word, color) in [(hovered, colors.hovered), (selected, colors.selected)] {
-            if let Some(word) = word {
-                for r in word_rects(&galley, words[word].chars.clone()) {
-                    painter.rect_filled(r.translate(rect.min.to_vec2()).expand2(egui::vec2(1.0, -size * 0.12)), 3.0, color);
-                }
-            }
-        }
-        painter.galley(rect.min, galley.clone(), colors.text);
-    }
-    response.clicked().then(|| {
-        let word = response.interact_pointer_pos().and_then(word_at)?;
-        let first_row = word_rects(&galley, words[word].chars.clone()).into_iter().next()?;
-        Some((word, rect.min + first_row.left_bottom().to_vec2() + egui::vec2(0.0, 4.0)))
-    })
-}
-
-/// The character under `pos` (relative to the galley), if any. The galley has no line breaks.
-fn char_at(galley: &Galley, pos: egui::Vec2) -> Option<usize> {
-    let mut index = 0;
-    for row in &galley.rows {
-        let r = row.rect();
-        if (r.min.y..r.max.y).contains(&pos.y) {
-            return row.row.glyphs.iter().position(|g| (row.pos.x + g.pos.x..row.pos.x + g.pos.x + g.advance_width).contains(&pos.x)).map(|i| index + i);
-        }
-        index += row.row.glyphs.len() + usize::from(row.ends_with_newline);
-    }
-    None
-}
-
-/// Rectangles covering the characters `chars` on each row they are on (relative to the galley).
-fn word_rects(galley: &Galley, chars: Range<usize>) -> Vec<Rect> {
-    let mut rects = Vec::new();
-    let mut index = 0;
-    for row in &galley.rows {
-        let glyphs = &row.row.glyphs;
-        let (start, end) = (chars.start.max(index), chars.end.min(index + glyphs.len()));
-        if start < end {
-            let (first, last) = (&glyphs[start - index], &glyphs[end - 1 - index]);
-            let r = row.rect();
-            rects.push(Rect::from_x_y_ranges(row.pos.x + first.pos.x..=row.pos.x + last.pos.x + last.advance_width, r.y_range()));
-        }
-        index += glyphs.len() + usize::from(row.ends_with_newline);
-    }
-    rects
 }
 
 /// The word, its reading and its definitions; returns a kanji of the word that was clicked.
@@ -583,6 +840,22 @@ mod tests {
 
     fn wheel(modifiers: Modifiers) -> Event {
         Event::MouseWheel { unit: MouseWheelUnit::Line, delta: vec2(0.0, 2.0), phase: TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers }
+    }
+
+    #[test]
+    fn wraps_lines_without_punctuation_at_their_start() {
+        let chars: Vec<char> = "あいう。えお「かき」くけ".chars().collect();
+        // 。 and 」 hang at the end of a line rather than start the next one, and 「 moves to the next line
+        assert_eq!(wrap(&chars, 3), [0..4, 4..6, 6..10, 10..12]);
+        // 「 moves to the next line with what it opens
+        assert_eq!(wrap(&chars, 6), [0..6, 6..12]);
+        assert_eq!(wrap(&[], 5), vec![0..0]);
+    }
+
+    #[test]
+    fn shows_half_width_characters_full_width() {
+        assert_eq!("40 ab!".chars().map(full_width).collect::<String>(), "４０　ａｂ！");
+        assert_eq!(full_width('魔'), '魔');
     }
 
     #[test]

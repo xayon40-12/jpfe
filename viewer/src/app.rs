@@ -109,6 +109,8 @@ struct SavedState {
     /// Show load times and storage errors in the sidebar
     debug: bool,
     reader_font_size: f32,
+    /// Vertical text (縦書き) in the reader
+    reader_vertical: bool,
 }
 
 impl Default for SavedState {
@@ -121,6 +123,7 @@ impl Default for SavedState {
             books: Vec::new(),
             debug: false,
             reader_font_size: reader::DEFAULT_FONT_SIZE,
+            reader_vertical: reader::DEFAULT_VERTICAL,
         }
     }
 }
@@ -157,6 +160,7 @@ pub struct ViewerApp {
     /// The chapter being read, kept when going back to the statistics
     reader: Option<Reader>,
     reader_font_size: f32,
+    reader_vertical: bool,
     /// Definitions and kanji for the reader (web: once the dictionary is loaded)
     lookup: Option<Lookup>,
 
@@ -223,6 +227,7 @@ impl ViewerApp {
             view: View::Statistics,
             reader: None,
             reader_font_size: reader::DEFAULT_FONT_SIZE,
+            reader_vertical: reader::DEFAULT_VERTICAL,
             lookup: platform::embedded_lookup(),
             state_loaded: false,
             saved: None,
@@ -322,6 +327,7 @@ impl ViewerApp {
                 self.log_scales = std::array::from_fn(|i| state.log_scales.get(i).copied().unwrap_or(DEFAULT_LOG_SCALES[i]));
                 self.debug = state.debug;
                 self.reader_font_size = state.reader_font_size.clamp(*reader::FONT_SIZES.start(), *reader::FONT_SIZES.end());
+                self.reader_vertical = state.reader_vertical;
                 self.wanted_shown = state.shown;
                 self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
                 self.to_restore = state.books.clone();
@@ -532,6 +538,7 @@ impl ViewerApp {
             log_scales: self.log_scales.to_vec(),
             debug: self.debug,
             reader_font_size: self.reader_font_size,
+            reader_vertical: self.reader_vertical,
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
             books,
@@ -609,6 +616,12 @@ impl ViewerApp {
                 ui.label("Reader font size");
                 ui.add(egui::Slider::new(&mut self.reader_font_size, reader::FONT_SIZES).suffix(" pt").fixed_decimals(0));
                 note(ui, "In the reader, you can also pinch, or scroll with Shift held down.");
+                ui.label("Reader text direction");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.reader_vertical, true, "Vertical (縦書き)");
+                    ui.radio_value(&mut self.reader_vertical, false, "Horizontal (横書き)");
+                });
+                note(ui, "Vertical text reads from top to bottom, in columns from right to left.");
                 ui.separator();
 
                 ui.label("Coverage target");
@@ -650,6 +663,7 @@ impl ViewerApp {
                     if ui.button("Restore defaults").clicked() {
                         self.edited_settings = Settings::default();
                         self.reader_font_size = reader::DEFAULT_FONT_SIZE;
+                        self.reader_vertical = reader::DEFAULT_VERTICAL;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(theme::primary_button("Done", palette)).clicked() {
@@ -701,30 +715,31 @@ impl ViewerApp {
             if book.is_none() || ui.available_width() > 520.0 {
                 ui.add(egui::Label::new(RichText::new(reader.book_name()).strong()).truncate());
             }
-            let Some(book) = book else { return };
-            if ui.add_enabled(chapter > 0, egui::Button::new("‹")).on_hover_text("Previous chapter").clicked() {
+            if ui.add_enabled(book.is_some() && chapter > 0, egui::Button::new("‹")).on_hover_text("Previous chapter").clicked() {
                 chapter -= 1;
             }
-            egui::ComboBox::from_id_salt("reader-chapter")
-                // Leaves room for the next chapter and settings buttons
-                .width((ui.available_width() - 80.0).clamp(60.0, 320.0))
-                .height(400.0)
-                .truncate()
-                .selected_text(book.chapter_label(chapter))
-                .show_ui(ui, |ui| {
-                    list_rows(ui, |ui| {
-                        for pos in 0..book.chapters.len() {
-                            ui.selectable_value(&mut chapter, pos, book.chapter_label(pos));
-                        }
-                    });
-                });
-            if ui.add_enabled(chapter + 1 < book.chapters.len(), egui::Button::new("›")).on_hover_text("Next chapter").clicked() {
-                chapter += 1;
-            }
+            // From the right: settings, next chapter, then the chapter list in the room left
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new("⚙").selected(self.show_settings)).on_hover_text("Settings, with the font size").clicked() {
+                if ui.add(egui::Button::new("⚙").selected(self.show_settings)).on_hover_text("Settings, with the font size and text direction").clicked() {
                     self.show_settings = !self.show_settings;
                 }
+                let Some(book) = book else { return };
+                if ui.add_enabled(chapter + 1 < book.chapters.len(), egui::Button::new("›")).on_hover_text("Next chapter").clicked() {
+                    chapter += 1;
+                }
+                egui::ComboBox::from_id_salt("reader-chapter")
+                    // The box adds its padding and arrow to this width
+                    .width((ui.available_width() - 40.0).clamp(40.0, 320.0))
+                    .height(400.0)
+                    .truncate()
+                    .selected_text(book.chapter_label(chapter))
+                    .show_ui(ui, |ui| {
+                        list_rows(ui, |ui| {
+                            for pos in 0..book.chapters.len() {
+                                ui.selectable_value(&mut chapter, pos, book.chapter_label(pos));
+                            }
+                        });
+                    });
             });
         });
         if reader.needs_words() {
@@ -737,7 +752,7 @@ impl ViewerApp {
                 tokenizer.set_include_particles(self.settings.include_particles);
             }
         }
-        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, palette);
+        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, palette);
         let chapter = response.chapter.unwrap_or(chapter);
         if let Some(book) = book.filter(|_| chapter != reader.chapter) {
             let opened_at = reader.opened_at;

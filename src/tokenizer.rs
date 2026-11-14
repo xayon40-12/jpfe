@@ -165,6 +165,32 @@ impl Headwords {
     fn kana_spelling(&self, word: &str) -> Option<&str> {
         self.get(word).filter(|h| h.rare).map(|h| h.reading)
     }
+
+    /// For a verb JMdict does not have, ending in -eru: the godan verb it derives from, if JMdict has that one.
+    /// UniDic lists some compound verbs with their transitive form (読み進める for JMdict's 読み進む), and some
+    /// causative or potential forms as verbs of their own (研ぎ澄ませる, 窺い知れる).
+    fn godan_counterpart(&self, verb: &str) -> Option<(String, Headword<'_>)> {
+        if !verb.chars().any(is_cjk_kanji) || self.get(verb).is_some() {
+            return None;
+        }
+        let stem = verb.strip_suffix('る')?;
+        let e_row = stem.chars().last()?;
+        let u_row = match e_row {
+            'え' => 'う',
+            'け' => 'く',
+            'げ' => 'ぐ',
+            'せ' => 'す',
+            'て' => 'つ',
+            'ね' => 'ぬ',
+            'べ' => 'ぶ',
+            'め' => 'む',
+            'れ' => 'る',
+            _ => return None,
+        };
+        let godan = format!("{}{u_row}", &stem[..stem.len() - e_row.len_utf8()]);
+        let headword = self.headword(&godan).filter(|h| h.pos == "動詞")?;
+        Some((godan, headword))
+    }
 }
 
 fn is_set(field: &str) -> bool {
@@ -331,6 +357,11 @@ impl JapaneseTokenizer {
                 Some(kana) => (kana.to_string(), hiragana_to_katakana(kana)),
                 None => (base_word, reading_seed),
             };
+            let godan = headwords.as_ref().filter(|_| pos == "動詞").and_then(|h| h.godan_counterpart(&base_word));
+            let (base_word, reading_seed) = match godan {
+                Some((verb, headword)) => (verb, hiragana_to_katakana(headword.reading)),
+                None => (base_word, reading_seed),
+            };
 
             if !is_valid_word(&base_word) || is_problematic_word(&base_word) {
                 continue;
@@ -401,6 +432,9 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
         for candidate in base.into_iter().chain(written) {
             if let Some(headword) = headwords.headword(&candidate) {
                 return Some((end, candidate, headword));
+            }
+            if let Some((verb, headword)) = headwords.godan_counterpart(&candidate) {
+                return Some((end, verb, headword));
             }
         }
     }
@@ -593,6 +627,12 @@ mod dictionary_tests {
             tokenizer.tokenize(text).unwrap().into_iter().map(|w| (w.base_word, &text[w.span])).collect();
         let expected = [("冒険者", "冒険者"), ("神出鬼没", "神出鬼没"), ("怪盗", "怪盗"), ("見る", "見")];
         assert_eq!(spans, expected.map(|(w, s)| (w.to_string(), s)));
+    }
+
+    #[test]
+    fn maps_verbs_missing_from_jmdict_to_their_godan_verb() {
+        assert_eq!(words("読み進めていくと"), ["読み進む", "行く"]);
+        assert_eq!(words("言い切れない"), ["言い切る"]);
     }
 
     #[test]

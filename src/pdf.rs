@@ -67,13 +67,24 @@ fn split_chapters(lines: &[Line]) -> Vec<Chapter> {
     let is_body = |line: &Line| body.is_none() || line.style.as_ref() == body;
     // Furigana (ruby) is drawn at about half the body size; drop it, like <rt> in EPUBs
     let is_ruby = |line: &Line| matches!((&line.style, body), (Some(s), Some(b)) if s.size * 10 <= b.size * 6);
-    let lines: Vec<&Line> = lines.iter().filter(|l| !is_ruby(l)).collect();
+    // Each line remembers whether furigana was dropped just before it, which may have cut a drawn line in two
+    let mut after_ruby = false;
+    let lines: Vec<(&Line, bool)> = lines
+        .iter()
+        .filter_map(|l| {
+            let ruby = is_ruby(l);
+            let kept = (!ruby).then_some((l, after_ruby));
+            after_ruby = ruby;
+            kept
+        })
+        .collect();
+    let full = full_line_length(lines.iter().map(|(l, _)| l.text.as_str()));
     let mut chapters = Vec::new();
     // Open chapter; None for front matter, which is dropped
     let mut current: Option<OpenChapter> = None;
     let mut found_heading = false;
 
-    for &line in &lines {
+    for &(line, after_ruby) in &lines {
         let trimmed = line.text.trim();
         if is_heading(line) {
             found_heading = true;
@@ -85,21 +96,21 @@ fn split_chapters(lines: &[Line]) -> Vec<Chapter> {
             if current.as_ref().is_some_and(|c| c.title == title) {
                 continue;
             }
-            chapters.extend(current.take().and_then(OpenChapter::finish));
+            chapters.extend(current.take().and_then(|c| c.finish(full)));
             if !FRONT_MATTER.contains(&title) {
-                current = Some(OpenChapter { title: title.to_string(), text: String::new(), has_body: false });
+                current = Some(OpenChapter { title: title.to_string(), lines: Vec::new(), has_body: false });
             }
             continue;
         }
         if let Some(chapter) = &mut current {
-            chapter.text.push_str(&line.text);
-            chapter.text.push('\n');
+            chapter.lines.push(DrawnLine { text: &line.text, after_ruby });
             chapter.has_body |= is_body(line) && !trimmed.is_empty();
         }
     }
-    chapters.extend(current.and_then(OpenChapter::finish));
+    chapters.extend(current.and_then(|c| c.finish(full)));
     if !found_heading {
-        let text: String = lines.iter().map(|l| format!("{}\n", l.text)).collect();
+        let drawn: Vec<DrawnLine> = lines.iter().map(|&(l, after_ruby)| DrawnLine { text: &l.text, after_ruby }).collect();
+        let text = join_lines(&drawn, full);
         if !text.trim().is_empty() {
             chapters.push(Chapter { index: 0, title: "Chapter 01".to_string(), text });
         }
@@ -135,16 +146,110 @@ fn classify_styles(lines: &[Line]) -> (Option<&Style>, HashSet<&Style>) {
     (body, headings)
 }
 
-struct OpenChapter {
+struct OpenChapter<'a> {
     title: String,
-    text: String,
+    lines: Vec<DrawnLine<'a>>,
     has_body: bool,
 }
 
-impl OpenChapter {
-    fn finish(self) -> Option<Chapter> {
-        self.has_body.then_some(Chapter { index: 0, title: self.title, text: self.text })
+impl OpenChapter<'_> {
+    fn finish(self, full: Option<usize>) -> Option<Chapter> {
+        self.has_body.then(|| Chapter { index: 0, title: self.title, text: join_lines(&self.lines, full) })
     }
+}
+
+/// A chapter's line as the PDF draws it.
+struct DrawnLine<'a> {
+    text: &'a str,
+    /// Furigana was dropped just before it
+    after_ruby: bool,
+}
+
+/// Characters that end a sentence: a line ending with one is not continued on the next line.
+const SENTENCE_ENDS: [char; 10] = ['。', '」', '』', '！', '？', '）', '】', '!', '?', '…'];
+
+/// Page numbers are drawn in a Latin font at the bottom of each page.
+fn is_page_number(text: &str) -> bool {
+    let text = text.trim();
+    (1..=4).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Number of characters of a full line, when the book's text is cut at one width (as it usually is).
+fn full_line_length<'a>(lines: impl Iterator<Item = &'a str>) -> Option<usize> {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for line in lines {
+        let length = line.trim_end().chars().count();
+        if length >= 10 {
+            *counts.entry(length).or_default() += 1;
+        }
+    }
+    let (&length, &count) = counts.iter().max_by_key(|&(&length, &count)| (count, length))?;
+    (length >= 15 && count >= 20).then_some(length)
+}
+
+/// Lines joined back into paragraphs, one per line of the result. The PDF cuts paragraphs at the line width
+/// and pages (which would also split words such as 興味 for the tokenizer): a line continues the previous one
+/// when that one was full and did not end a sentence, unless it is indented (a new paragraph), or when it is
+/// the rest of a line cut in two by furigana. Page numbers stay on lines of their own, after the paragraph
+/// where the page ends.
+fn join_lines(lines: &[DrawnLine], full: Option<usize>) -> String {
+    let mut out = String::new();
+    let mut paragraph: Option<String> = None;
+    // Characters of the paragraph's last drawn line
+    let mut last_length = 0;
+    // Page numbers met inside the paragraph
+    let mut pages: Vec<&str> = Vec::new();
+    let flush = |out: &mut String, paragraph: &mut Option<String>, pages: &mut Vec<&str>| {
+        if let Some(text) = paragraph.take() {
+            out.push_str(&text);
+            out.push('\n');
+        }
+        for page in pages.drain(..) {
+            out.push_str(page);
+            out.push('\n');
+        }
+    };
+    for (i, line) in lines.iter().enumerate() {
+        let text = line.text.trim_end();
+        // A page ends with an empty line, then its number
+        if text.is_empty() && lines.get(i + 1).is_some_and(|l| is_page_number(l.text)) {
+            continue;
+        }
+        if is_page_number(text) {
+            if paragraph.is_some() {
+                pages.push(text.trim());
+            } else {
+                out.push_str(text.trim());
+                out.push('\n');
+            }
+            continue;
+        }
+        let length = text.chars().count();
+        let (same_line, next_line) = match (&paragraph, full) {
+            (Some(p), Some(full)) if !text.is_empty() && !text.starts_with('　') => (
+                line.after_ruby && last_length + length <= full + 1,
+                last_length + 2 >= full && !p.ends_with(SENTENCE_ENDS),
+            ),
+            _ => (false, false),
+        };
+        match &mut paragraph {
+            Some(p) if same_line || next_line => {
+                p.push_str(text);
+                last_length = if same_line { last_length + length } else { length };
+            }
+            _ => {
+                flush(&mut out, &mut paragraph, &mut pages);
+                if text.is_empty() {
+                    out.push('\n');
+                } else {
+                    paragraph = Some(text.to_string());
+                    last_length = length;
+                }
+            }
+        }
+    }
+    flush(&mut out, &mut paragraph, &mut pages);
+    out
 }
 
 fn extract_page_lines(doc: &Document, page_id: (u32, u16)) -> Result<Vec<Line>> {
@@ -274,6 +379,52 @@ mod tests {
             line("　おしまい。", &body),
         ];
         assert_eq!(titles(&split_chapters(&lines)), ["プロローグ", "第一話　「始まり」", "最終話「終わり」"]);
+    }
+
+    fn joined(lines: &[(&str, bool)], full: usize) -> String {
+        let lines: Vec<DrawnLine> = lines.iter().map(|&(text, after_ruby)| DrawnLine { text, after_ruby }).collect();
+        join_lines(&lines, Some(full))
+    }
+
+    #[test]
+    fn joins_lines_cut_at_the_line_width_into_paragraphs() {
+        let lines = [
+            ("　魔術に関する記述は実に興", false), // full (12 characters)
+            ("味深いものである。", false),
+            ("　読み進めていくと、わかった。", false), // full, but ends a sentence
+            ("「そういう問題じゃねぇ」", false),
+            ("１．まず、魔術は三種類しか", false),
+            ("　ないらしい。", false), // indented: a new paragraph
+        ];
+        assert_eq!(
+            joined(&lines, 12),
+            "　魔術に関する記述は実に興味深いものである。\n　読み進めていくと、わかった。\n「そういう問題じゃねぇ」\n１．まず、魔術は三種類しか\n　ないらしい。\n"
+        );
+    }
+
+    #[test]
+    fn keeps_page_numbers_after_the_paragraph_across_a_page() {
+        let lines = [("　骸骨は壁に背を預けて興味なさげなそ", false), ("", false), ("38", false), ("ぶりだ。", false), ("", false), ("　次。", false)];
+        assert_eq!(joined(&lines, 18), "　骸骨は壁に背を預けて興味なさげなそぶりだ。\n38\n\n　次。\n");
+        let lines = [("　一頁目。", false), ("", false), ("39", false), ("　二頁目。", false)];
+        assert_eq!(joined(&lines, 18), "　一頁目。\n39\n　二頁目。\n");
+    }
+
+    #[test]
+    fn joins_a_line_cut_in_two_by_furigana() {
+        let lines = [("　《落", false), ("とし子》が来た。", true), ("　本文、", false), ("続き。", true)];
+        assert_eq!(joined(&lines, 10), "　《落とし子》が来た。\n　本文、続き。\n");
+        // Too long for one line: the furigana ended a line, and the next line is a new paragraph
+        let lines = [("　本文、", false), ("「続きの文章です」", true)];
+        assert_eq!(joined(&lines, 10), "　本文、\n「続きの文章です」\n");
+    }
+
+    #[test]
+    fn finds_the_full_line_length() {
+        let mut lines = vec!["　あいうえおかきくけこさしすせそたち"; 25]; // 18 characters
+        lines.extend(["短い。"; 40]);
+        assert_eq!(full_line_length(lines.iter().copied()), Some(18));
+        assert_eq!(full_line_length(["　本文。"; 50].into_iter()), None);
     }
 
     #[test]
