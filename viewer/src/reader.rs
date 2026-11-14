@@ -27,8 +27,10 @@ const LINE_PITCH: f32 = 1.75;
 const MAX_LINE: f32 = 38.0;
 /// Margin around the text, in font sizes.
 const MARGIN: f32 = 1.0;
-/// Room after the text for the next chapter button, in font sizes.
+/// Room after the text for the next chapter button, in font sizes: below horizontal text, or beside vertical
+/// text (where the button, written horizontally, is wider than a column).
 const END_SPACE: f32 = 4.0;
+const END_SPACE_VERTICAL: f32 = 10.0;
 /// Size of the chapter title and of PDF page numbers, in font sizes.
 const TITLE_SCALE: f32 = 1.3;
 const PAGE_NUMBER_SCALE: f32 = 0.5;
@@ -149,7 +151,8 @@ impl Layout {
 
     /// Size of everything to scroll through, for a visible area of `view`.
     fn content_size(&self, view: Vec2) -> Vec2 {
-        let thickness = self.extent + self.key.size * (2.0 * MARGIN + END_SPACE);
+        let end = if self.key.vertical { END_SPACE_VERTICAL } else { END_SPACE };
+        let thickness = self.extent + self.key.size * (2.0 * MARGIN + end);
         if self.key.vertical { vec2(thickness.max(view.x), view.y) } else { vec2(view.x, thickness.max(view.y)) }
     }
 
@@ -509,8 +512,8 @@ impl Reader {
             if self.chapter + 1 < self.chapters {
                 // After the text: below it, or on its left for vertical text
                 let (area, align) = if vertical {
-                    let right = origin.x - layout.extent - size;
-                    (Rect::from_min_max(pos2(right - size * 12.0, origin.y), pos2(right, origin.y + size * 2.0)), egui::Align::Max)
+                    let right = origin.x - layout.extent - size * 0.5;
+                    (Rect::from_min_max(pos2(right - size * (END_SPACE_VERTICAL - 1.0), origin.y), pos2(right, origin.y + size * 2.0)), egui::Align::Max)
                 } else {
                     let top = origin.y + layout.extent + size;
                     (Rect::from_min_size(pos2(origin.x, top), vec2(layout.line_length, size * 2.0)), egui::Align::Center)
@@ -527,7 +530,8 @@ impl Reader {
                 clicked = Some(background.interact_pointer_pos().and_then(word_at).and_then(|w| {
                     let word = &self.words[w];
                     let first = *layout.rects(word.paragraph, &word.chars, origin).first()?;
-                    Some(if vertical {
+                    let width = popup_width(ui.ctx(), size, WORD_POPUP_WIDTH);
+                    Some(if vertical && first.left() - 6.0 - width >= ui.ctx().content_rect().left() {
                         (w, first.left_top() - vec2(6.0, 0.0), Align2::RIGHT_TOP)
                     } else {
                         (w, first.left_bottom() + vec2(0.0, 4.0), Align2::LEFT_TOP)
@@ -560,7 +564,7 @@ impl Reader {
     }
 
     fn popups_ui(&mut self, ctx: &egui::Context, lookup: Option<&Lookup>, size: f32, palette: Palette) {
-        let body = (size * 0.85).clamp(13.0, 20.0);
+        let body = popup_body(size);
         let max_width = (ctx.content_rect().width() - 24.0).max(200.0);
         let max_height = ctx.content_rect().height() * 0.7;
         if let Some(popup) = &self.word_popup {
@@ -576,7 +580,7 @@ impl Reader {
                 .resizable(false)
                 .pivot(popup.pivot)
                 .default_pos(popup.anchor)
-                .default_width((body * 20.0).min(max_width))
+                .default_width(popup_width(ctx, size, WORD_POPUP_WIDTH))
                 .max_width(max_width)
                 .show(ctx, |ui| {
                     // Scrolls when long, and is no taller than its content otherwise (egui's own window
@@ -592,11 +596,16 @@ impl Reader {
             }
             if let (Some(kanji), Some(rect)) = (kanji, self.word_popup_rect) {
                 self.popups += 1;
-                // Next to the word window, on the same side of it as it is of the word
-                let (anchor, pivot) = if side == Align2::RIGHT_TOP {
+                // Next to the word window, on the same side of it as it is of the word, or below it when
+                // there is no room there (phones)
+                let width = popup_width(ctx, size, KANJI_POPUP_WIDTH);
+                let screen = ctx.content_rect();
+                let (anchor, pivot) = if side == Align2::RIGHT_TOP && rect.left() - 8.0 - width >= screen.left() {
                     (rect.left_top() - vec2(8.0, 0.0), Align2::RIGHT_TOP)
-                } else {
+                } else if side == Align2::LEFT_TOP && rect.right() + 8.0 + width <= screen.right() {
                     (rect.right_top() + vec2(8.0, 0.0), Align2::LEFT_TOP)
+                } else {
+                    (rect.left_bottom() + vec2(0.0, 8.0), Align2::LEFT_TOP)
                 };
                 self.kanji_popup = Some(KanjiPopup { kanji, anchor, pivot, id: self.popups });
             }
@@ -610,7 +619,7 @@ impl Reader {
                 .resizable(false)
                 .pivot(popup.pivot)
                 .default_pos(popup.anchor)
-                .default_width((body * 16.0).min(max_width))
+                .default_width(popup_width(ctx, size, KANJI_POPUP_WIDTH))
                 .max_width(max_width)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
@@ -623,6 +632,20 @@ impl Reader {
             }
         }
     }
+}
+
+/// Width of the word and kanji windows, in their font sizes.
+const WORD_POPUP_WIDTH: f32 = 20.0;
+const KANJI_POPUP_WIDTH: f32 = 16.0;
+
+/// Font size of the word and kanji windows, for a reader font of `size`.
+fn popup_body(size: f32) -> f32 {
+    (size * 0.85).clamp(13.0, 20.0)
+}
+
+/// Width of a word or kanji window (`width` in its font sizes), no wider than the screen.
+fn popup_width(ctx: &egui::Context, size: f32, width: f32) -> f32 {
+    (popup_body(size) * width).min((ctx.content_rect().width() - 24.0).max(200.0))
 }
 
 /// Pinching, Cmd/Ctrl + scrolling and Shift + scrolling change the font size.
@@ -656,11 +679,48 @@ fn zoom(ui: &Ui, font_size: &mut f32) {
     }
 }
 
-/// The word, its reading and its definitions; returns a kanji of the word that was clicked.
+/// Text in several colors, wrapped to the width available.
+fn colored(ui: &Ui, parts: &[(&str, Color32)], size: f32, italics: bool) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for &(text, color) in parts {
+        job.append(text, 0.0, egui::TextFormat { font_id: FontId::proportional(size), color, italics, ..Default::default() });
+    }
+    job.wrap.max_width = ui.available_width();
+    job
+}
+
+/// `readings` in the reading color, between 【】 and separated by ・.
+fn readings_parts<'a>(readings: &[&'a str], palette: Palette) -> Vec<(&'a str, Color32)> {
+    let mut parts = vec![("【", palette.secondary_text)];
+    for (i, &reading) in readings.iter().enumerate() {
+        if i > 0 {
+            parts.push(("・", palette.secondary_text));
+        }
+        parts.push((reading, palette.reading));
+    }
+    parts.push(("】", palette.secondary_text));
+    parts
+}
+
+/// The word with its readings, then its definitions; returns a kanji of the word that was clicked.
 fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup>, body: f32, palette: Palette) -> Option<char> {
     let mut clicked = None;
-    let secondary = |text: &str, size: f32| RichText::new(text).size(size).color(palette.secondary_text);
+    let text_color = ui.visuals().text_color();
+    let note = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).size(body * 0.8).color(palette.secondary_text));
     ui.spacing_mut().item_spacing.y = body * 0.35;
+
+    let mut entries = lookup.map(|l| l.words.lookup(&word.base_word)).unwrap_or_default();
+    // The entry read as in the text first: its readings go on the first line, with the word
+    if let Some(i) = entries.iter().position(|e| e.readings.contains(&word.pronunciation.as_str())) {
+        entries[..=i].rotate_right(1);
+    }
+    let mut readings: Vec<&str> = entries.first().map(|e| e.readings.clone()).unwrap_or_default();
+    // The reading in the text first
+    if word.pronunciation != word.base_word {
+        readings.retain(|r| *r != word.pronunciation);
+        readings.insert(0, &word.pronunciation);
+    }
+
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for c in word.base_word.chars() {
@@ -675,38 +735,48 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
                     clicked = Some(c);
                 }
             } else {
-                ui.label(text);
+                ui.label(text.color(text_color));
             }
         }
+        // Each reading stays whole: a reading that does not fit moves to the next line
+        let parts = readings_parts(&readings, palette);
+        let mut i = 0;
+        while i < parts.len() && !readings.is_empty() {
+            // A reading with the bracket or separator before it, and the closing bracket after the last one
+            let end = if i + 3 == parts.len() { parts.len() } else { (i + 2).min(parts.len()) };
+            let job = colored(ui, &parts[i..end], body * 1.1, false);
+            ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+            i = end;
+        }
     });
-    let entries = lookup.map(|l| l.words.lookup(&word.base_word)).unwrap_or_default();
-    if word.pronunciation != word.base_word {
-        ui.label(RichText::new(&word.pronunciation).size(body * 1.1));
+    if let Some(first) = entries.first() {
+        let others: Vec<&str> = first.spellings.iter().copied().filter(|s| *s != word.base_word).collect();
+        if !others.is_empty() {
+            note(ui, &format!("Also written {}", others.join("・")));
+        }
     }
     if surface != word.base_word {
-        ui.label(secondary(&format!("Written {surface} in the text"), body * 0.8));
+        note(ui, &format!("Written {surface} in the text"));
     }
     let Some(lookup) = lookup else {
-        ui.label(secondary("The dictionary is still loading.", body * 0.85));
+        note(ui, "The dictionary is still loading.");
         return clicked;
     };
     if entries.is_empty() {
-        ui.label(secondary("Not in the dictionary.", body * 0.85));
+        note(ui, "Not in the dictionary.");
     }
-    let several = entries.len() > 1;
     for (i, entry) in entries.iter().take(MAX_ENTRIES).enumerate() {
         ui.separator();
-        // Other spellings and readings, when they say more than the word above
-        let spellings: Vec<&str> = entry.spellings.iter().copied().filter(|s| *s != word.base_word).collect();
-        let readings: Vec<&str> = entry.readings.iter().copied().filter(|r| *r != word.pronunciation && *r != word.base_word).collect();
-        if several || !spellings.is_empty() || !readings.is_empty() {
-            let mut header = entry.spellings.first().or(entry.readings.first()).copied().unwrap_or_default().to_string();
-            if !entry.spellings.is_empty() && !entry.readings.is_empty() {
-                header = format!("{header}【{}】", entry.readings.join("・"));
+        // The first entry is the word above; the others are other words written the same way
+        if i > 0 {
+            let spelling = entry.spellings.first().or(entry.readings.first()).copied().unwrap_or_default();
+            let mut parts = vec![(spelling, text_color)];
+            if !entry.spellings.is_empty() {
+                parts.extend(readings_parts(&entry.readings, palette));
             }
-            ui.label(RichText::new(header).size(body).strong());
+            ui.label(colored(ui, &parts, body, false));
             if entry.spellings.len() > 1 {
-                ui.label(secondary(&format!("Also written {}", entry.spellings[1..].join("・")), body * 0.8));
+                note(ui, &format!("Also written {}", entry.spellings[1..].join("・")));
             }
         }
         let numbered = entry.senses.len() > 1;
@@ -715,14 +785,15 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
             // Senses often share their tags: shown again only when they change
             if !sense.tags.is_empty() && previous_tags != Some(&sense.tags) {
                 let tags: Vec<&str> = sense.tags.iter().map(|t| short_tag(t).unwrap_or_else(|| lookup.words.tag(t))).collect();
-                ui.label(secondary(&tags.join(", "), body * 0.75).italics());
+                ui.label(colored(ui, &[(&tags.join(", "), palette.grammar)], body * 0.75, true));
             }
             previous_tags = Some(&sense.tags);
-            let text = if numbered { format!("{}. {}", n + 1, sense.glosses) } else { sense.glosses.to_string() };
-            ui.label(RichText::new(text).size(body));
+            let number = format!("{}. ", n + 1);
+            let parts: &[(&str, Color32)] = if numbered { &[(&number, palette.marker), (sense.glosses, text_color)] } else { &[(sense.glosses, text_color)] };
+            ui.label(colored(ui, parts, body, false));
         }
         if i + 1 == MAX_ENTRIES && entries.len() > MAX_ENTRIES {
-            ui.label(secondary(&format!("{} more entries", entries.len() - MAX_ENTRIES), body * 0.8));
+            note(ui, &format!("{} more entries", entries.len() - MAX_ENTRIES));
         }
     }
     clicked
@@ -811,16 +882,66 @@ fn kanji_ui(ui: &mut Ui, kanji: char, kanjidic: &Kanjidic, body: f32, palette: P
         ui.label(RichText::new(details.join(" · ")).size(body * 0.75).color(palette.secondary_text));
     }
     ui.separator();
-    egui::Grid::new("kanji-readings").num_columns(2).spacing([body * 0.6, body * 0.35]).show(ui, |ui| {
-        for (name, values, separator) in [("On", &k.on, "、"), ("Kun", &k.kun, "、"), ("Names", &k.nanori, "、"), ("Meanings", &k.meanings, "; ")] {
-            if values.is_empty() {
-                continue;
-            }
-            ui.label(RichText::new(name).size(body * 0.8).color(palette.secondary_text));
-            ui.add(egui::Label::new(RichText::new(values.join(separator)).size(body)).wrap());
-            ui.end_row();
+    // Readings, each kept whole (a reading that does not fit moves to the next line), with the separator
+    // after it. Kun'yomi mark okurigana with a dot (い.きる), shown dimmed, and affixes with a dash (-うえ).
+    let readings = |values: &[&str], color: Color32| -> Vec<Vec<(String, Color32)>> {
+        let last = values.len().saturating_sub(1);
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let (stem, okurigana) = value.split_once('.').unwrap_or((value, ""));
+                let mut item = vec![(stem.to_string(), color)];
+                if !okurigana.is_empty() {
+                    item.push((okurigana.to_string(), palette.secondary_text));
+                }
+                if i < last {
+                    item.push(("、".to_string(), palette.secondary_text));
+                }
+                item
+            })
+            .collect()
+    };
+    let label_width = body * 4.2;
+    let text_width = (ui.available_width() - label_width - ui.spacing().item_spacing.x).max(body * 6.0);
+    let row = |ui: &mut Ui, name: &str, add: &mut dyn FnMut(&mut Ui)| {
+        ui.horizontal_top(|ui| {
+            let name = egui::Label::new(RichText::new(name).size(body * 0.8).color(palette.secondary_text));
+            ui.add_sized([label_width, body * 1.3], name);
+            add(ui);
+        });
+    };
+    for (name, items) in [("On", readings(&k.on, palette.marker)), ("Kun", readings(&k.kun, palette.reading)), ("Names", readings(&k.nanori, palette.reading))] {
+        if items.is_empty() {
+            continue;
         }
-    });
+        row(ui, name, &mut |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.set_max_width(text_width);
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for item in &items {
+                    let parts: Vec<(&str, Color32)> = item.iter().map(|(t, c)| (t.as_str(), *c)).collect();
+                    ui.add(egui::Label::new(colored(ui, &parts, body, false)).wrap_mode(egui::TextWrapMode::Extend));
+                }
+            });
+        });
+    }
+    if !k.meanings.is_empty() {
+        let text_color = ui.visuals().text_color();
+        row(ui, "Meanings", &mut |ui| {
+            let mut parts = Vec::new();
+            for (i, meaning) in k.meanings.iter().enumerate() {
+                if i > 0 {
+                    parts.push(("; ", palette.secondary_text));
+                }
+                parts.push((meaning, text_color));
+            }
+            // Labels in a row do not wrap unless told to
+            let mut job = colored(ui, &parts, body, false);
+            job.wrap.max_width = text_width;
+            ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
+        });
+    }
 }
 
 #[cfg(test)]

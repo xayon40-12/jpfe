@@ -16,6 +16,11 @@ pub struct Palette {
     pub teal: Color32,
     pub purple: Color32,
     pub green: Color32,
+    /// Text colors of the dictionary windows, darker (or lighter) than the chart colors so they read well
+    /// as text: readings, grammar (parts of speech), and markers (sense numbers, on'yomi)
+    pub reading: Color32,
+    pub grammar: Color32,
+    pub marker: Color32,
 }
 
 const LIGHT: Palette = Palette {
@@ -30,6 +35,9 @@ const LIGHT: Palette = Palette {
     teal: Color32::from_rgb(0x30, 0xB0, 0xC7),
     purple: Color32::from_rgb(0xAF, 0x52, 0xDE),
     green: Color32::from_rgb(0x34, 0xC7, 0x59),
+    reading: Color32::from_rgb(0xB8, 0x4A, 0x00),
+    grammar: Color32::from_rgb(0x8E, 0x3F, 0xC4),
+    marker: Color32::from_rgb(0x0A, 0x7A, 0x8C),
 };
 
 const DARK: Palette = Palette {
@@ -44,6 +52,9 @@ const DARK: Palette = Palette {
     teal: Color32::from_rgb(0x40, 0xC8, 0xE0),
     purple: Color32::from_rgb(0xBF, 0x5A, 0xF2),
     green: Color32::from_rgb(0x30, 0xD1, 0x58),
+    reading: Color32::from_rgb(0xFF, 0xB0, 0x5C),
+    grammar: Color32::from_rgb(0xCB, 0x9C, 0xF5),
+    marker: Color32::from_rgb(0x5C, 0xD0, 0xE3),
 };
 
 impl Palette {
