@@ -10,6 +10,8 @@ use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer};
 use jpfe::models::{chapter_file_stem, Chapter, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters_from_bytes;
 use jpfe::tokenizer::{is_katakana_word, JapaneseTokenizer, ParsedWord};
+#[cfg(test)]
+use jpfe::tokenizer::WordKind;
 use web_time::Instant;
 
 /// Word-list settings, with the same meaning and defaults as the CLI options.
@@ -22,7 +24,7 @@ pub struct Settings {
     pub min_book_count: usize,
     /// Opposite of `--show-previous-words`: only list words new to the book
     pub hide_previous_words: bool,
-    /// `--include-particles`; changing it re-tokenizes the books
+    /// `--include-particles`; changing it analyzes the books again (which takes them from their text)
     pub include_particles: bool,
     /// Leave out words written only in katakana (mostly loanwords)
     pub hide_katakana_words: bool,
@@ -296,8 +298,9 @@ impl PendingBook {
     }
 
     pub fn finish(self, settings: &Settings) -> Book {
-        let analyzer = FrequencyAnalyzer::from_tokens(&self.chapters, &self.tokens);
-        let counts: Vec<ChapterCounts> = self.tokens.iter().map(|t| ChapterCounts::new(t)).collect();
+        let particles = settings.include_particles;
+        let analyzer = FrequencyAnalyzer::from_tokens(&self.chapters, &self.tokens, particles);
+        let counts: Vec<ChapterCounts> = self.tokens.iter().map(|t| ChapterCounts::new(t, particles)).collect();
         Book::new(self.saved, self.chapters, analyzer, counts, settings)
     }
 }
@@ -332,7 +335,7 @@ mod tests {
                 .map(|i| ChapterInfo { index: i, title: format!("第{i}話"), characters: 100 })
                 .collect(),
             texts: Vec::new(),
-            analyzer: FrequencyAnalyzer::from_tokens(&[], &[]),
+            analyzer: FrequencyAnalyzer::from_tokens(&[], &[], false),
             counts: Vec::new(),
             words: words.iter().map(|ws| ws.iter().map(|w| w.to_string()).collect()).collect(),
             learned: None,
@@ -340,7 +343,15 @@ mod tests {
     }
 
     fn tokens(words: &[&str]) -> Vec<ParsedWord> {
-        words.iter().map(|w| ParsedWord { base_word: w.to_string(), spelling: w.to_string(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }).collect()
+        let word = |w: &&str| ParsedWord {
+            base_word: w.to_string(),
+            spelling: w.to_string(),
+            pronunciation: String::new(),
+            pos: "名詞".into(),
+            span: 0..0,
+            kind: WordKind::Word,
+        };
+        words.iter().map(word).collect()
     }
 
     #[test]

@@ -3,6 +3,8 @@ use anyhow::Result;
 
 use crate::models::{Chapter, WordEntry};
 use crate::tokenizer::{JapaneseTokenizer, ParsedWord};
+#[cfg(test)]
+use crate::tokenizer::WordKind;
 
 /// Book-wide data of one base word (pronunciation, POS and first chapter come from its first occurrence).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -32,7 +34,7 @@ impl BookWord {
     }
 }
 
-/// Occurrences of each base word in one chapter.
+/// Occurrences of each base word word lists count in one chapter (see [`ParsedWord::is_listed`]).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChapterCounts {
     pub total: usize,
@@ -40,12 +42,14 @@ pub struct ChapterCounts {
 }
 
 impl ChapterCounts {
-    pub fn new(tokens: &[ParsedWord]) -> Self {
+    pub fn new(tokens: &[ParsedWord], include_particles: bool) -> Self {
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for token in tokens {
+        let mut total = 0;
+        for token in tokens.iter().filter(|t| t.is_listed(include_particles)) {
             *counts.entry(token.base_word.clone()).or_default() += 1;
+            total += 1;
         }
-        Self { total: tokens.len(), counts }
+        Self { total, counts }
     }
 }
 
@@ -56,16 +60,17 @@ pub struct FrequencyAnalyzer {
 }
 
 impl FrequencyAnalyzer {
-    pub fn build(tokenizer: &mut JapaneseTokenizer, chapters: &[Chapter]) -> Result<(Self, Vec<Vec<ParsedWord>>)> {
+    /// Tokenize the chapters and count their words; particles and auxiliary verbs only with `include_particles`.
+    pub fn build(tokenizer: &mut JapaneseTokenizer, chapters: &[Chapter], include_particles: bool) -> Result<(Self, Vec<Vec<ParsedWord>>)> {
         let tokenized = chapters.iter().map(|c| tokenizer.tokenize(&c.text)).collect::<Result<Vec<_>>>()?;
-        Ok((Self::from_tokens(chapters, &tokenized), tokenized))
+        Ok((Self::from_tokens(chapters, &tokenized, include_particles), tokenized))
     }
 
     /// Book-wide counts from already tokenized chapters (`tokenized[i]` belongs to `chapters[i]`).
-    pub fn from_tokens(chapters: &[Chapter], tokenized: &[Vec<ParsedWord>]) -> Self {
+    pub fn from_tokens(chapters: &[Chapter], tokenized: &[Vec<ParsedWord>], include_particles: bool) -> Self {
         let mut words: HashMap<String, BookWord> = HashMap::new();
         for (chapter_pos, (chapter, tokens)) in chapters.iter().zip(tokenized).enumerate() {
-            for t in tokens {
+            for t in tokens.iter().filter(|t| t.is_listed(include_particles)) {
                 let word = words.entry(t.base_word.clone()).or_insert_with(|| BookWord {
                     count: 0,
                     spellings: Vec::new(),
@@ -81,7 +86,7 @@ impl FrequencyAnalyzer {
                 }
             }
         }
-        let total_words = tokenized.iter().map(Vec::len).sum();
+        let total_words = words.values().map(|w| w.count).sum();
         Self { words, total_words }
     }
 
@@ -92,8 +97,9 @@ impl FrequencyAnalyzer {
         target_percentage: f64,
         min_book_count: usize,
         hide_previous_words: bool,
+        include_particles: bool,
     ) -> Vec<WordEntry> {
-        let counts = ChapterCounts::new(chapter_tokens);
+        let counts = ChapterCounts::new(chapter_tokens, include_particles);
         self.analyze_counts(chapter_pos, &counts, target_percentage, min_book_count, hide_previous_words)
     }
 
@@ -149,7 +155,7 @@ mod tests {
     use super::*;
 
     fn token(word: &str) -> ParsedWord {
-        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }
+        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word }
     }
 
     fn spelled(word: &str, spelling: &str) -> ParsedWord {
@@ -163,8 +169,8 @@ mod tests {
             vec![spelled("出来る", "できる"), spelled("出来る", "出来る"), token("猫")],
             vec![spelled("出来る", "できる")],
         ];
-        let analyzer = FrequencyAnalyzer::from_tokens(&chapters, &tokens);
-        let entries = analyzer.analyze_chapter(0, &tokens[0], 100.0, 1, false);
+        let analyzer = FrequencyAnalyzer::from_tokens(&chapters, &tokens, false);
+        let entries = analyzer.analyze_chapter(0, &tokens[0], 100.0, 1, false, false);
         // One word, counted under its dictionary form and shown as the book writes it most
         assert_eq!(entries.iter().map(|e| (e.key.as_str(), e.word.as_str())).collect::<Vec<_>>(), [("出来る", "できる"), ("猫", "猫")]);
         assert_eq!((entries[0].occurrences, entries[0].book_occurrences), (2, 3));
@@ -177,8 +183,8 @@ mod tests {
         let words = HashMap::from([("猫".to_string(), first)]);
         let analyzer = FrequencyAnalyzer { words, total_words: 2 };
         let tokens = [token("猫")];
-        assert_eq!(analyzer.analyze_chapter(0, &tokens, 100.0, 1, true).len(), 1);
+        assert_eq!(analyzer.analyze_chapter(0, &tokens, 100.0, 1, true, false).len(), 1);
         // Chapter 1 has the same title as chapter 0 but 猫 is no longer new there
-        assert!(analyzer.analyze_chapter(1, &tokens, 100.0, 1, true).is_empty());
+        assert!(analyzer.analyze_chapter(1, &tokens, 100.0, 1, true, false).is_empty());
     }
 }

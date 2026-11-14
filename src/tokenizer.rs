@@ -17,7 +17,18 @@ pub struct JapaneseTokenizer {
     headwords: Option<Headwords>,
     reading_cache: HashMap<String, String>,
     reading_in_hiragana: bool,
-    include_particles: bool,
+}
+
+/// What a word is, for word lists to choose which words to list: the tokenizer reports every word it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordKind {
+    /// A word to learn
+    Word,
+    /// Particles and auxiliary verbs (助詞・助動詞), which include colloquial contractions (てる, ちゃう, とく);
+    /// listed only when asked
+    Grammar,
+    /// A single hiragana other than a conjunction: interjections (あ), prefixes (お) and suffixes (さ, げ), never listed
+    Fragment,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +43,18 @@ pub struct ParsedWord {
     pub pos: String,
     /// Where the word is written in the tokenized text (bytes): its surface, which may be conjugated (言っ)
     pub span: Range<usize>,
+    pub kind: WordKind,
+}
+
+impl ParsedWord {
+    /// Whether word lists count this word; particles and auxiliary verbs only with `include_particles`.
+    pub fn is_listed(&self, include_particles: bool) -> bool {
+        match self.kind {
+            WordKind::Word => true,
+            WordKind::Grammar => include_particles,
+            WordKind::Fragment => false,
+        }
+    }
 }
 
 /// Longest run of tokens tried as one JMdict headword.
@@ -344,15 +367,11 @@ pub const TOKENIZER_FILES: [&str; 10] = [
 ];
 
 /// A tokenizer from the contents of [`TOKENIZER_FILES`] (for the web viewer, which downloads them).
-pub fn tokenizer_from_files(
-    mut file: impl FnMut(&str) -> Option<Vec<u8>>,
-    reading_in_hiragana: bool,
-    include_particles: bool,
-) -> Result<JapaneseTokenizer> {
+pub fn tokenizer_from_files(mut file: impl FnMut(&str) -> Option<Vec<u8>>, reading_in_hiragana: bool) -> Result<JapaneseTokenizer> {
     let headwords = file(HEADWORDS_FILE).with_context(|| format!("Missing dictionary file {HEADWORDS_FILE}"))?;
     let headwords = Headwords::parse(String::from_utf8(headwords)?)?;
     let dictionary = dictionary_from_files(file)?;
-    Ok(JapaneseTokenizer::with_dictionary(dictionary, Some(headwords), reading_in_hiragana, include_particles))
+    Ok(JapaneseTokenizer::with_dictionary(dictionary, Some(headwords), reading_in_hiragana))
 }
 
 /// Build a dictionary from the contents of [`DICTIONARY_FILES`].
@@ -374,7 +393,7 @@ pub fn dictionary_from_files(mut file: impl FnMut(&str) -> Option<Vec<u8>>) -> R
 
 impl JapaneseTokenizer {
     /// Tokenizer using the dictionary at `dict_path`, or the embedded UniDic, with the embedded JMdict headwords.
-    pub fn new(dict_path: Option<&Path>, reading_in_hiragana: bool, include_particles: bool) -> Result<Self> {
+    pub fn new(dict_path: Option<&Path>, reading_in_hiragana: bool) -> Result<Self> {
         let dictionary = match dict_path {
             Some(p) => load_fs_dictionary(p).with_context(|| format!("Failed to load dictionary from: {:?}", p))?,
             None => embedded_dictionary()?,
@@ -383,27 +402,23 @@ impl JapaneseTokenizer {
         let headwords = Some(Headwords::embedded());
         #[cfg(not(feature = "embed-dict"))]
         let headwords = None;
-        Ok(Self::with_dictionary(dictionary, headwords, reading_in_hiragana, include_particles))
+        Ok(Self::with_dictionary(dictionary, headwords, reading_in_hiragana))
     }
 
     /// Without `headwords`, compounds stay split as UniDic splits them (神出 + 鬼没).
-    pub fn with_dictionary(dictionary: Dictionary, headwords: Option<Headwords>, reading_in_hiragana: bool, include_particles: bool) -> Self {
+    pub fn with_dictionary(dictionary: Dictionary, headwords: Option<Headwords>, reading_in_hiragana: bool) -> Self {
         Self {
             segmenter: Segmenter::new(Mode::Normal, dictionary, None),
             headwords,
             reading_cache: HashMap::new(),
             reading_in_hiragana,
-            include_particles,
         }
     }
 
-    /// Whether particles (助詞) and auxiliary verbs (助動詞) are kept.
-    pub fn set_include_particles(&mut self, include: bool) {
-        self.include_particles = include;
-    }
-
+    /// Every word of `text`, with what kind of word it is (see [`WordKind`]): only symbols, spaces and
+    /// tokens that are not words (numerals in digits, runs of punctuation) are left out.
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
-        let Self { segmenter, headwords, reading_cache, reading_in_hiragana, include_particles } = self;
+        let Self { segmenter, headwords, reading_cache, reading_in_hiragana } = self;
         let mut words = Vec::new();
         let separator = FIELD_SEPARATOR.to_string();
         let tokens: Vec<Token> = segmenter
@@ -428,6 +443,7 @@ impl JapaneseTokenizer {
                     spelling: word.clone(),
                     base_word: word,
                     span: token.span.start..tokens[end - 1].span.end,
+                    kind: WordKind::Word,
                 });
                 continue;
             }
@@ -435,8 +451,7 @@ impl JapaneseTokenizer {
             let field = |i: usize| token.field(i);
             let pos = field(0);
             match pos {
-                "記号" | "補助記号" | "空白" | "接尾辞" | "接頭辞" => continue,
-                "助詞" | "助動詞" if !*include_particles => continue,
+                "記号" | "補助記号" | "空白" => continue,
                 _ => {}
             }
             let raw_reading = field(6);
@@ -514,6 +529,7 @@ impl JapaneseTokenizer {
                             spelling: word.clone(),
                             base_word: word,
                             span,
+                            kind: WordKind::Word,
                         });
                     }
                     continue;
@@ -522,9 +538,15 @@ impl JapaneseTokenizer {
             };
             let spelling = spelling.unwrap_or_else(|| base_word.clone());
 
-            if !is_valid_word(&spelling) || is_problematic_word(&base_word) || is_problematic_word(&spelling) {
+            if !is_valid_word(&spelling) {
                 continue;
             }
+            let kind = match pos {
+                "助詞" | "助動詞" => WordKind::Grammar,
+                "接続詞" => WordKind::Word,
+                _ if is_single_hiragana(&spelling) => WordKind::Fragment,
+                _ => WordKind::Word,
+            };
 
             // The reading of the spelling: a kana spelling is its own reading (いい, not よい for 良い)
             let reading = if spelling != base_word {
@@ -538,6 +560,7 @@ impl JapaneseTokenizer {
                 base_word,
                 spelling,
                 span,
+                kind,
             });
         }
         Ok(words)
@@ -692,31 +715,10 @@ pub fn is_valid_word(s: &str) -> bool {
     s.chars().any(|c| c.is_alphabetic() && !matches!(c, 'ー' | '々'))
 }
 
-/// Single-hiragana words, colloquial contractions, archaic auxiliaries and bound fragments.
-pub fn is_problematic_word(word: &str) -> bool {
+/// A single hiragana (あ, お, さ).
+fn is_single_hiragana(word: &str) -> bool {
     let mut chars = word.chars();
-    if matches!((chars.next(), chars.next()), (Some(c), None) if is_hiragana(c)) {
-        return true;
-    }
-    matches!(
-        word,
-        // Colloquial verb contractions (口語縮約形・補助動詞)
-        "てる" | "でる" | "とく" | "どく" | "ちゃう" | "ちまう" | "じゃう" | "じまう"
-        | "でく" | "てく" | "とる" | "とれる" | "とける" | "たげる"
-        | "てらっしゃる" | "てらしゃる" | "でらっしゃる" | "でらしゃる"
-        | "しめる" | "よる" | "はる" | "やがる" | "たがる"
-        // Colloquial slang and speech particles (口語短縮・音変化)
-        | "もん" | "っつう" | "つう" | "っちゅう" | "ちゅう" | "ちゃ" | "じゃ"
-        | "っす" | "でちゅ" | "みてえ" | "みてぇ" | "みたく"
-        | "そりゃ" | "こりゃ" | "ありゃ" | "トコ" | "とこ" | "っけ" | "っと"
-        // Archaic auxiliaries (文語助動詞)
-        | "まじ" | "べし" | "まい"
-        // Bound suffixes/prefixes and fragments (接頭辞・接尾辞・語の分断)
-        | "っぽい" | "ぽい" | "やすい" | "にくい" | "づらい" | "がたい" | "くさい"
-        | "がましい" | "ったらしい" | "たらしい" | "だらけ" | "っぱなし"
-        | "がち" | "まとい" | "ごかし" | "ぶり" | "がる" | "ぶる"
-        | "たち" | "ども" | "ちゃん" | "さん" | "さま" | "じい" | "とう" | "おじ" | "おば"
-    )
+    matches!((chars.next(), chars.next()), (Some(c), None) if is_hiragana(c))
 }
 
 #[cfg(test)]
@@ -747,17 +749,34 @@ mod tests {
 
 #[cfg(all(test, feature = "embed-dict"))]
 mod dictionary_tests {
-    use super::{is_cjk_kanji, JapaneseTokenizer};
+    use super::{is_cjk_kanji, JapaneseTokenizer, WordKind};
 
     fn words(text: &str) -> Vec<String> {
-        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
-        tokenizer.tokenize(text).unwrap().into_iter().map(|w| w.spelling).collect()
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false)).map(|w| w.spelling).collect()
+    }
+
+    #[test]
+    fn reports_every_word_and_lists_only_some() {
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        let text = "あ、グレイラット家の本を５冊読んでる";
+        let found: Vec<(&str, WordKind)> = tokenizer.tokenize(text).unwrap().into_iter().map(|w| (&text[w.span], w.kind)).collect();
+        use WordKind::*;
+        assert_eq!(
+            found,
+            [("あ", Fragment), ("グレイ", Word), ("ラット", Word), ("家", Word), ("の", Grammar), ("本", Word), ("を", Grammar), ("冊", Word), ("読ん", Word), ("でる", Grammar)]
+        );
+        // Ordinary verbs that share their kana with contractions are words (とって is 取る, によって 因る)
+        let pairs = |list: &[(&str, &str)]| list.iter().map(|&(k, s)| (k.to_string(), s.to_string())).collect::<Vec<_>>();
+        assert_eq!(keys("手にとって"), pairs(&[("手", "手"), ("取る", "とる")]));
+        // (JMdict marks 其れ and 因る as rarely used spellings)
+        assert_eq!(keys("それによって"), pairs(&[("それ", "それ"), ("よる", "よる")]));
     }
 
     /// Dictionary form and spelling of each word.
     fn keys(text: &str) -> Vec<(String, String)> {
-        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
-        tokenizer.tokenize(text).unwrap().into_iter().map(|w| (w.base_word, w.spelling)).collect()
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false)).map(|w| (w.base_word, w.spelling)).collect()
     }
 
     #[test]
@@ -773,7 +792,7 @@ mod dictionary_tests {
         // A potential form written in kana is not one of the verb's readings: still counted as the verb
         let (verb, spelling) = keys("かえれる").remove(0);
         assert!(verb.chars().any(is_cjk_kanji) && spelling == verb, "{verb} {spelling}");
-        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
         assert_eq!(tokenizer.tokenize("いい").unwrap()[0].pronunciation, "いい");
     }
 
@@ -810,9 +829,9 @@ mod dictionary_tests {
     #[test]
     fn finds_where_words_are_written() {
         let text = "冒険者は神出鬼没の怪盗を見た";
-        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
         let spans: Vec<(String, &str)> =
-            tokenizer.tokenize(text).unwrap().into_iter().map(|w| (w.base_word, &text[w.span])).collect();
+            tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false)).map(|w| (w.base_word, &text[w.span])).collect();
         let expected = [("冒険者", "冒険者"), ("神出鬼没", "神出鬼没"), ("怪盗", "怪盗"), ("見る", "見")];
         assert_eq!(spans, expected.map(|(w, s)| (w.to_string(), s)));
     }
@@ -857,8 +876,8 @@ mod dictionary_tests {
         assert_eq!(words("消えかけた"), ["消える", "掛ける"]);
         assert_eq!(words("巡り巡って"), ["巡る", "巡る"]);
         let text = "握り直した";
-        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
-        let spans: Vec<&str> = tokenizer.tokenize(text).unwrap().into_iter().map(|w| &text[w.span]).collect();
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        let spans: Vec<&str> = tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false)).map(|w| &text[w.span]).collect();
         assert_eq!(spans, ["握り", "直し"]);
     }
 

@@ -453,7 +453,6 @@ impl ViewerApp {
 
         let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary else { return };
         let Some(book) = self.pending.first_mut() else { return };
-        tokenizer.set_include_particles(self.settings.include_particles);
         let started = Instant::now();
         let stepped = book.step(tokenizer, started + WORK_PER_FRAME);
         self.load_times.add("analyzing books", started.elapsed().as_secs_f64());
@@ -499,7 +498,7 @@ impl ViewerApp {
                 } else if files.len() == WEB_DICTIONARY_FILES.len() {
                     let (version, mut files) = (version.clone(), std::mem::take(files));
                     log::info!("Dictionary {version} {}", if *from_storage { "from storage" } else { "downloaded" });
-                    let tokenizer = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::tokenizer_from_files(|name| files.remove(name), true, false));
+                    let tokenizer = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::tokenizer_from_files(|name| files.remove(name), true));
                     match self.load_times.timed("loading the definitions", || Lookup::from_files(|name| files.remove(name))) {
                         Ok(lookup) => self.lookup = Some(lookup),
                         Err(e) => self.errors.push(format!("Definitions unavailable: {e:#}")),
@@ -744,12 +743,10 @@ impl ViewerApp {
         });
         if reader.needs_words() {
             if let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary {
-                // Every word can be looked up, particles included
-                tokenizer.set_include_particles(true);
+                // Every word the tokenizer finds can be looked up, whether word lists count it or not
                 let started = Instant::now();
                 reader.tokenize(tokenizer);
                 log::info!("Reader: chapter tokenized in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
-                tokenizer.set_include_particles(self.settings.include_particles);
             }
         }
         let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, palette);

@@ -85,7 +85,7 @@ mod native {
     ];
 
     pub fn embedded_tokenizer() -> Option<Result<JapaneseTokenizer>> {
-        Some(JapaneseTokenizer::new(None, true, false))
+        Some(JapaneseTokenizer::new(None, true))
     }
 
     /// The definitions and kanji built into the app.

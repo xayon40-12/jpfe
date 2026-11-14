@@ -715,11 +715,12 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
         entries[..=i].rotate_right(1);
     }
     let mut readings: Vec<&str> = entries.first().map(|e| e.readings.clone()).unwrap_or_default();
-    // The reading in the text first
+    // The reading in the text first; none that only repeats a word written in kana (の【の】)
     if word.pronunciation != word.base_word {
         readings.retain(|r| *r != word.pronunciation);
         readings.insert(0, &word.pronunciation);
     }
+    readings.retain(|r| *r != word.base_word);
 
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;

@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     println!("Target cumulative percentage: {:.1}%", args.target_percentage);
     println!("Min occurrences in whole novel: {}", args.min_book_count);
     println!("Pronunciation: {:?}", args.reading);
-    println!("Grammar filtering: {}", if args.include_particles { "Particles/auxiliaries included" } else { "Clean vocabulary only (particles, affixes, contractions excluded)" });
+    println!("Grammar filtering: {}", if args.include_particles { "Particles/auxiliaries included" } else { "Particles, auxiliaries and contractions excluded" });
     println!("Hide previously seen words: {hide_previous_words}\n{RULE}");
 
     let t0 = Instant::now();
@@ -153,11 +153,11 @@ fn main() -> Result<()> {
 
     println!("Initializing Japanese morphological tokenizer (Lindera + UniDic)...");
     let reading_in_hiragana = matches!(args.reading, ReadingFormat::Hiragana);
-    let mut tokenizer = JapaneseTokenizer::new(args.dict_path.as_deref(), reading_in_hiragana, args.include_particles)?;
+    let mut tokenizer = JapaneseTokenizer::new(args.dict_path.as_deref(), reading_in_hiragana)?;
 
     let t_tokenize = Instant::now();
     println!("Tokenizing and calculating book-wide vocabulary statistics across {} chapters...", chapters.len());
-    let (analyzer, tokenized_chapters) = FrequencyAnalyzer::build(&mut tokenizer, &chapters)?;
+    let (analyzer, tokenized_chapters) = FrequencyAnalyzer::build(&mut tokenizer, &chapters, args.include_particles)?;
     println!(
         "Processed {} total words ({} unique base vocabulary) across entire book in {:?}\n{RULE}",
         analyzer.total_words,
@@ -167,7 +167,8 @@ fn main() -> Result<()> {
 
     let show_first_seen = args.show_previous_words || args.show_first_appearance;
     let analyze = |i: usize| {
-        analyzer.analyze_chapter(i, &tokenized_chapters[i], args.target_percentage, args.min_book_count, hide_previous_words)
+        let chapter = &tokenized_chapters[i];
+        analyzer.analyze_chapter(i, chapter, args.target_percentage, args.min_book_count, hide_previous_words, args.include_particles)
     };
     // Vocabulary-ratio baseline: the first chapter (the prologue if there is one, otherwise chapter 1)
     let baseline_ratio = vocabulary_ratio(analyze(0).len(), char_counts[0]);
