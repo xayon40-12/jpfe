@@ -9,7 +9,7 @@ use jpfe::exporter::{export_chapter_entries, pad, ExportFormat};
 use jpfe::frequency::FrequencyAnalyzer;
 use jpfe::models::{vocabulary_ratio, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters;
-use jpfe::statistics::{export_statistics, ChartScales, Scale};
+use jpfe::statistics::export_statistics;
 use jpfe::tokenizer::JapaneseTokenizer;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -73,18 +73,6 @@ struct Args {
     /// Path to custom external MeCab/Lindera dictionary directory
     #[arg(long = "dict-path")]
     dict_path: Option<PathBuf>,
-
-    /// Y-axis scale of the normalized vocabulary ratio plot
-    #[arg(long = "ratio-scale", value_enum, default_value_t = Scale::Log)]
-    ratio_scale: Scale,
-
-    /// Y-axis scale of the filtered word count plot
-    #[arg(long = "words-scale", value_enum, default_value_t = Scale::Log)]
-    words_scale: Scale,
-
-    /// Y-axis scale of the chapter character count plot
-    #[arg(long = "chars-scale", value_enum, default_value_t = Scale::Linear)]
-    chars_scale: Scale,
 }
 
 fn parse_chapter_selection(spec: &str, valid: std::ops::RangeInclusive<usize>) -> Result<HashSet<usize>> {
@@ -218,12 +206,9 @@ fn main() -> Result<()> {
     }
 
     if !chapter_stats.is_empty() {
-        let scales = ChartScales { ratio: args.ratio_scale, words: args.words_scale, characters: args.chars_scale };
-        let stats_paths = export_statistics(&output_dir, &chapter_stats, args.format, scales)?;
+        let table_path = export_statistics(&output_dir, &chapter_stats, args.format)?;
         println!("{RULE}\nVocabulary Density Statistics:");
-        println!("  Table:     {}", stats_paths.table_path.display());
-        println!("  SVG chart: {}", stats_paths.svg_path.display());
-        println!("  Scales:    Ratio = {:?} | Words = {:?} | Characters = {:?}", scales.ratio, scales.words, scales.characters);
+        println!("  Table:     {}", table_path.display());
         println!("  Baseline:  Ch {:0pad_width$} \"{}\" (raw ratio: {:.6})\n", first.index, first.title, baseline_ratio);
     }
 

@@ -1,6 +1,5 @@
 //! Chapter extraction, tokenization and vocabulary statistics shared by the CLI and the viewer.
 
-pub mod chart;
 pub mod epub;
 pub mod frequency;
 pub mod models;

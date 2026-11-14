@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use egui::{Color32, RichText, Ui};
 use egui_plot::{GridInput, GridMark, HoverPosition, Line, Plot, Points, VLine};
-use jpfe::chart::{format_count, format_ratio, log_ticks};
+use crate::chart::{format_count, format_ratio, log_ticks};
 use jpfe::tokenizer::{JapaneseTokenizer, TOKENIZER_FILES};
 use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};

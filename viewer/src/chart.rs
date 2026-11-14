@@ -1,4 +1,4 @@
-//! Axis ticks and number formatting shared by the SVG chart and the viewer.
+//! Axis ticks and number formatting of the plots.
 
 /// 1-2-5 ticks inside `lo..=hi`, or 1..9 when the range is too narrow for that.
 pub fn log_ticks(lo: f64, hi: f64) -> Vec<f64> {

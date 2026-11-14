@@ -75,8 +75,7 @@ By default, files are exported to a folder adjacent to the input file named `<fi
 │   ├── chapter_001_chapter_one.txt
 │   └── chapter_002_chapter_two.txt
 └── statistics/
-    ├── vocabulary_ratio.tsv
-    └── vocabulary_ratio.svg
+    └── vocabulary_ratio.tsv
 ```
 
 ### 1. `words/` Directory
@@ -115,18 +114,14 @@ Contains chapter-level vocabulary load and density statistics:
   - `characters`: Total character count of the chapter
   - `raw_ratio`: Raw vocabulary load per character (`filtered_words / characters`)
   - `normalized_ratio`: Normalized ratio relative to Chapter 0 / baseline (`raw_ratio / baseline_ratio`, baseline = `1.000000`)
-- **`vocabulary_ratio.svg`**: Vector chart (rendered with [`plotters`](https://crates.io/crates/plotters)) made of three stacked plots sharing the chapter axis, each with its own left vertical axis:
-  1. **Normalized vocabulary ratio** relative to the baseline chapter, with a dashed `1` baseline. Log scale by default (`--ratio-scale linear` to change).
-  2. **Filtered words exported** per chapter. Log scale by default (`--words-scale linear` to change).
-  3. **Character count** per chapter (bottom). Linear scale by default (`--chars-scale log` to change).
-  - A header shows the chapter count and the min / average / max of each metric.
-  - Hovering a chapter highlights its points in all three plots and shows a tooltip with its title, ratios, word count and character count (when the SVG is opened in a browser).
+
+To see these statistics as charts, use the viewer below.
 
 ---
 
 ## Interactive Viewer (desktop and web)
 
-`viewer/` is an [egui](https://github.com/emilk/egui) app that shows the same three charts live for several books at once:
+`viewer/` is an [egui](https://github.com/emilk/egui) app that charts these statistics live for several books at once:
 
 - **Left panel**: one entry per loaded EPUB/PDF (open them with the button or drop them on the window), each with a **Learned up to (included)** chapter selector. It starts at *Not started*, so loading a book does not mark anything as learned.
 - **Central panel**: pick the book to show. Its word lists leave out every word you have learned in the *other* books (their word lists up to the selected chapter), and an orange vertical line marks your progress in the shown book. The plots are, from top to bottom: new words to learn, words learned so far (every word to learn from the start of the book up to and including each chapter), chapter length, and vocabulary density (new words per 100 characters, about a sentence: how many words to learn for the same amount of reading). Click a plot's "log scale" / "linear scale" label to switch its scale. Hovering a chapter shows its title and numbers in all the plots.
@@ -362,7 +357,4 @@ Within each chapter, vocabulary is sorted using a multi-level priority:
 | `--chapters` | `-c` | *(all)* | Specific chapters to export (e.g. `1,2,3` or `1-4`) |
 | `--format` | | `tsv` | Full stats table format: `tsv` or `csv` |
 | `--reading` | | `hiragana` | Reading pronunciation format: `hiragana` or `katakana` |
-| `--ratio-scale` | | `log` | Y-axis scale of the normalized ratio plot: `log` or `linear` |
-| `--words-scale` | | `log` | Y-axis scale of the filtered word count plot: `log` or `linear` |
-| `--chars-scale` | | `linear` | Y-axis scale of the character count plot: `log` or `linear` |
 | `--dict-path` | | `None` | Path to optional external MeCab/Lindera dictionary directory |

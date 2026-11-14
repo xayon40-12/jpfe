@@ -1,6 +1,7 @@
 //! Interactive vocabulary statistics for several books, as a desktop app or a web page.
 
 mod app;
+mod chart;
 mod book;
 mod platform;
 mod storage;
