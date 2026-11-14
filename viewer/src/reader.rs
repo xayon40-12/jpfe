@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use egui::epaint::TextShape;
 use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use jpfe::dictionary::{Definitions, Kanjidic, DEFINITIONS_FILE, KANJI_FILE};
-use jpfe::tokenizer::{is_cjk_kanji, JapaneseTokenizer, ParsedWord};
+use jpfe::tokenizer::{is_cjk_kanji, JapaneseTokenizer, ParsedWord, WordKind};
 
 use crate::book::Book;
 use crate::theme::Palette;
@@ -780,7 +780,7 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
         return clicked;
     };
     if entries.is_empty() {
-        note(ui, "Not in the dictionary.");
+        note(ui, if word.kind == WordKind::Number { "A number (not in word lists)." } else { "Not in the dictionary." });
     }
     for (i, entry) in entries.iter().take(MAX_ENTRIES).enumerate() {
         ui.separator();

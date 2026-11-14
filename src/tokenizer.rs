@@ -29,6 +29,9 @@ pub enum WordKind {
     Grammar,
     /// A single hiragana other than a conjunction: interjections (あ), prefixes (お) and suffixes (さ, げ), never listed
     Fragment,
+    /// A number with no counter (二十三, 2020, 第二, 数十), never listed: numbers are learned as a system, not word by
+    /// word (with a counter, the counter is the word: see [`ParsedWord::written_reading`])
+    Number,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +83,7 @@ impl ParsedWord {
         match self.kind {
             WordKind::Word => true,
             WordKind::Grammar => include_particles,
-            WordKind::Fragment => false,
+            WordKind::Fragment | WordKind::Number => false,
         }
     }
 }
@@ -459,8 +462,8 @@ impl JapaneseTokenizer {
     }
 
     /// Every word of `text`, with what kind of word it is (see [`WordKind`]): only symbols, spaces and
-    /// tokens that are not words (numerals in digits, runs of punctuation) are left out. Conjugation endings
-    /// are part of the word they follow (see [`ParsedWord::endings`]).
+    /// tokens that are not words (runs of punctuation) are left out. Prefixes, conjugation endings and suffixes
+    /// are part of their word (see [`ParsedWord::affixes`]), and numbers of their counter.
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
         let Self { segmenter, headwords, reading_cache, reading_in_hiragana } = self;
         let mut words = Vec::new();
@@ -636,9 +639,10 @@ impl JapaneseTokenizer {
     }
 }
 
-/// Puts each number into the counter after it (一 + つ → 一つ, 二十 + 三 + 人 → 二十三人, 3 + 人 → 3人), and an
-/// ordinal 目 after them (一つ目): the word is the counter, and the whole is read as a number with its counter
-/// (see [`ParsedWord::written_reading`]). Numbers in digits with no counter are left out, as they are not words.
+/// Groups numbers into words. A run of numbers goes into the counter after it (一 + つ → 一つ, 二十 + 三 + 人 →
+/// 二十三人, 3 + 人 → 3人), with an ordinal 目 after them (一つ目): the word is the counter, and the whole is read as
+/// a number with its counter (see [`ParsedWord::written_reading`]). With no counter, the run is one number, which
+/// is not listed (see [`WordKind::Number`]). 第 before the numbers makes them an ordinal (第三章, 第二).
 /// `sources[i]` are the tokens `words[i]` is made of.
 fn attach_counters(
     words: Vec<ParsedWord>,
@@ -658,19 +662,32 @@ fn attach_counters(
     let next_to = |previous: &ParsedWord, previous_source: &Range<usize>, word: &ParsedWord, source: &Range<usize>| {
         source.start == previous_source.end && word.span.start == previous.span.end
     };
+    let in_kana = |reading: String| if reading_in_hiragana { reading } else { hiragana_to_katakana(&reading) };
     let (mut attached, mut attached_sources) = (Vec::with_capacity(words.len()), Vec::with_capacity(words.len()));
     let mut items = words.into_iter().zip(sources).peekable();
-    while let Some((mut word, source)) = items.next() {
+    while let Some((word, source)) = items.next() {
+        // 第 before a number makes it an ordinal
+        let ordinal = word.pos == "接頭辞"
+            && word.base_word == "第"
+            && items.peek().is_some_and(|(w, s)| next_to(&word, &source, w, s) && is_number(s));
+        let (prefix, (mut word, source)) = match ordinal {
+            true => (Some((word, source)), items.next().expect("a number follows")),
+            false => (None, (word, source)),
+        };
         if !is_number(&source) {
-            // A single kana UniDic takes for a number is not one (the シ of シッ)
-            if single(&source).is_some_and(|t| t.field(1) == "数詞") && word.spelling.chars().count() == 1 {
+            // A single kana UniDic takes for a number is not one (the シ of シッ), nor kana it takes for 第 (the ダイ
+            // of ダイスキヤキ, the だい of だいぃぶ)
+            let kana_number = single(&source).is_some_and(|t| t.field(1) == "数詞") && word.spelling.chars().count() == 1;
+            let kana_ordinal = word.pos == "接頭辞" && word.base_word == "第" && single(&source).is_some_and(|t| t.surface != "第");
+            if kana_number || kana_ordinal {
                 word.kind = WordKind::Fragment;
             }
             attached.push(word);
             attached_sources.push(source);
             continue;
         }
-        let start = (word.span.start, source.start);
+        let first = prefix.as_ref().map_or((word.span.start, source.start), |(w, s)| (w.span.start, s.start));
+        let numbers_start = source.start;
         let mut numbers = vec![(word, source)];
         while let Some(number) = items.next_if(|(w, s)| {
             let (last, last_source) = &numbers[numbers.len() - 1];
@@ -679,22 +696,49 @@ fn attach_counters(
             numbers.push(number);
         }
         let (last, last_source) = &numbers[numbers.len() - 1];
-        let end = last_source.end;
+        let (end, span_end) = (last_source.end, last.span.end);
+        let number_tokens = &tokens[numbers_start..end];
+        let ordinal_reading = |reading: String| if prefix.is_some() { format!("だい{reading}") } else { reading };
         // Not the decimals of a number (1.5倍), which UniDic splits at the point
-        let decimals = start.1 > 0 && matches!(tokens[start.1 - 1].surface.as_str(), "." | "．");
+        let decimals = numbers_start > 0 && matches!(tokens[numbers_start - 1].surface.as_str(), "." | "．");
         let counter = items.next_if(|(w, s)| !decimals && next_to(last, last_source, w, s) && single(s).is_some_and(is_counter));
         let Some((mut word, mut source)) = counter else {
-            // Numbers in kanji are words (一, 百), not those in digits
-            for (word, source) in numbers.into_iter().filter(|(w, _)| is_valid_word(&w.spelling)) {
-                attached.push(word);
-                attached_sources.push(source);
+            // Words such as 何 and 数 when no number comes with them
+            if !number_tokens.iter().any(is_numeral) {
+                attached.extend(prefix.iter().map(|(w, _)| w.clone()));
+                attached_sources.extend(prefix.map(|(_, s)| s));
+                for (word, source) in numbers.into_iter().filter(|(w, _)| is_valid_word(&w.spelling)) {
+                    attached.push(word);
+                    attached_sources.push(source);
+                }
+                continue;
             }
+            let written: String = tokens[first.1..end].iter().map(|t| t.surface.as_str()).collect();
+            let number = ParsedWord {
+                pronunciation: in_kana(ordinal_reading(number_reading_of(number_tokens, ""))),
+                pos: "名詞".to_string(),
+                spelling: written.clone(),
+                base_word: written,
+                span: first.0..span_end,
+                kind: WordKind::Number,
+                affixes: Vec::new(),
+                forms: if prefix.is_some() { vec!["ordinal (第)"] } else { Vec::new() },
+                homograph: None,
+                written_reading: None,
+            };
+            attached.push(number);
+            attached_sources.push(first.1..end);
             continue;
         };
-        let mut reading = number_with_counter(&tokens[start.1..end], &tokens[source.start]);
-        word.span.start = start.0;
-        source.start = start.1;
+        let mut reading = ordinal_reading(number_with_counter(number_tokens, &tokens[source.start]));
+        word.span.start = first.0;
+        source.start = first.1;
         word.kind = WordKind::Word;
+        if let Some((mut prefix, _)) = prefix {
+            prefix.kind = WordKind::Grammar;
+            word.affixes.push(prefix);
+            word.forms.push("ordinal (第)");
+        }
         let is_ordinal = |s: &Range<usize>| single(s).is_some_and(|t| t.field(0) == "接尾辞" && t.field(7) == "目");
         if let Some((ordinal, ordinal_source)) = items.next_if(|(w, s)| next_to(&word, &source, w, s) && is_ordinal(s)) {
             word.span.end = ordinal.span.end;
@@ -702,11 +746,48 @@ fn attach_counters(
             reading.push('め');
             word.forms.push("ordinal (目)");
         }
-        word.written_reading = Some(if reading_in_hiragana { reading } else { hiragana_to_katakana(&reading) });
+        word.written_reading = Some(in_kana(reading));
         attached.push(word);
         attached_sources.push(source);
     }
     (attached, attached_sources)
+}
+
+/// Kanji for numbers, and digits: what a number is written with (一, 十, 万, 〇, 3, ３).
+fn is_numeral_char(c: char) -> bool {
+    "〇零一二三四五六七八九十百千万億兆".contains(c) || c.is_ascii_digit() || ('０'..='９').contains(&c)
+}
+
+/// A token that is a number, possibly an approximate one (二十, 2020, 数十, 何百), as written or as UniDic's lemma
+/// (ひと and イチ are 一, 0 is ゼロ), but not 何 or 数 alone.
+fn is_numeral(token: &Token) -> bool {
+    let numeral = |text: &str| text.chars().any(is_numeral_char) && text.chars().all(|c| is_numeral_char(c) || "数何幾".contains(c));
+    numeral(&token.surface) || numeral(token.field(7).split('-').next().unwrap_or_default())
+}
+
+/// The value of numbers written in digits (2020, ２０２０) or digit by digit in kanji (二〇二〇).
+fn digits_value(numbers: &[Token]) -> Option<u64> {
+    const KANJI: &str = "〇一二三四五六七八九";
+    let digit = |c: char| {
+        c.to_digit(10)
+            .or_else(|| ('０'..='９').contains(&c).then(|| c as u32 - '０' as u32))
+            .or_else(|| KANJI.chars().position(|k| k == c).map(|d| d as u32))
+    };
+    let chars: Vec<char> = numbers.iter().flat_map(|t| t.surface.chars()).collect();
+    // In kanji, one digit (三, 四時 よじ), or digit by digit with a zero (二〇二〇); not 二三日 (に、さんにち)
+    if chars.iter().any(|c| KANJI.contains(*c)) && chars.len() > 1 && !chars.contains(&'〇') {
+        return None;
+    }
+    chars.into_iter().map(digit).try_fold(0u64, |value, d| value.checked_mul(10)?.checked_add(u64::from(d?)))
+}
+
+/// How `numbers` (tokens) are read before `counter` (a lemma, or empty): from their value when written in
+/// digits, as UniDic reads them there otherwise (ヒト in 一つ, ミッ in 三日).
+fn number_reading_of(numbers: &[Token], counter: &str) -> String {
+    match digits_value(numbers) {
+        Some(value) => number_reading(value, counter),
+        None => numbers.iter().map(token_reading).collect(),
+    }
 }
 
 /// A counter after a number: a suffix (つ, 人, 匹) or a noun UniDic says can count (円, 回, 時間).
@@ -724,20 +805,10 @@ fn is_counter(token: &Token) -> bool {
 fn number_with_counter(numbers: &[Token], counter: &Token) -> String {
     let counter_reading = katakana_to_hiragana(counter.field(6));
     let lemma = counter.field(7).split('-').next().unwrap_or_default();
-    let digit = |c: char| c.to_digit(10).or_else(|| ('０'..='９').contains(&c).then(|| c as u32 - '０' as u32));
-    let value = numbers
-        .iter()
-        .flat_map(|t| t.surface.chars())
-        .map(digit)
-        .try_fold(0u64, |value, d| value.checked_mul(10)?.checked_add(u64::from(d?)));
-    let number = match value {
-        Some(value) => match native_count(value, lemma) {
-            Some(whole) => return whole.to_string(),
-            None => number_reading(value, lemma),
-        },
-        None => numbers.iter().map(token_reading).collect(),
-    };
-    join_counter(&number, &counter_reading, lemma)
+    if let Some(whole) = digits_value(numbers).and_then(|value| native_count(value, lemma)) {
+        return whole.to_string();
+    }
+    join_counter(&number_reading_of(numbers, lemma), &counter_reading, lemma)
 }
 
 /// The reading of a token in context, in hiragana: its pronunciation, with the long vowels (ー) of its lemma
@@ -896,16 +967,24 @@ fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[
 }
 
 /// Puts each polite prefix お or ご into the word after it (お二人 is 二人, ご出席 is 出席, お聞き is 聞く), unless
-/// JMdict has the whole word (お茶, ご飯), which is then already one word.
+/// JMdict has the whole word (お茶, ご飯), which is then already one word; and 第 into a word that starts with a
+/// number (第一軍 is 一軍), which UniDic sometimes reads as one word (第 before numbers is part of them: see
+/// [`attach_counters`]).
 fn attach_prefixes(words: Vec<ParsedWord>) -> Vec<ParsedWord> {
     let mut attached: Vec<ParsedWord> = Vec::with_capacity(words.len());
     let mut prefix: Option<ParsedWord> = None;
     for mut word in words {
         if let Some(mut polite) = prefix.take() {
             // A word to learn, next to the prefix in the text: not a particle or another interjection (お、お…)
-            if polite.span.end == word.span.start && word.kind == WordKind::Word && !matches!(word.pos.as_str(), "接頭辞" | "感動詞") {
+            let ordinal = polite.base_word == "第";
+            let fits = if ordinal { word.spelling.starts_with(is_numeral_char) } else { !matches!(word.pos.as_str(), "接頭辞" | "感動詞") };
+            if polite.span.end == word.span.start && word.kind == WordKind::Word && fits {
                 word.span.start = polite.span.start;
-                word.forms.insert(0, if polite.spelling == "ご" { "polite (ご)" } else { "polite (お)" });
+                word.forms.insert(0, match polite.spelling.as_str() {
+                    _ if ordinal => "ordinal (第)",
+                    "ご" => "polite (ご)",
+                    _ => "polite (お)",
+                });
                 polite.kind = WordKind::Grammar;
                 word.affixes.insert(0, polite);
                 attached.push(word);
@@ -913,7 +992,8 @@ fn attach_prefixes(words: Vec<ParsedWord>) -> Vec<ParsedWord> {
             }
             attached.push(polite);
         }
-        let polite = word.pos == "接頭辞" && word.base_word == "御" && matches!(word.spelling.as_str(), "お" | "ご" | "御");
+        let polite = word.pos == "接頭辞"
+            && (word.base_word == "御" && matches!(word.spelling.as_str(), "お" | "ご" | "御") || word.spelling == "第" && word.kind == WordKind::Word);
         if polite {
             prefix = Some(word);
         } else {
@@ -1391,15 +1471,29 @@ mod dictionary_tests {
         assert_eq!(counted_with_numbers("三日"), one("三日", "日", "みっか"));
         assert_eq!(counted_with_numbers("三階"), one("三階", "階", "さんがい"));
         assert_eq!(counted_with_numbers("一つ目"), one("一つ目", "つ", "ひとつめ"));
+        // 第 makes an ordinal
+        assert_eq!(counted_with_numbers("第二話"), one("第二話", "話【わ】", "だいにわ"));
         // Numbers in digits, read from their value
         assert_eq!(counted_with_numbers("10人"), one("10人", "人【にん】", "じゅうにん"));
         assert_eq!(counted_with_numbers("1人"), one("1人", "人【にん】", "ひとり"));
         assert_eq!(counted_with_numbers("3つ"), one("3つ", "つ", "みっつ"));
         assert_eq!(counted_with_numbers("2020年"), one("2020年", "年", "にせんにじゅうねん"));
         assert_eq!(counted_with_numbers("4時"), one("4時", "時", "よじ"));
-        // Counted as the counter, which is a word to learn even when a single kana; numbers in digits alone are
-        // not words, and decimals keep their counter apart
+        // Counted as the counter, which is a word to learn even when a single kana; numbers with no counter are
+        // one number, never listed, and decimals keep their counter apart
         assert_eq!(counted("一つ"), ["つ"]);
+        let numbers = |text: &str| {
+            let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+            let words = tokenizer.tokenize(text).unwrap();
+            words.iter().filter(|w| w.kind == WordKind::Number).map(|w| (text[w.span.clone()].to_string(), w.pronunciation.clone())).collect::<Vec<_>>()
+        };
+        let pairs = |list: &[(&str, &str)]| list.iter().map(|&(w, r)| (w.to_string(), r.to_string())).collect::<Vec<_>>();
+        assert_eq!(numbers("二十三"), pairs(&[("二十三", "にじゅうさん")]));
+        assert_eq!(numbers("二〇二〇年まで2020"), pairs(&[("2020", "にせんにじゅう")]));
+        assert_eq!(numbers("第三章"), pairs(&[("第三", "だいさん")]));
+        assert_eq!(numbers("数十"), pairs(&[("数十", "すうじゅう")]));
+        assert_eq!(counted("二十三の"), Vec::<String>::new());
+        assert_eq!(counted("何が"), ["何"]);
         assert_eq!(counted_with_numbers("ひとつ"), one("ひとつ", "つ", "ひとつ"));
         assert_eq!(counted("3"), Vec::<String>::new());
         assert_eq!(counted("1.5倍"), ["倍"]);
