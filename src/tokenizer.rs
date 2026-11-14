@@ -33,7 +33,8 @@ pub enum WordKind {
 
 #[derive(Debug, Clone)]
 pub struct ParsedWord {
-    /// The word's dictionary form, which identifies it in counts and across books
+    /// The word's dictionary form, which identifies it in counts and across books (with its reading for a
+    /// homograph: see [`Self::key`])
     pub base_word: String,
     /// The dictionary form as the text writes it: the same as `base_word`, unless the text writes in kana a
     /// word whose dictionary form has kanji (いる for 居る, こと for 事); word lists show each word in the
@@ -41,12 +42,34 @@ pub struct ParsedWord {
     pub spelling: String,
     pub pronunciation: String,
     pub pos: String,
-    /// Where the word is written in the tokenized text (bytes): its surface, which may be conjugated (言っ)
+    /// Where the word is written in the tokenized text (bytes), with its conjugation endings (数えられる)
     pub span: Range<usize>,
     pub kind: WordKind,
+    /// The conjugation endings written after the word, which UniDic makes words of their own (られる, た, て,
+    /// the ない of 美しくない): part of the word in the text, and grammar in word lists (see [`Self::with_endings`])
+    pub endings: Vec<ParsedWord>,
+    /// What the word's conjugation means, in order ("passive or potential (られる)", "past (た)")
+    pub forms: Vec<&'static str>,
+    /// For a word with the same dictionary form as another word but read differently (the 様 of ようだ, not
+    /// the 様 of エミリア様), its reading, which keeps the two apart in counts (see [`Self::key`])
+    pub homograph: Option<String>,
 }
 
 impl ParsedWord {
+    /// What identifies the word in counts and across books: its dictionary form, with its reading for a
+    /// homograph (様【よう】, while 様 is さま).
+    pub fn key(&self) -> Cow<'_, str> {
+        match &self.homograph {
+            Some(reading) => Cow::Owned(format!("{}【{reading}】", self.base_word)),
+            None => Cow::Borrowed(&self.base_word),
+        }
+    }
+
+    /// The word, then its conjugation endings: what word lists count.
+    pub fn with_endings(&self) -> impl Iterator<Item = &ParsedWord> {
+        std::iter::once(self).chain(&self.endings)
+    }
+
     /// Whether word lists count this word; particles and auxiliary verbs only with `include_particles`.
     pub fn is_listed(&self, include_particles: bool) -> bool {
         match self.kind {
@@ -97,6 +120,8 @@ struct Headword<'a> {
     kana: bool,
     /// Every reading of the word in any entry (・-separated), when it has others than `reading`
     readings: &'a str,
+    /// The readings that are other words written the same (・-separated): よう and ざま for 様, read さま
+    homographs: &'a str,
 }
 
 /// How a word written in kana relates to a dictionary form in kanji UniDic gives it.
@@ -166,6 +191,7 @@ impl Headwords {
         let mut fields = rest[..rest.find('\n').unwrap_or(rest.len())].split('\t').skip(1);
         let (reading, pos, kind) = (fields.next()?, fields.next()?, fields.next()?);
         let readings = fields.next().unwrap_or_default();
+        let homographs = fields.next().unwrap_or_default();
         let pos = match pos {
             "動詞" => "動詞",
             "形容詞" => "形容詞",
@@ -174,7 +200,7 @@ impl Headwords {
             "表現" => "表現",
             _ => "名詞",
         };
-        Some(Headword { reading, pos, rare: kind == "r", kana: kind == "a", readings })
+        Some(Headword { reading, pos, rare: kind == "r", kana: kind == "a", readings, homographs })
     }
 
     /// A kanji headword (not rarely used), which tokens may be merged into.
@@ -193,6 +219,18 @@ impl Headwords {
         let same_kind = |h: &Headword| !matches!(pos, "動詞" | "形容詞") || h.pos == pos;
         let own = [hiragana.as_str(), kana].into_iter().find(|k| self.get(k).is_some_and(|h| h.kana && same_kind(&h)));
         own.map_or(KanaForm::Other, |k| KanaForm::OwnWord(k.to_string()))
+    }
+
+    /// For `word`, UniDic's lemma `lemma` read `reading` (katakana), that reading when it is another word
+    /// written the same (よう for 様, whose usual reading is さま): a reading of a JMdict entry of `word` that
+    /// shares no meaning with the entry of its usual reading (see `scripts/jmdict-headwords.py`).
+    fn homograph(&self, word: &str, lemma: &str, reading: &str) -> Option<String> {
+        if word != lemma || !word.chars().any(is_cjk_kanji) || !is_set(reading) {
+            return None;
+        }
+        let reading = katakana_to_hiragana(reading);
+        let headword = self.get(word)?;
+        headword.homographs.split('・').any(|r| r == reading).then_some(reading)
     }
 
     /// The kana spelling of a rarely used kanji spelling (遣る → やる).
@@ -416,10 +454,13 @@ impl JapaneseTokenizer {
     }
 
     /// Every word of `text`, with what kind of word it is (see [`WordKind`]): only symbols, spaces and
-    /// tokens that are not words (numerals in digits, runs of punctuation) are left out.
+    /// tokens that are not words (numerals in digits, runs of punctuation) are left out. Conjugation endings
+    /// are part of the word they follow (see [`ParsedWord::endings`]).
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
         let Self { segmenter, headwords, reading_cache, reading_in_hiragana } = self;
         let mut words = Vec::new();
+        // The tokens each word is made of
+        let mut sources: Vec<Range<usize>> = Vec::new();
         let separator = FIELD_SEPARATOR.to_string();
         let tokens: Vec<Token> = segmenter
             .segment(Cow::Borrowed(text))?
@@ -444,7 +485,11 @@ impl JapaneseTokenizer {
                     base_word: word,
                     span: token.span.start..tokens[end - 1].span.end,
                     kind: WordKind::Word,
+                    endings: Vec::new(),
+                    forms: Vec::new(),
+                    homograph: None,
                 });
+                sources.push(index..end);
                 continue;
             }
             let surface = token.surface.clone();
@@ -507,6 +552,7 @@ impl JapaneseTokenizer {
 
             // A verb or adjective JMdict does not have: the word (or words) a dictionary has instead
             let mut span = token.span.clone();
+            let mut source = index..index + 1;
             let missing = matches!(pos, "動詞" | "形容詞") && base_word.chars().any(is_cjk_kanji);
             let found = headwords
                 .as_ref()
@@ -517,6 +563,7 @@ impl JapaneseTokenizer {
                     if with_next {
                         span.end = tokens[index + 1].span.end;
                         next = index + 2;
+                        source.end = next;
                     }
                     (word, hiragana_to_katakana(&reading), None)
                 }
@@ -530,13 +577,18 @@ impl JapaneseTokenizer {
                             base_word: word,
                             span,
                             kind: WordKind::Word,
+                            endings: Vec::new(),
+                            forms: Vec::new(),
+                            homograph: None,
                         });
+                        sources.push(index..index + 1);
                     }
                     continue;
                 }
                 None => (base_word, reading_seed, spelling),
             };
             let spelling = spelling.unwrap_or_else(|| base_word.clone());
+            let homograph = headwords.as_ref().and_then(|h| h.homograph(&base_word, lemma, raw_reading));
 
             if !is_valid_word(&spelling) {
                 continue;
@@ -549,8 +601,11 @@ impl JapaneseTokenizer {
             };
 
             // The reading of the spelling: a kana spelling is its own reading (いい, not よい for 良い)
+            // A homograph's reading is the one that tells it apart (readings are cached by dictionary form)
             let reading = if spelling != base_word {
                 hiragana_to_katakana(&spelling)
+            } else if let Some(reading) = &homograph {
+                hiragana_to_katakana(reading)
             } else {
                 resolve_reading(segmenter, reading_cache, &base_word, &surface, &reading_seed)
             };
@@ -561,9 +616,130 @@ impl JapaneseTokenizer {
                 spelling,
                 span,
                 kind,
+                endings: Vec::new(),
+                forms: Vec::new(),
+                homograph,
             });
+            sources.push(source);
         }
-        Ok(words)
+        Ok(attach_endings(words, sources, &tokens, *reading_in_hiragana))
+    }
+}
+
+/// Moves each conjugation ending into the word it follows (数え + られる → 数えられる, with られる as an
+/// ending), and names what the conjugation means. `sources[i]` are the tokens `words[i]` is made of.
+fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[Token], reading_in_hiragana: bool) -> Vec<ParsedWord> {
+    let mut attached: Vec<ParsedWord> = Vec::with_capacity(words.len());
+    // The last token of the last word, endings included
+    let mut last_token: Option<usize> = None;
+    for (mut word, source) in words.into_iter().zip(sources) {
+        let ending = source.len() == 1
+            && last_token.is_some_and(|last| last + 1 == source.start && is_ending(&tokens[last], &tokens[source.start]));
+        let (Some(head), true) = (attached.last_mut(), ending) else {
+            let last = &tokens[source.end - 1];
+            word.forms.extend(own_form(last));
+            last_token = Some(source.end - 1);
+            attached.push(word);
+            continue;
+        };
+        let (previous, token) = (&tokens[source.start - 1], &tokens[source.start]);
+        // Particles and auxiliaries under their lemma: the だ of 読んだ is た, the ん of 行かん is ず
+        if matches!(token.field(0), "助動詞" | "助詞") {
+            let lemma = token.field(7).split('-').next().unwrap_or_default();
+            if is_set(lemma) {
+                word.base_word = lemma.to_string();
+                word.spelling = lemma.to_string();
+                word.pronunciation = if reading_in_hiragana { katakana_to_hiragana(lemma) } else { hiragana_to_katakana(lemma) };
+            }
+        }
+        word.kind = WordKind::Grammar;
+        head.span.end = word.span.end;
+        for form in ending_form(previous, token).into_iter().chain(own_form(token)) {
+            if head.forms.last() != Some(&form) {
+                head.forms.push(form);
+            }
+        }
+        head.endings.push(word);
+        last_token = Some(source.start);
+    }
+    attached
+}
+
+/// Whether `token` is a conjugation ending of the token before it, `previous` (itself a word or an ending):
+/// - after a verb, adjective or auxiliary (or a suffix that conjugates, っぽい): auxiliaries (られる, た, ない,
+///   ます), the particles that make conjugated forms (て, ば, たり, ながら), the stems of そうだ and ようだ, and
+///   ない after an adjective (美しくない, 行きたくない; not after a noun: 関係ない)
+/// - after a na-adjective, or the stem of そうだ: the copula (静かだった, 静かな, 寒そうだ)
+///
+/// Nouns take nothing (学生だ, 勉強する), and verbs after て stay words of their own (書いて + しまう).
+fn is_ending(previous: &Token, token: &Token) -> bool {
+    let previous_pos = previous.field(0);
+    let na = previous_pos == "形状詞";
+    let conjugates = na || matches!(previous_pos, "動詞" | "形容詞" | "助動詞") || previous_pos == "接尾辞" && is_set(previous.field(4));
+    if !conjugates {
+        return false;
+    }
+    let lemma = token.field(7);
+    match token.field(0) {
+        "助動詞" => !na || matches!(lemma, "だ" | "です"),
+        "助詞" => !na && matches!(lemma, "て" | "ば" | "たり" | "ながら" | "つつ"),
+        "形容詞" => {
+            lemma == "無い" && token.field(1) == "非自立可能" && matches!(previous_pos, "形容詞" | "助動詞") && previous.field(5).starts_with("連用形")
+        }
+        "形状詞" => !na && token.field(1) == "助動詞語幹",
+        _ => false,
+    }
+}
+
+/// What a conjugation ending (see [`is_ending`]) means, with the ending in its usual form.
+fn ending_form(previous: &Token, token: &Token) -> Option<&'static str> {
+    let form = token.field(5);
+    Some(match (token.field(0), token.field(7)) {
+        ("助動詞", "れる") => "passive (れる)",
+        ("助動詞", "られる") => "passive or potential (られる)",
+        ("助動詞", "せる" | "させる") => "causative (させる)",
+        ("助動詞", "た") if form.starts_with("仮定形") => "conditional (たら)",
+        ("助動詞", "た") => "past (た)",
+        ("助動詞", "ない") | ("形容詞", "無い") => "negative (ない)",
+        ("助動詞", "ず" | "ぬ") => "negative (ず)",
+        ("助動詞", "たい") => "want to (たい)",
+        ("助動詞", "ます") => "polite (ます)",
+        ("助動詞", "です") => "polite (です)",
+        // The う of 行こう or だろう, unless the token before is already volitional
+        ("助動詞", "う" | "よう") if previous.field(5) != "意志推量形" => "volitional (よう)",
+        ("助動詞", "まい") => "negative volitional (まい)",
+        ("助動詞", "らしい") => "seems (らしい)",
+        ("助動詞", "ちゃう" | "じゃう" | "ちまう" | "じまう") => "completed (ちゃう)",
+        ("助動詞", "てる" | "でる") => "ongoing (てる)",
+        ("助動詞", "とく" | "どく") => "in advance (とく)",
+        ("助動詞", "だ") if form == "連用形-ニ" => "adverb (に)",
+        ("助動詞", "だ") if form == "連用形-一般" => "te-form (で)",
+        ("助動詞", "だ") if form.starts_with("連体形") => "before a noun (な)",
+        ("形状詞", "そう-様態") => "looks (そう)",
+        ("形状詞", "そう-伝聞") => "hearsay (そう)",
+        ("形状詞", "みたい") => "seems (みたい)",
+        ("形状詞", lemma) if lemma.starts_with("よう") || lemma.starts_with('様') => "seems (よう)",
+        ("助詞", "て") => "te-form (て)",
+        ("助詞", "ば") => "conditional (ば)",
+        ("助詞", "たり") => "listing (たり)",
+        ("助詞", "ながら" | "つつ") => "while (ながら)",
+        _ => return None,
+    })
+}
+
+/// A form a token is conjugated in that no ending shows: imperative (書け) and volitional (食べよう, だろう).
+fn own_form(token: &Token) -> Option<&'static str> {
+    let form = token.field(5);
+    if form.starts_with("命令形") {
+        Some("imperative")
+    } else if form.starts_with("意志推量形") {
+        Some(match token.field(7) {
+            "だ" => "presumptive (だろう)",
+            "です" => "presumptive (でしょう)",
+            _ => "volitional (よう)",
+        })
+    } else {
+        None
     }
 }
 
@@ -764,7 +940,7 @@ mod dictionary_tests {
         use WordKind::*;
         assert_eq!(
             found,
-            [("あ", Fragment), ("グレイ", Word), ("ラット", Word), ("家", Word), ("の", Grammar), ("本", Word), ("を", Grammar), ("冊", Word), ("読ん", Word), ("でる", Grammar)]
+            [("あ", Fragment), ("グレイ", Word), ("ラット", Word), ("家", Word), ("の", Grammar), ("本", Word), ("を", Grammar), ("冊", Word), ("読んでる", Word)]
         );
         // Ordinary verbs that share their kana with contractions are words (とって is 取る, によって 因る)
         let pairs = |list: &[(&str, &str)]| list.iter().map(|&(k, s)| (k.to_string(), s.to_string())).collect::<Vec<_>>();
@@ -832,7 +1008,7 @@ mod dictionary_tests {
         let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
         let spans: Vec<(String, &str)> =
             tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false)).map(|w| (w.base_word, &text[w.span])).collect();
-        let expected = [("冒険者", "冒険者"), ("神出鬼没", "神出鬼没"), ("怪盗", "怪盗"), ("見る", "見")];
+        let expected = [("冒険者", "冒険者"), ("神出鬼没", "神出鬼没"), ("怪盗", "怪盗"), ("見る", "見た")];
         assert_eq!(spans, expected.map(|(w, s)| (w.to_string(), s)));
     }
 
@@ -878,7 +1054,79 @@ mod dictionary_tests {
         let text = "握り直した";
         let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
         let spans: Vec<&str> = tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false)).map(|w| &text[w.span]).collect();
-        assert_eq!(spans, ["握り", "直し"]);
+        assert_eq!(spans, ["握り", "直した"]);
+    }
+
+    /// Each word as written, its dictionary form, what its conjugation means and its endings.
+    fn conjugated(text: &str) -> Vec<(String, String, String, String)> {
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        let words = tokenizer.tokenize(text).unwrap();
+        let join = |parts: Vec<&str>| parts.join(", ");
+        words
+            .iter()
+            .map(|w| {
+                let endings = join(w.endings.iter().map(|e| e.base_word.as_str()).collect());
+                (text[w.span.clone()].to_string(), w.base_word.clone(), join(w.forms.clone()), endings)
+            })
+            .collect()
+    }
+
+    /// What identifies each word listed in `text` in counts.
+    fn counted(text: &str) -> Vec<String> {
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        tokenizer.tokenize(text).unwrap().iter().filter(|w| w.is_listed(false)).map(|w| w.key().into_owned()).collect()
+    }
+
+    #[test]
+    fn counts_homographs_apart() {
+        // 様 is read さま in エミリア様 and よう in ように, which JMdict has as words of their own
+        assert_eq!(counted("エミリア様"), ["エミリア", "様"]);
+        assert_eq!(counted("猫のように"), ["猫", "様【よう】"]);
+        assert_eq!(counted("その様な"), ["その", "様【よう】"]);
+        assert_eq!(counted("部屋の中"), ["部屋", "中【なか】"]);
+        assert_eq!(counted("やめる"), ["止める【やめる】"]);
+        assert_eq!(counted("とめる"), ["止める"]);
+        // Entries that share a meaning are one word: わたし and わたくし, なに and なん, and also 方 かた and ほう
+        assert_eq!(counted("私"), counted("わたし"));
+        assert_eq!(counted("何"), counted("なん"));
+        assert_eq!(counted("こっちの方が"), ["こちら", "方"]);
+    }
+
+    #[test]
+    fn keeps_conjugation_endings_with_their_word() {
+        let one = |written: &str, word: &str, forms: &str, endings: &str| vec![(written.into(), word.into(), forms.into(), endings.into())];
+        assert_eq!(conjugated("数えられる"), one("数えられる", "数える", "passive or potential (られる)", "られる"));
+        assert_eq!(conjugated("あった"), one("あった", "有る", "past (た)", "た"));
+        assert_eq!(
+            conjugated("食べさせられた"),
+            one("食べさせられた", "食べる", "causative (させる), passive or potential (られる), past (た)", "させる, られる, た")
+        );
+        // The ない of an adjective is its negative, and the だ of 読んだ is た
+        assert_eq!(conjugated("美しくなかった"), one("美しくなかった", "美しい", "negative (ない), past (た)", "無い, た"));
+        assert_eq!(conjugated("読んだ"), one("読んだ", "読む", "past (た)", "た"));
+        assert_eq!(conjugated("静かだった"), one("静かだった", "静か", "past (た)", "だ, た"));
+        assert_eq!(conjugated("高かったら"), one("高かったら", "高い", "conditional (たら)", "た"));
+        assert_eq!(conjugated("早く書け").remove(1), one("書け", "書く", "imperative", "").remove(0));
+        // Verbs after て, nouns and what follows them stay words of their own
+        let written = |text: &str| conjugated(text).into_iter().map(|(w, ..)| w).collect::<Vec<_>>();
+        assert_eq!(written("それによって"), ["それ", "に", "よって"]);
+        assert_eq!(written("書いてしまった"), ["書いて", "しまった"]);
+        assert_eq!(written("読まれている"), ["読まれて", "いる"]);
+        assert_eq!(written("勉強した"), ["勉強", "した"]);
+        assert_eq!(written("関係なかった"), ["関係", "なかった"]);
+        assert_eq!(written("学生だった"), ["学生", "だった"]);
+        // Word lists count the word once, and its endings as grammar
+        assert_eq!(words("食べさせられた"), ["食べる"]);
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        let listed: Vec<String> = tokenizer
+            .tokenize("美しくなかった")
+            .unwrap()
+            .iter()
+            .flat_map(|w| w.with_endings())
+            .filter(|w| w.is_listed(true))
+            .map(|w| w.base_word.clone())
+            .collect();
+        assert_eq!(listed, ["美しい", "無い", "た"]);
     }
 
     #[test]

@@ -350,6 +350,9 @@ mod tests {
             pos: "名詞".into(),
             span: 0..0,
             kind: WordKind::Word,
+            endings: Vec::new(),
+            forms: Vec::new(),
+            homograph: None,
         };
         words.iter().map(word).collect()
     }

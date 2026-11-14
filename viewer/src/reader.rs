@@ -756,8 +756,15 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
             note(ui, &format!("Also written {}", others.join("・")));
         }
     }
-    if surface != word.base_word {
-        note(ui, &format!("Written {surface} in the text"));
+    // As the text writes it, and what its conjugation means (数えられる: passive or potential (られる))
+    let written = if surface != word.base_word { format!("Written {surface} in the text") } else { String::new() };
+    if !word.forms.is_empty() {
+        // The forms in the color of grammar, like parts of speech
+        let lead = if written.is_empty() { "Here: ".to_string() } else { format!("{written}: ") };
+        let forms = word.forms.join(", ");
+        ui.label(colored(ui, &[(&lead, palette.secondary_text), (&forms, palette.grammar)], body * 0.8, false));
+    } else if !written.is_empty() {
+        note(ui, &written);
     }
     let Some(lookup) = lookup else {
         note(ui, "The dictionary is still loading.");

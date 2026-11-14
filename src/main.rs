@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         let entries = analyze(i);
         let paths = export_chapter_entries(&output_dir, chapter.index, &chapter.title, &entries, args.format, show_first_seen, pad_width)?;
         chapter_stats.push(ChapterStat::new(chapter.index, &chapter.title, entries.len(), char_counts[i], baseline_ratio));
-        let unique = tokens.iter().map(|t| t.base_word.as_str()).collect::<HashSet<_>>().len();
+        let unique = tokens.iter().map(|t| t.key()).collect::<HashSet<_>>().len();
 
         println!("Chapter {:0pad_width$}: \"{}\"", chapter.index, chapter.title);
         println!("  Tokens: {} | Total unique words: {} | {}: {}", tokens.len(), unique, filter_mode_desc, entries.len());
