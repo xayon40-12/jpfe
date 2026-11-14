@@ -15,6 +15,7 @@ pub struct Palette {
     pub blue: Color32,
     pub teal: Color32,
     pub purple: Color32,
+    pub green: Color32,
 }
 
 const LIGHT: Palette = Palette {
@@ -28,6 +29,7 @@ const LIGHT: Palette = Palette {
     blue: Color32::from_rgb(0x00, 0x7A, 0xFF),
     teal: Color32::from_rgb(0x30, 0xB0, 0xC7),
     purple: Color32::from_rgb(0xAF, 0x52, 0xDE),
+    green: Color32::from_rgb(0x34, 0xC7, 0x59),
 };
 
 const DARK: Palette = Palette {
@@ -41,6 +43,7 @@ const DARK: Palette = Palette {
     blue: Color32::from_rgb(0x0A, 0x84, 0xFF),
     teal: Color32::from_rgb(0x40, 0xC8, 0xE0),
     purple: Color32::from_rgb(0xBF, 0x5A, 0xF2),
+    green: Color32::from_rgb(0x30, 0xD1, 0x58),
 };
 
 impl Palette {

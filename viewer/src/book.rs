@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use jpfe::epub::extract_epub_chapters_from_bytes;
 use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer};
-use jpfe::models::{chapter_file_stem, vocabulary_ratio, Chapter, ChapterStat};
+use jpfe::models::{chapter_file_stem, Chapter, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters_from_bytes;
 use jpfe::tokenizer::{is_katakana_word, JapaneseTokenizer, ParsedWord};
 use web_time::Instant;
@@ -188,20 +188,30 @@ impl Book {
             .map(|ws| ws.iter().filter(|w| !known.contains(w.as_str())).cloned().collect())
             .collect();
         let excluded = book.words.iter().map(Vec::len).sum::<usize>() - words.iter().map(Vec::len).sum::<usize>();
-        // Normalized to the first chapter, like the CLI
-        let baseline = vocabulary_ratio(words[0].len(), book.chapters[0].characters);
         let chapters = book
             .chapters
             .iter()
             .zip(&words)
-            .map(|(c, w)| ChapterStat::new(c.index, &c.title, w.len(), c.characters, baseline))
+            // No reference chapter: the viewer shows the density itself, not relative to the first chapter
+            .map(|(c, w)| ChapterStat::new(c.index, &c.title, w.len(), c.characters, 0.0))
             .collect();
-        BookStats { chapters, words, excluded }
+        // Distinct words, as a chapter's list can repeat earlier ones when previous words are shown
+        let mut seen = HashSet::new();
+        let learned_so_far = words
+            .iter()
+            .map(|ws| {
+                seen.extend(ws.iter().map(String::as_str));
+                seen.len()
+            })
+            .collect();
+        BookStats { chapters, learned_so_far, words, excluded }
     }
 }
 
 pub struct BookStats {
     pub chapters: Vec<ChapterStat>,
+    /// Words to learn from the start of the book up to and including each chapter
+    pub learned_so_far: Vec<usize>,
     /// Remaining words of each chapter
     pub words: Vec<Vec<String>>,
     /// How many of the book's words were removed because they are learned in other books

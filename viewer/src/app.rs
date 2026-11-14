@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use egui::{Color32, RichText, Ui};
-use egui_plot::{GridInput, GridMark, HLine, HoverPosition, Line, LineStyle, Plot, Points, VLine};
+use egui_plot::{GridInput, GridMark, HoverPosition, Line, Plot, Points, VLine};
 use jpfe::chart::{format_count, format_ratio, log_ticks};
-use jpfe::models::ChapterStat;
 use jpfe::tokenizer::{JapaneseTokenizer, TOKENIZER_FILES};
 use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
@@ -88,12 +87,19 @@ impl LoadTimes {
     }
 }
 
+/// The vocabulary density counts new words per this many characters (about a sentence).
+const DENSITY_CHARACTERS: f64 = 100.0;
+
+/// Log scale of each plot by default: new words, characters, density, words learned so far.
+const DEFAULT_LOG_SCALES: [bool; 4] = [true, false, true, false];
+
 /// Everything remembered between sessions, besides the files and analyses.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct SavedState {
     settings: Settings,
-    log_scales: [bool; 3],
+    /// Log scale of each plot, in the order of [`DEFAULT_LOG_SCALES`] (a list, so states saved with fewer plots load)
+    log_scales: Vec<bool>,
     shown: Option<u64>,
     next_id: u64,
     books: Vec<SavedBook>,
@@ -103,7 +109,7 @@ struct SavedState {
 
 impl Default for SavedState {
     fn default() -> Self {
-        Self { settings: Settings::default(), log_scales: [true, false, true], shown: None, next_id: 0, books: Vec::new(), debug: false }
+        Self { settings: Settings::default(), log_scales: DEFAULT_LOG_SCALES.to_vec(), shown: None, next_id: 0, books: Vec::new(), debug: false }
     }
 }
 
@@ -118,8 +124,8 @@ pub struct ViewerApp {
     /// Bumped whenever books are added or removed, to invalidate `stats`
     generation: u64,
     stats: Option<(StatsKey, BookStats)>,
-    /// Log scale for each plot, in display order (words, characters, density)
-    log_scales: [bool; 3],
+    /// Log scale of each plot, in the order of [`DEFAULT_LOG_SCALES`]
+    log_scales: [bool; 4],
     /// Settings the word lists are built with, and the ones being edited in the settings window
     settings: Settings,
     edited_settings: Settings,
@@ -183,7 +189,7 @@ impl ViewerApp {
             shown: 0,
             generation: 0,
             stats: None,
-            log_scales: [true, false, true],
+            log_scales: DEFAULT_LOG_SCALES,
             settings: Settings::default(),
             edited_settings: Settings::default(),
             show_settings: false,
@@ -284,7 +290,7 @@ impl ViewerApp {
                 let state: SavedState = bytes.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
                 self.settings = state.settings;
                 self.edited_settings = state.settings;
-                self.log_scales = state.log_scales;
+                self.log_scales = std::array::from_fn(|i| state.log_scales.get(i).copied().unwrap_or(DEFAULT_LOG_SCALES[i]));
                 self.debug = state.debug;
                 self.wanted_shown = state.shown;
                 self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
@@ -489,7 +495,7 @@ impl ViewerApp {
         books.sort_by_key(|b| b.id);
         SavedState {
             settings: self.settings,
-            log_scales: self.log_scales,
+            log_scales: self.log_scales.to_vec(),
             debug: self.debug,
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
@@ -846,18 +852,54 @@ impl ViewerApp {
             }
         }
 
-        let chapters = &stats.chapters;
-        let [words_log, characters_log, density_log] = self.log_scales;
         let metrics = [
-            Metric { title: "New words to learn", hint: None, short: "Words", log: words_log, color: palette.teal, value: |s| s.filtered_words as f64, format: format_count, baseline: None },
-            Metric { title: "Chapter length (characters)", hint: None, short: "Characters", log: characters_log, color: palette.purple, value: |s| s.characters as f64, format: format_count, baseline: None },
-            Metric { title: "Vocabulary density", hint: Some("New words ÷ characters, relative to the first chapter"), short: "Density", log: density_log, color: palette.blue, value: |s| s.normalized_ratio, format: format_ratio, baseline: Some(1.0) },
+            Metric {
+                title: "New words to learn",
+                hint: None,
+                short: "Words",
+                scale: 0,
+                color: palette.teal,
+                value: |s, i| s.chapters[i].filtered_words as f64,
+                format: format_count,
+                total: false,
+            },
+            Metric {
+                title: "Words learned so far",
+                hint: Some("All the words to learn from the start of the book up to and including each chapter"),
+                short: "Learned",
+                scale: 3,
+                color: palette.green,
+                value: |s, i| s.learned_so_far[i] as f64,
+                format: format_count,
+                total: true,
+            },
+            Metric {
+                title: "Chapter length (characters)",
+                hint: None,
+                short: "Characters",
+                scale: 1,
+                color: palette.purple,
+                value: |s, i| s.chapters[i].characters as f64,
+                format: format_count,
+                total: false,
+            },
+            Metric {
+                title: "Vocabulary density",
+                hint: Some("New words per 100 characters (about a sentence): how many words to learn for the same amount of reading"),
+                short: "Density",
+                scale: 2,
+                color: palette.blue,
+                value: |s, i| s.chapters[i].raw_ratio * DENSITY_CHARACTERS,
+                format: format_ratio,
+                total: false,
+            },
         ];
-        // Fill the window with the three cards, each adding its margins, border, title row and
-        // the spacing after it; below a minimum height the page scrolls instead
+        // Fill the window with the cards, each adding its margins, border, title row and the
+        // spacing after it; below a minimum height the page scrolls instead
         let card_overhead = 2.0 * 12.0 + 2.0 + 22.0 + 2.0 * ui.spacing().item_spacing.y;
         let header = ui.cursor().top() - top;
-        let height = if stacked { MIN_PLOT_HEIGHT } else { ((viewport_height - header - 3.0 * card_overhead) / 3.0).max(MIN_PLOT_HEIGHT) };
+        let count = metrics.len() as f32;
+        let height = if stacked { MIN_PLOT_HEIGHT } else { ((viewport_height - header - count * card_overhead) / count).max(MIN_PLOT_HEIGHT) };
         // While inspecting (touch screens), the finger is not a hover for egui, so the charts draw
         // the inspected chapter themselves, and a tooltip follows the finger
         let finger = if self.inspecting.active { ui.ctx().input(|i| i.pointer.latest_pos()) } else { None };
@@ -865,20 +907,21 @@ impl ViewerApp {
         let mut toggled = None;
         let mut plot_rects = Vec::with_capacity(metrics.len());
         let mut inspected = None;
-        for (i, metric) in metrics.iter().enumerate() {
+        for metric in &metrics {
             theme::card(palette).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let drawn = metric_plot(ui, metric, chapters, learned_x, height, palette, inspect);
+                let log = self.log_scales[metric.scale];
+                let drawn = metric_plot(ui, metric, log, stats, learned_x, height, palette, inspect);
                 plot_rects.push(drawn.rect);
                 inspected = inspected.or(drawn.inspected);
                 if drawn.toggle {
-                    toggled = Some(i);
+                    toggled = Some(metric.scale);
                 }
             });
         }
         self.plot_rects = plot_rects;
         self.inspected_chapter = inspected;
-        if let (Some(finger), Some(text)) = (finger, inspected.and_then(|x| chapter_text(chapters, x))) {
+        if let (Some(finger), Some(text)) = (finger, inspected.and_then(|x| chapter_text(stats, x))) {
             egui::Area::new(egui::Id::unique("inspected-chapter"))
                 .order(egui::Order::Tooltip)
                 .pivot(egui::Align2::CENTER_BOTTOM)
@@ -930,12 +973,14 @@ struct Metric {
     /// Shown when hovering the title
     hint: Option<&'static str>,
     short: &'static str,
-    log: bool,
+    /// Index of its log scale setting in `log_scales`
+    scale: usize,
     color: Color32,
-    value: fn(&ChapterStat) -> f64,
+    /// Value for the chapter at a position
+    value: fn(&BookStats, usize) -> f64,
     format: fn(&f64) -> String,
-    /// Dashed horizontal reference line
-    baseline: Option<f64>,
+    /// Summarized by its last value (a running total) rather than min, average and max
+    total: bool,
 }
 
 /// A chart being inspected on a touch screen.
@@ -956,28 +1001,36 @@ struct DrawnPlot {
 }
 
 /// Draws one plot card.
+#[allow(clippy::too_many_arguments)]
 fn metric_plot(
     ui: &mut Ui,
     m: &Metric,
-    chapters: &[ChapterStat],
+    log: bool,
+    stats: &BookStats,
     learned_x: Option<f64>,
     height: f32,
     palette: Palette,
     inspect: Inspect,
 ) -> DrawnPlot {
-    let values: Vec<f64> = chapters.iter().map(m.value).collect();
+    let chapters = &stats.chapters;
+    let values: Vec<f64> = (0..chapters.len()).map(|i| (m.value)(stats, i)).collect();
     let (min, max) = values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     let avg = values.iter().sum::<f64>() / values.len().max(1) as f64;
     let f = m.format;
     let mut toggle = false;
     let wide = ui.available_width() > 640.0;
-    let summary = RichText::new(format!("min {} · avg {} · max {}", f(&min), f(&avg), f(&max))).small().color(palette.secondary_text);
+    let summary = if m.total {
+        format!("total {}", f(values.last().unwrap_or(&0.0)))
+    } else {
+        format!("min {} · avg {} · max {}", f(&min), f(&avg), f(&max))
+    };
+    let summary = RichText::new(summary).small().color(palette.secondary_text);
     ui.horizontal_wrapped(|ui| {
         let title = ui.label(RichText::new(m.title).strong());
         if let Some(hint) = m.hint {
             title.on_hover_text(hint);
         }
-        let (scale, other) = if m.log { ("log scale", "linear") } else { ("linear scale", "log") };
+        let (scale, other) = if log { ("log scale", "linear") } else { ("linear scale", "log") };
         let button = egui::Button::new(RichText::new(format!("{scale} ⇄")).small().color(palette.accent)).frame(false);
         toggle = ui
             .add(button)
@@ -993,18 +1046,17 @@ fn metric_plot(
     }
 
     // Log axes plot log10 of the values; non-positive values cannot be shown there
-    let to_y = |v: f64| if m.log { v.log10() } else { v };
+    let to_y = |v: f64| if log { v.log10() } else { v };
     let points: Vec<[f64; 2]> = chapters
         .iter()
         .zip(&values)
-        .filter(|&(_, &v)| !m.log || v > 0.0)
+        .filter(|&(_, &v)| !log || v > 0.0)
         .map(|(s, &v)| [s.chapter_index as f64, to_y(v)])
         .collect();
 
-    let log = m.log;
     let x_ticks = (ui.available_width() as f64 / 70.0).clamp(3.0, 12.0);
     // The scale is part of the id, so switching it resets the y range
-    let mut plot = Plot::new(("metric", m.short, m.log))
+    let mut plot = Plot::new(("metric", m.short, log))
         .height(height)
         // Hover only: no panning or zooming, and drags go to the page (scrolling on touch screens)
         .sense(egui::Sense::hover())
@@ -1024,12 +1076,9 @@ fn metric_plot(
         .x_grid_spacer(move |input| nice_grid(input, x_ticks, 1.0))
         .x_axis_formatter(|mark, _| if mark.value.fract() == 0.0 { format!("{:.0}", mark.value) } else { String::new() })
         .y_axis_formatter(move |mark, _| f(&if log { 10f64.powf(mark.value) } else { mark.value }))
-        .label_formatter(move |pos| hover_text(pos, chapters));
-    plot = if m.log { plot.y_grid_spacer(log_grid) } else { plot.y_grid_spacer(|input| nice_grid(input, 5.0, 0.0)) };
+        .label_formatter(move |pos| hover_text(pos, stats));
+    plot = if log { plot.y_grid_spacer(log_grid) } else { plot.y_grid_spacer(|input| nice_grid(input, 5.0, 0.0)) };
     let shown = plot.show(ui, |plot_ui| {
-        if let Some(b) = m.baseline {
-            plot_ui.hline(HLine::new("Baseline", to_y(b)).color(palette.secondary_text).style(LineStyle::dashed_loose()).width(1.0));
-        }
         if let Some(x) = learned_x {
             plot_ui.vline(VLine::new("Learned up to here", x).color(palette.orange).width(2.0));
         }
@@ -1045,23 +1094,25 @@ fn metric_plot(
 }
 
 /// Every metric of the chapter under the cursor.
-fn hover_text(pos: &HoverPosition<'_>, chapters: &[ChapterStat]) -> Option<String> {
+fn hover_text(pos: &HoverPosition<'_>, stats: &BookStats) -> Option<String> {
     let x = match pos {
         HoverPosition::NearDataPoint { position, .. } | HoverPosition::Elsewhere { position } => position.x,
     };
-    chapter_text(chapters, x)
+    chapter_text(stats, x)
 }
 
 /// Every metric of the chapter at `x` on the chapter axis.
-fn chapter_text(chapters: &[ChapterStat], x: f64) -> Option<String> {
-    let s = chapters.iter().find(|s| s.chapter_index as f64 == x.round())?;
+fn chapter_text(stats: &BookStats, x: f64) -> Option<String> {
+    let i = stats.chapters.iter().position(|s| s.chapter_index as f64 == x.round())?;
+    let s = &stats.chapters[i];
     Some(format!(
-        "{}: {}\nNew words: {}\nCharacters: {}\nNormalized ratio: {}",
+        "{}: {}\nNew words: {}\nLearned so far: {}\nCharacters: {}\nDensity: {} per 100 characters",
         s.chapter_index,
         s.title,
         format_count(&(s.filtered_words as f64)),
+        format_count(&(stats.learned_so_far[i] as f64)),
         format_count(&(s.characters as f64)),
-        format_ratio(&s.normalized_ratio),
+        format_ratio(&(s.raw_ratio * DENSITY_CHARACTERS)),
     ))
 }
 
