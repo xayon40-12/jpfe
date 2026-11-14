@@ -118,7 +118,7 @@ mod native {
 mod web {
     use super::{Inbox, Incoming};
     use anyhow::{anyhow, Result};
-    use jpfe::tokenizer::{JapaneseTokenizer, DICTIONARY_FILES};
+    use jpfe::tokenizer::{JapaneseTokenizer, TOKENIZER_FILES};
     use std::io::Read;
     use wasm_bindgen::JsCast;
 
@@ -153,7 +153,7 @@ mod web {
 
     /// Download the compressed dictionary files of `version`.
     pub fn download_dictionary(inbox: &Inbox, ctx: &egui::Context, version: &str) {
-        for name in DICTIONARY_FILES {
+        for name in TOKENIZER_FILES {
             let (inbox, ctx) = (inbox.clone(), ctx.clone());
             // The version in the URL avoids getting older files from the HTTP cache
             ehttp::fetch(ehttp::Request::get(format!("assets/dict/{name}.zst?v={version}")), move |result| {

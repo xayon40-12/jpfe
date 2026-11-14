@@ -9,7 +9,7 @@ A fast, precision Rust CLI tool designed for Japanese language learners and NLP 
 - **Accurate Lemmatization (辞書形 / 原形)**: Converts all inflected verbs, adjectives, and auxiliaries back to their base elementary dictionary forms (e.g., `追い出された` → `追い出す`, `教わった` → `教わる`, `死んでしまった` → `死ぬ`, `美しかった` → `美味しい`).
 - **True Root Verb Extraction**: Accurately maps potential forms (可能動詞 / 可能形 like `吸える` → `吸う`, `起こせる` → `起こす`, `行ける` → `行く`, `話せる` → `話す`, `読める` → `読む`, `見れる` → `見る`), passive forms, and causative forms back to their elementary root dictionary verbs, avoiding redundant headwords.
 - **Modern Comprehensive Dictionary (UniDic)**: Powered by NINJAL's modern **UniDic** dictionary, providing accurate lexical analysis with strict separation of lemmas (*goiso*) from conjugated word forms, with optional external dictionary support via `--dict-path`.
-- **Compounds Kept Whole**: UniDic splits text into short units, so idioms and compounds such as `神出鬼没`, `一目瞭然`, `図書館` or `魔法使い` would come out as pieces (`神出` + `鬼没`). About 6,500 kanji compounds that UniDic lacks are added as a user dictionary (`src/compounds.csv`, generated from IPADIC's nouns by `scripts/gen-compounds.py`; IPADIC's license is in `src/compounds-LICENSE.txt`). A few verbs that UniDic lists in a derived form are mapped to the word a dictionary has (`研ぎ澄ませる` → `研ぎ澄ます`, `計り知れる` → `計り知れない`).
+- **Words as a Dictionary Has Them (JMdict)**: UniDic splits text into short units, so idioms and compounds such as `神出鬼没`, `冒険者`, `お嬢様` or `魔法使い` would come out as pieces (`神出` + `鬼没`). Consecutive tokens that form a [JMdict](https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project) headword, the dictionary behind 10ten and most Yomitan setups, are merged into that word. Only word building is merged: phrases (`頭を下げる`), inflections (`知らない`), productive endings (`歩き始める`, `大きくなる`) and numbers with counters (`三人`) stay apart. Verbs written in kana keep their kana spelling when JMdict marks the kanji one as rarely used (`やる`, not `遣る`), and a few verbs UniDic lists in a derived form are mapped to the word a dictionary has (`研ぎ澄ませる` → `研ぎ澄ます`).
 - **Both EPUB and PDF Support**:
   - **EPUB**: Automatically parses container, manifest, spine, and TOC; safely strips `<rt>` and `<rp>` ruby tags so furigana annotations do not duplicate or pollute word tokens.
   - **PDF**: Multi-threaded page extraction using `rayon` and `lopdf` with support for Japanese PDF font encodings (including 2-byte `UniJIS-UTF16-H` UTF-16BE streams) and automatic chapter boundary detection. Headings are found anywhere on a page by their font (a Japanese font other than the body text's, at the same size or larger), falling back to names such as `プロローグ` or `第N話` when the PDF uses a single font. An episode's `（前書き）` / `（後書き）` sections stay in that episode, and the cover and `注意事項` pages are skipped. Furigana (text at 60% of the body size or smaller) is removed, like `<rt>` in EPUBs.
@@ -42,6 +42,21 @@ This installs the `jpfe` binary into your `~/.cargo/bin` directory, making it av
 cargo build --release
 ```
 The compiled binary will be located at `./target/release/jpfe`.
+
+Building downloads the dictionaries the first time: lindera fetches UniDic, and `build.rs` runs `scripts/fetch-jmdict.sh` for JMdict (it needs `curl`, `tar` and `python3`).
+
+### Dictionaries and updating JMdict
+- **UniDic** is pinned by the lindera version in `Cargo.lock`.
+- **JMdict** is pinned in `jmdict.lock`: a release of [jmdict-simplified](https://github.com/scriptin/jmdict-simplified), which publishes JMdict as JSON every week and keeps the older releases, and the SHA-256 of its archive. `scripts/fetch-jmdict.sh` downloads that release, refuses it if the checksum differs, and extracts the headwords into `target/jmdict/headwords.tsv`. Nothing of the dictionary is committed.
+
+To move to the latest JMdict release:
+```bash
+scripts/fetch-jmdict.sh --update   # pins the latest release in jmdict.lock and extracts it
+cargo test --release               # sentences with known words must still come out right
+```
+Then compare a book's word lists before and after (run `jpfe` on it with both versions and `diff` the `words/` folders), and commit `jmdict.lock` once the changes look right. Pushing it to `main` rebuilds the web viewer with that release, and the viewer analyzes books again with it. The extraction stops if a release has far fewer headwords than expected.
+
+JMdict is the property of the [Electronic Dictionary Research and Development Group](https://www.edrdg.org/) and is used under its [licence](https://www.edrdg.org/edrdg/licence.html) (CC BY-SA 4.0).
 
 ---
 
@@ -128,13 +143,13 @@ cargo run --release -p jpfe-viewer
 The dictionary is embedded, as in the CLI. Japanese text uses a system font (Hiragino on macOS, Noto Sans CJK on Linux, Yu Gothic / Meiryo on Windows).
 
 ### Build the web version
-Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary (about 35 MB, zstd-compressed) and Noto Sans JP (4 MB), and keeps the unpacked dictionary in browser storage. On later visits it only fetches `assets/dict/version.txt` and downloads the dictionary again when that version changed.
+Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary (about 35 MB, zstd-compressed), the JMdict headwords (2 MB) and Noto Sans JP (4 MB), and keeps the compressed dictionaries in browser storage. On later visits it only fetches `assets/dict/version.txt` and downloads the dictionaries again when that version changed.
 ```bash
 rustup target add wasm32-unknown-unknown   # once
-./viewer/build-web-assets.sh               # dictionary and font into viewer/assets/ (needs zstd and curl)
+./viewer/build-web-assets.sh               # dictionaries and font into viewer/assets/ (needs zstd, curl and python3)
 cd viewer && trunk serve --release         # or `trunk build --release` for viewer/dist/
 ```
-`.github/workflows/pages.yml` builds and publishes it when a push to `main` changes the code (or when started from the Actions tab). It caches the compiled dependencies and the dictionary, which is only rebuilt when `Cargo.lock` or `build-web-assets.sh` changes. Enable it once in the repository's **Settings → Pages → Source: GitHub Actions**. The published dictionary includes UniDic's BSD license (`assets/dict/UNIDIC-LICENSE.txt`); Noto Sans JP is under the SIL Open Font License.
+`.github/workflows/pages.yml` builds and publishes it when a push to `main` changes the code or `jmdict.lock` (or when started from the Actions tab). It caches the compiled dependencies and the dictionaries, which are only prepared again when `Cargo.lock`, `jmdict.lock` or the scripts change. Enable it once in the repository's **Settings → Pages → Source: GitHub Actions**. The published dictionaries include UniDic's BSD license (`assets/dict/UNIDIC-LICENSE.txt`) and JMdict's attribution (`assets/dict/JMDICT-LICENSE.txt`); Noto Sans JP is under the SIL Open Font License.
 
 ---
 

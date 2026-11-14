@@ -4,7 +4,7 @@ use egui::{Color32, RichText, Ui};
 use egui_plot::{GridInput, GridMark, HLine, HoverPosition, Line, LineStyle, Plot, Points, VLine};
 use jpfe::chart::{format_count, format_ratio, log_ticks};
 use jpfe::models::ChapterStat;
-use jpfe::tokenizer::{JapaneseTokenizer, DICTIONARY_FILES};
+use jpfe::tokenizer::{JapaneseTokenizer, TOKENIZER_FILES};
 use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
 
@@ -235,7 +235,7 @@ impl ViewerApp {
                                 storage::write(&self.inbox, ctx, Key::DictionaryFile(name.clone()), &bytes);
                                 compressed.push((name, bytes));
                                 *received += 1;
-                                if *received == DICTIONARY_FILES.len() {
+                                if *received == TOKENIZER_FILES.len() {
                                     self.load_times.fetched("downloading the dictionary");
                                 }
                             }
@@ -248,7 +248,7 @@ impl ViewerApp {
                     if let Some((version, written)) = &mut self.dictionary_writes {
                         *written += 1;
                         // Written last, so an interrupted download is never taken as complete
-                        if *written == DICTIONARY_FILES.len() {
+                        if *written == TOKENIZER_FILES.len() {
                             storage::write(&self.inbox, ctx, Key::DictionaryVersion, version.as_bytes());
                             self.dictionary_writes = None;
                         }
@@ -303,11 +303,11 @@ impl ViewerApp {
                         Some(bytes) => {
                             compressed.push((name.clone(), bytes));
                             *received += 1;
-                            if *received == DICTIONARY_FILES.len() {
+                            if *received == TOKENIZER_FILES.len() {
                                 self.load_times.fetched("reading the dictionary");
                             }
                             // One file at a time, to keep memory low
-                            let next = DICTIONARY_FILES.iter().position(|f| *f == name).and_then(|i| DICTIONARY_FILES.get(i + 1));
+                            let next = TOKENIZER_FILES.iter().position(|f| *f == name).and_then(|i| TOKENIZER_FILES.get(i + 1));
                             if let Some(next) = next {
                                 storage::read(&self.inbox, ctx, Key::DictionaryFile(next.to_string()));
                             }
@@ -454,15 +454,12 @@ impl ViewerApp {
                         }
                         Err(e) => self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}")),
                     }
-                } else if files.len() == DICTIONARY_FILES.len() {
+                } else if files.len() == TOKENIZER_FILES.len() {
                     let (version, mut files) = (version.clone(), std::mem::take(files));
                     log::info!("Dictionary {version} {}", if *from_storage { "from storage" } else { "downloaded" });
-                    let dictionary = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::dictionary_from_files(|name| files.remove(name)));
-                    self.dictionary = match dictionary {
-                        Ok(dictionary) => DictionaryState::Ready {
-                            tokenizer: Box::new(JapaneseTokenizer::with_dictionary(dictionary, true, false)),
-                            version,
-                        },
+                    let tokenizer = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::tokenizer_from_files(|name| files.remove(name), true, false));
+                    self.dictionary = match tokenizer {
+                        Ok(tokenizer) => DictionaryState::Ready { tokenizer: Box::new(tokenizer), version },
                         Err(e) => DictionaryState::Failed(format!("{e:#}")),
                     };
                 }
@@ -476,7 +473,7 @@ impl ViewerApp {
     fn read_stored_dictionary(&mut self, ctx: &egui::Context, version: String) {
         self.load_times.fetching_since = Some(Instant::now());
         // The others are read one after the other, as each one arrives
-        storage::read(&self.inbox, ctx, Key::DictionaryFile(DICTIONARY_FILES[0].to_string()));
+        storage::read(&self.inbox, ctx, Key::DictionaryFile(TOKENIZER_FILES[0].to_string()));
         self.dictionary = DictionaryState::Loading { version, from_storage: true, compressed: Vec::new(), files: HashMap::new(), received: 0 };
     }
 
@@ -555,6 +552,9 @@ impl ViewerApp {
             .resizable(false)
             .default_width(380.0)
             .max_width(ctx.content_rect().width() - 24.0)
+            // Scrolls when the screen is too short for it (phones)
+            .max_height(ctx.content_rect().height() - 96.0)
+            .vscroll(true)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
             .show(ctx, |ui| {
                 // Slider tracks use the control fill, which is white on the white window
@@ -585,6 +585,19 @@ impl ViewerApp {
                 ui.separator();
                 ui.checkbox(&mut self.debug, "Show debug information");
                 note(ui, "Load times and storage errors, under the Open button.");
+
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let small = |text: &str| egui::RichText::new(text).small().color(palette.secondary_text);
+                    ui.label(small("Words are found with "));
+                    ui.hyperlink_to(small("UniDic").color(palette.accent), "https://clrd.ninjal.ac.jp/unidic/");
+                    ui.label(small(" (BSD) and "));
+                    ui.hyperlink_to(small("JMdict").color(palette.accent), "https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project");
+                    ui.label(small(", the property of the EDRDG, used under "));
+                    ui.hyperlink_to(small("CC BY-SA 4.0").color(palette.accent), "https://www.edrdg.org/edrdg/licence.html");
+                    ui.label(small("."));
+                });
 
                 ui.horizontal(|ui| {
                     if ui.button("Restore defaults").clicked() {
@@ -630,7 +643,7 @@ impl ViewerApp {
         }
         ui.label(RichText::new("You can also drop files on the window.").small().color(palette.secondary_text));
 
-        let total = DICTIONARY_FILES.len();
+        let total = TOKENIZER_FILES.len();
         match &self.dictionary {
             DictionaryState::Checking { .. } => {
                 ui.add(egui::ProgressBar::new(0.0).text("Checking the dictionary…"));

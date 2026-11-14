@@ -1,0 +1,3 @@
+# JMdict release used to merge tokens into dictionary words (see scripts/fetch-jmdict.sh)
+version=3.6.2+20261109214828
+sha256=acf4beb64e7a0bb8f44b3aae9bf2b81cb0ecde462fb3679264ef66e92f25c04a

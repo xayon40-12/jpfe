@@ -23,8 +23,11 @@ fn main() {
         println!("cargo:rerun-if-changed={dir}");
         hash_dir(Path::new(dir), &mut hasher);
     }
-    // Dependency versions (lindera, the PDF and EPUB readers) affect the results too
-    println!("cargo:rerun-if-changed=../Cargo.lock");
-    std::fs::read("../Cargo.lock").unwrap_or_default().hash(&mut hasher);
+    // The results also depend on the dependency versions (lindera, the PDF and EPUB readers) and on the JMdict
+    // release (embedded on the desktop; on the web it also changes the dictionary version)
+    for file in ["../Cargo.lock", "../jmdict.lock", "../scripts/jmdict-headwords.py"] {
+        println!("cargo:rerun-if-changed={file}");
+        std::fs::read(file).unwrap_or_default().hash(&mut hasher);
+    }
     println!("cargo:rustc-env=JPFE_BUILD_ID={:016x}", hasher.finish());
 }
