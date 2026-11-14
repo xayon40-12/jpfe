@@ -573,7 +573,8 @@ impl Reader {
             let side = popup.pivot;
             let mut open = true;
             let mut kanji = None;
-            let shown = egui::Window::new("Dictionary")
+            // Titled with the word as the text writes it (数えられるだろう)
+            let shown = egui::Window::new(RichText::new(surface).size(body * 1.2))
                 .id(egui::Id::unique(("word-popup", popup.id)))
                 .open(&mut open)
                 .collapsible(false)
@@ -586,7 +587,7 @@ impl Reader {
                     // Scrolls when long, and is no taller than its content otherwise (egui's own window
                     // scrolling always takes the maximum height)
                     egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-                        kanji = word_ui(ui, &word.parsed, surface, lookup, body, palette);
+                        kanji = word_ui(ui, &word.parsed, lookup, body, palette);
                     });
                 });
             self.word_popup_rect = shown.map(|s| s.response.rect);
@@ -632,6 +633,27 @@ impl Reader {
             }
         }
     }
+}
+
+/// `word` at `size`, with each kanji KANJIDIC has as a link; returns the kanji that was clicked.
+fn kanji_links(ui: &mut Ui, word: &str, size: f32, lookup: Option<&Lookup>, palette: Palette) -> Option<char> {
+    let mut clicked = None;
+    let text_color = ui.visuals().text_color();
+    for c in word.chars() {
+        let text = RichText::new(c.to_string()).size(size);
+        if !(is_cjk_kanji(c) && lookup.is_some_and(|l| l.kanji.lookup(c).is_some())) {
+            ui.label(text.color(text_color));
+            continue;
+        }
+        let label = ui.add(egui::Label::new(text.color(palette.accent)).sense(Sense::click()));
+        if label.hovered() {
+            ui.painter().hline(label.rect.x_range(), label.rect.bottom() - 1.0, egui::Stroke::new(1.0, palette.accent));
+        }
+        if label.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Show this kanji").clicked() {
+            clicked = Some(c);
+        }
+    }
+    clicked
 }
 
 /// Width of the word and kanji windows, in their font sizes.
@@ -702,8 +724,9 @@ fn readings_parts<'a>(readings: &[&'a str], palette: Palette) -> Vec<(&'a str, C
     parts
 }
 
-/// The word with its readings, then its definitions; returns a kanji of the word that was clicked.
-fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup>, body: f32, palette: Palette) -> Option<char> {
+/// The word with its other spellings and its readings, what its conjugation means, then its definitions;
+/// returns a kanji of the word that was clicked.
+fn word_ui(ui: &mut Ui, word: &ParsedWord, lookup: Option<&Lookup>, body: f32, palette: Palette) -> Option<char> {
     let mut clicked = None;
     let text_color = ui.visuals().text_color();
     let note = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).size(body * 0.8).color(palette.secondary_text));
@@ -722,22 +745,14 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
     }
     readings.retain(|r| *r != word.base_word);
 
+    let others: Vec<&str> = entries.first().map_or(Vec::new(), |e| e.spellings.iter().copied().filter(|s| *s != word.base_word).collect());
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for c in word.base_word.chars() {
-            let known = is_cjk_kanji(c) && lookup.is_some_and(|l| l.kanji.lookup(c).is_some());
-            let text = RichText::new(c.to_string()).size(body * 1.5);
-            if known {
-                let label = ui.add(egui::Label::new(text.color(palette.accent)).sense(Sense::click()));
-                if label.hovered() {
-                    ui.painter().hline(label.rect.x_range(), label.rect.bottom() - 1.0, egui::Stroke::new(1.0, palette.accent));
-                }
-                if label.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Show this kanji").clicked() {
-                    clicked = Some(c);
-                }
-            } else {
-                ui.label(text.color(text_color));
-            }
+        clicked = kanji_links(ui, &word.base_word, body * 1.5, lookup, palette);
+        // The word's other spellings, smaller
+        for other in &others {
+            ui.label(RichText::new(", ").size(body * 1.1).color(palette.secondary_text));
+            clicked = kanji_links(ui, other, body * 1.1, lookup, palette).or(clicked);
         }
         // Each reading stays whole: a reading that does not fit moves to the next line
         let parts = readings_parts(&readings, palette);
@@ -750,21 +765,9 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
             i = end;
         }
     });
-    if let Some(first) = entries.first() {
-        let others: Vec<&str> = first.spellings.iter().copied().filter(|s| *s != word.base_word).collect();
-        if !others.is_empty() {
-            note(ui, &format!("Also written {}", others.join("・")));
-        }
-    }
-    // As the text writes it, and what its conjugation means (数えられる: passive or potential (られる))
-    let written = if surface != word.base_word { format!("Written {surface} in the text") } else { String::new() };
+    // What the conjugation means (passive or potential (られる), past (た)), in the color of grammar
     if !word.forms.is_empty() {
-        // The forms in the color of grammar, like parts of speech
-        let lead = if written.is_empty() { "Here: ".to_string() } else { format!("{written}: ") };
-        let forms = word.forms.join(", ");
-        ui.label(colored(ui, &[(&lead, palette.secondary_text), (&forms, palette.grammar)], body * 0.8, false));
-    } else if !written.is_empty() {
-        note(ui, &written);
+        ui.label(colored(ui, &[(&word.forms.join(", "), palette.grammar)], body * 0.9, false));
     }
     let Some(lookup) = lookup else {
         note(ui, "The dictionary is still loading.");
