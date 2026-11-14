@@ -173,6 +173,11 @@ impl Book {
             .collect()
     }
 
+    /// The text of the chapter at `pos`.
+    pub fn chapter_text(&self, pos: usize) -> &str {
+        self.texts.get(pos).map_or("", |c| c.text.as_str())
+    }
+
     pub fn chapter_label(&self, pos: usize) -> String {
         let c = &self.chapters[pos];
         format!("{}: {}", c.index, c.title)
@@ -329,7 +334,7 @@ mod tests {
     }
 
     fn tokens(words: &[&str]) -> Vec<ParsedWord> {
-        words.iter().map(|w| ParsedWord { base_word: w.to_string(), pronunciation: String::new(), pos: "名詞".into() }).collect()
+        words.iter().map(|w| ParsedWord { base_word: w.to_string(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }).collect()
     }
 
     #[test]

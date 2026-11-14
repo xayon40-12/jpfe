@@ -1,3 +1,5 @@
-# JMdict release used to merge tokens into dictionary words (see scripts/fetch-jmdict.sh)
+# JMdict release used to merge tokens into dictionary words, and for the reader's definitions and kanji
+# (see scripts/fetch-jmdict.sh)
 version=3.6.2+20261109214828
 sha256=acf4beb64e7a0bb8f44b3aae9bf2b81cb0ecde462fb3679264ef66e92f25c04a
+kanjidic_sha256=3a2e9c19abb75f416bdcb2b03818334651419ffdcc7028d1e3e86e697cad0019

@@ -47,7 +47,7 @@ Building downloads the dictionaries the first time: lindera fetches UniDic, and 
 
 ### Dictionaries and updating JMdict
 - **UniDic** is pinned by the lindera version in `Cargo.lock`.
-- **JMdict** is pinned in `jmdict.lock`: a release of [jmdict-simplified](https://github.com/scriptin/jmdict-simplified), which publishes JMdict as JSON every week and keeps the older releases, and the SHA-256 of its archive. `scripts/fetch-jmdict.sh` downloads that release, refuses it if the checksum differs, and extracts the headwords into `target/jmdict/headwords.tsv`. Nothing of the dictionary is committed.
+- **JMdict** is pinned in `jmdict.lock`: a release of [jmdict-simplified](https://github.com/scriptin/jmdict-simplified), which publishes JMdict and KANJIDIC2 as JSON every week and keeps the older releases, and the SHA-256 of both archives. `scripts/fetch-jmdict.sh` downloads that release, refuses it if a checksum differs, and extracts into `target/jmdict/` the headwords (`headwords.tsv`), and for the viewer's reader the definitions (`definitions.tsv`) and kanji (`kanji.tsv`). Nothing of the dictionary is committed.
 
 To move to the latest JMdict release:
 ```bash
@@ -56,7 +56,7 @@ cargo test --release               # sentences with known words must still come 
 ```
 Then compare a book's word lists before and after (run `jpfe` on it with both versions and `diff` the `words/` folders), and commit `jmdict.lock` once the changes look right. Pushing it to `main` rebuilds the web viewer with that release, and the viewer analyzes books again with it. The extraction stops if a release has far fewer headwords than expected.
 
-JMdict is the property of the [Electronic Dictionary Research and Development Group](https://www.edrdg.org/) and is used under its [licence](https://www.edrdg.org/edrdg/licence.html) (CC BY-SA 4.0).
+JMdict and KANJIDIC2 are the property of the [Electronic Dictionary Research and Development Group](https://www.edrdg.org/) and are used under its [licence](https://www.edrdg.org/edrdg/licence.html) (CC BY-SA 4.0).
 
 ---
 
@@ -126,8 +126,9 @@ To see these statistics as charts, use the viewer below.
 - **Left panel**: one entry per loaded EPUB/PDF (open them with the button or drop them on the window), each with a **Learned up to (included)** chapter selector. It starts at *Not started*, so loading a book does not mark anything as learned.
 - **Central panel**: pick the book to show. Its word lists leave out every word you have learned in the *other* books (their word lists up to the selected chapter), and an orange vertical line marks your progress in the shown book. The plots are, from top to bottom: new words to learn, vocabulary density (new words per 100 words of the chapter: the share of its words that are new), words learned so far (every word to learn from the start of the book up to and including each chapter), and chapter length. They start in log scale; click a plot's "log scale" / "linear scale" label to switch it. Hovering a chapter shows its title and numbers in all the plots.
 - **Download word lists (.zip)**: the shown book's filtered word lists, one `words/chapter_…txt` per chapter, as in the CLI output.
+- **Reader** (📖 button at the top left; 📊 goes back): the selected book's text, full screen, opened at the chapter you learned up to (the first chapter before any), or where you left it if that has not changed. Click or tap any word to see its reading and its JMdict definitions; the kanji of the word, shown larger at the top of that window, can be clicked for their on and kun readings, name readings, meanings, stroke count, school grade and frequency (from KANJIDIC2). Escape or a click beside the words closes the windows. Change the font size by pinching, with Shift + scroll wheel (or Cmd/Ctrl + scroll), or in **⚙ Settings**; it is remembered.
 
-Each book entry also shows how many of its words are left once the words learned in your other books are removed. **⚙ Settings** changes how the word lists are built, with the same meaning and defaults as the CLI options: coverage target (`-p 99`), minimum occurrences in the book (`-m 3`), only words new to the book (opposite of `--show-previous-words`), leaving out katakana-only words (on by default; viewer only), and including particles and auxiliary verbs (`--include-particles`, which analyzes the books again). At the bottom, **Show debug information** (off by default) shows load times and storage errors in the sidebar. The look follows macOS colors and controls, in light or dark mode depending on the system setting.
+Each book entry also shows how many of its words are left once the words learned in your other books are removed. **⚙ Settings** has the reader's font size and changes how the word lists are built, with the same meaning and defaults as the CLI options: coverage target (`-p 99`), minimum occurrences in the book (`-m 3`), only words new to the book (opposite of `--show-previous-words`), leaving out katakana-only words (on by default; viewer only), and including particles and auxiliary verbs (`--include-particles`, which analyzes the books again). At the bottom, **Show debug information** (off by default) shows load times and storage errors in the sidebar. The look follows macOS colors and controls, in light or dark mode depending on the system setting.
 
 Imported books, your progress in each, the settings and the plot scales are remembered: in the browser's private storage (OPFS) on the web, and in the user data folder (e.g. `~/Library/Application Support/jpfe-viewer`) on the desktop. Each book's analysis is cached too, and reused only by the same build of the viewer with the same dictionary; after an update, books are analyzed again from their stored file.
 
@@ -138,7 +139,7 @@ cargo run --release -p jpfe-viewer
 The dictionary is embedded, as in the CLI. Japanese text uses a system font (Hiragino on macOS, Noto Sans CJK on Linux, Yu Gothic / Meiryo on Windows).
 
 ### Build the web version
-Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary (about 35 MB, zstd-compressed), the JMdict headwords (2 MB) and Noto Sans JP (4 MB), and keeps the compressed dictionaries in browser storage. On later visits it only fetches `assets/dict/version.txt` and downloads the dictionaries again when that version changed.
+Everything runs in the browser, so books are never uploaded anywhere. The page downloads the UniDic dictionary (about 35 MB, zstd-compressed), the JMdict headwords (2 MB), the reader's definitions (8 MB) and kanji (0.2 MB), and Noto Sans JP (4 MB), and keeps the compressed dictionaries in browser storage. On later visits it only fetches `assets/dict/version.txt` and downloads the dictionaries again when that version changed.
 ```bash
 rustup target add wasm32-unknown-unknown   # once
 ./viewer/build-web-assets.sh               # dictionaries and font into viewer/assets/ (needs zstd, curl and python3)

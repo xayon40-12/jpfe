@@ -2,8 +2,8 @@
 # Prepare viewer/assets/ for the web build:
 # - the compiled UniDic dictionary, zstd-compressed (about 200 MB raw, ~35 MB compressed),
 #   with its BSD license
-# - the JMdict headwords of the release pinned in jmdict.lock (9 MB raw, ~2 MB compressed),
-#   with its CC BY-SA 4.0 attribution
+# - from the JMdict and KANJIDIC2 release pinned in jmdict.lock, with their CC BY-SA 4.0 attribution:
+#   the headwords (9 MB raw, ~2 MB compressed), the reader's definitions (28 MB, ~8 MB) and kanji (0.7 MB, ~0.2 MB)
 # - Noto Sans JP, since browsers do not let the page read system fonts
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,9 +30,12 @@ for f in metadata.json char_def.bin matrix.mtx dict.trie dict.valsidx dict.vals 
 done
 tar -xzOf "$dict/../unidic-mecab-2.1.2.tar.gz" unidic-mecab-2.1.2/BSD > "$out/dict/UNIDIC-LICENSE.txt"
 zstd -19 -q -f target/jmdict/headwords.tsv -o "$out/dict/jmdict.tsv.zst"
+zstd -19 -q -f target/jmdict/definitions.tsv -o "$out/dict/definitions.tsv.zst"
+zstd -19 -q -f target/jmdict/kanji.tsv -o "$out/dict/kanji.tsv.zst"
 jmdict_version=$(sed -n 's/^version=//p' jmdict.lock)
 printf '%s\n' \
-  "jmdict.tsv.zst is derived from JMdict (release $jmdict_version of https://github.com/scriptin/jmdict-simplified)," \
+  "jmdict.tsv.zst and definitions.tsv.zst are derived from JMdict, and kanji.tsv.zst from KANJIDIC2" \
+  "(release $jmdict_version of https://github.com/scriptin/jmdict-simplified)," \
   "the property of the Electronic Dictionary Research and Development Group (https://www.edrdg.org/)," \
   "used in conformance with the Group's licence (https://www.edrdg.org/edrdg/licence.html):" \
   "Creative Commons Attribution-ShareAlike 4.0 International (https://creativecommons.org/licenses/by-sa/4.0/)." \

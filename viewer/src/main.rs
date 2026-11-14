@@ -4,6 +4,7 @@ mod app;
 mod chart;
 mod book;
 mod platform;
+mod reader;
 mod storage;
 mod theme;
 

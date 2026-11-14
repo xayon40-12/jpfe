@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use anyhow::{Context, Result};
 use lindera::dictionary::{load_fs_dictionary, Dictionary};
@@ -24,6 +25,8 @@ pub struct ParsedWord {
     pub base_word: String,
     pub pronunciation: String,
     pub pos: String,
+    /// Where the word is written in the tokenized text (bytes): its surface, which may be conjugated (言っ)
+    pub span: Range<usize>,
 }
 
 /// Basic verbs/adjectives normalized to their kana spelling when written in kana: (lemma, word, reading).
@@ -58,6 +61,8 @@ const MAX_RUN: usize = 6;
 struct Token {
     surface: String,
     fields: String,
+    /// Bytes of the surface in the text
+    span: Range<usize>,
 }
 
 const FIELD_SEPARATOR: char = '\u{1f}';
@@ -258,7 +263,11 @@ impl JapaneseTokenizer {
         let tokens: Vec<Token> = segmenter
             .segment(Cow::Borrowed(text))?
             .into_iter()
-            .map(|mut t| Token { surface: t.surface.to_string(), fields: t.details().join(&separator) })
+            .map(|mut t| Token {
+                surface: t.surface.to_string(),
+                span: t.byte_start..t.byte_end,
+                fields: t.details().join(&separator),
+            })
             .collect();
         let mut next = 0;
         for (index, token) in tokens.iter().enumerate() {
@@ -271,6 +280,7 @@ impl JapaneseTokenizer {
                     pronunciation: if *reading_in_hiragana { headword.reading.to_string() } else { hiragana_to_katakana(headword.reading) },
                     pos: headword.pos.to_string(),
                     base_word: word,
+                    span: token.span.start..tokens[end - 1].span.end,
                 });
                 continue;
             }
@@ -331,6 +341,7 @@ impl JapaneseTokenizer {
                 pronunciation: if *reading_in_hiragana { katakana_to_hiragana(&reading) } else { reading },
                 pos: pos.to_string(),
                 base_word,
+                span: token.span.clone(),
             });
         }
         Ok(words)
@@ -572,6 +583,16 @@ mod dictionary_tests {
     fn maps_derived_verbs_to_headwords() {
         assert_eq!(words("研ぎ澄ませた"), ["研ぎ澄ます"]);
         assert_eq!(words("計り知れない"), ["計り知れない"]);
+    }
+
+    #[test]
+    fn finds_where_words_are_written() {
+        let text = "冒険者は神出鬼没の怪盗を見た";
+        let mut tokenizer = JapaneseTokenizer::new(None, true, false).unwrap();
+        let spans: Vec<(String, &str)> =
+            tokenizer.tokenize(text).unwrap().into_iter().map(|w| (w.base_word, &text[w.span])).collect();
+        let expected = [("冒険者", "冒険者"), ("神出鬼没", "神出鬼没"), ("怪盗", "怪盗"), ("見る", "見")];
+        assert_eq!(spans, expected.map(|(w, s)| (w.to_string(), s)));
     }
 
     #[test]

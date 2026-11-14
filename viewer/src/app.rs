@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use egui::{Color32, RichText, Ui};
 use egui_plot::{GridInput, GridMark, HoverPosition, Line, Plot, Points, VLine};
 use crate::chart::{format_count, format_ratio, log_ticks};
-use jpfe::tokenizer::{JapaneseTokenizer, TOKENIZER_FILES};
+use jpfe::tokenizer::JapaneseTokenizer;
 use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
 
 use crate::book::{Book, BookStats, CacheKey, PendingBook, SavedBook, Settings};
-use crate::platform::{self, Inbox, Incoming};
+use crate::platform::{self, Inbox, Incoming, WEB_DICTIONARY_FILES};
+use crate::reader::{self, Lookup, Reader};
 use crate::storage::{self, Key};
 use crate::theme::{self, Palette};
 
@@ -107,6 +108,7 @@ struct SavedState {
     books: Vec<SavedBook>,
     /// Show load times and storage errors in the sidebar
     debug: bool,
+    reader_font_size: f32,
 }
 
 impl Default for SavedState {
@@ -118,8 +120,15 @@ impl Default for SavedState {
             next_id: 0,
             books: Vec::new(),
             debug: false,
+            reader_font_size: reader::DEFAULT_FONT_SIZE,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Statistics,
+    Reader,
 }
 
 pub struct ViewerApp {
@@ -143,6 +152,13 @@ pub struct ViewerApp {
     debug: bool,
     /// For each book, its words not learned in the other books
     remaining: Option<(StatsKey, Vec<usize>)>,
+
+    view: View,
+    /// The chapter being read, kept when going back to the statistics
+    reader: Option<Reader>,
+    reader_font_size: f32,
+    /// Definitions and kanji for the reader (web: once the dictionary is loaded)
+    lookup: Option<Lookup>,
 
     /// The saved state has been read; until then nothing is saved, so it is not overwritten
     state_loaded: bool,
@@ -204,6 +220,10 @@ impl ViewerApp {
             show_settings: false,
             debug: false,
             remaining: None,
+            view: View::Statistics,
+            reader: None,
+            reader_font_size: reader::DEFAULT_FONT_SIZE,
+            lookup: platform::embedded_lookup(),
             state_loaded: false,
             saved: None,
             next_id: 0,
@@ -250,7 +270,7 @@ impl ViewerApp {
                                 storage::write(&self.inbox, ctx, Key::DictionaryFile(name.clone()), &bytes);
                                 compressed.push((name, bytes));
                                 *received += 1;
-                                if *received == TOKENIZER_FILES.len() {
+                                if *received == WEB_DICTIONARY_FILES.len() {
                                     self.load_times.fetched("downloading the dictionary");
                                 }
                             }
@@ -263,7 +283,7 @@ impl ViewerApp {
                     if let Some((version, written)) = &mut self.dictionary_writes {
                         *written += 1;
                         // Written last, so an interrupted download is never taken as complete
-                        if *written == TOKENIZER_FILES.len() {
+                        if *written == WEB_DICTIONARY_FILES.len() {
                             storage::write(&self.inbox, ctx, Key::DictionaryVersion, version.as_bytes());
                             self.dictionary_writes = None;
                         }
@@ -301,6 +321,7 @@ impl ViewerApp {
                 self.edited_settings = state.settings;
                 self.log_scales = std::array::from_fn(|i| state.log_scales.get(i).copied().unwrap_or(DEFAULT_LOG_SCALES[i]));
                 self.debug = state.debug;
+                self.reader_font_size = state.reader_font_size.clamp(*reader::FONT_SIZES.start(), *reader::FONT_SIZES.end());
                 self.wanted_shown = state.shown;
                 self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
                 self.to_restore = state.books.clone();
@@ -318,11 +339,11 @@ impl ViewerApp {
                         Some(bytes) => {
                             compressed.push((name.clone(), bytes));
                             *received += 1;
-                            if *received == TOKENIZER_FILES.len() {
+                            if *received == WEB_DICTIONARY_FILES.len() {
                                 self.load_times.fetched("reading the dictionary");
                             }
                             // One file at a time, to keep memory low
-                            let next = TOKENIZER_FILES.iter().position(|f| *f == name).and_then(|i| TOKENIZER_FILES.get(i + 1));
+                            let next = WEB_DICTIONARY_FILES.iter().position(|f| *f == name).and_then(|i| WEB_DICTIONARY_FILES.get(i + 1));
                             if let Some(next) = next {
                                 storage::read(&self.inbox, ctx, Key::DictionaryFile(next.to_string()));
                             }
@@ -469,10 +490,14 @@ impl ViewerApp {
                         }
                         Err(e) => self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}")),
                     }
-                } else if files.len() == TOKENIZER_FILES.len() {
+                } else if files.len() == WEB_DICTIONARY_FILES.len() {
                     let (version, mut files) = (version.clone(), std::mem::take(files));
                     log::info!("Dictionary {version} {}", if *from_storage { "from storage" } else { "downloaded" });
                     let tokenizer = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::tokenizer_from_files(|name| files.remove(name), true, false));
+                    match self.load_times.timed("loading the definitions", || Lookup::from_files(|name| files.remove(name))) {
+                        Ok(lookup) => self.lookup = Some(lookup),
+                        Err(e) => self.errors.push(format!("Definitions unavailable: {e:#}")),
+                    }
                     self.dictionary = match tokenizer {
                         Ok(tokenizer) => DictionaryState::Ready { tokenizer: Box::new(tokenizer), version },
                         Err(e) => DictionaryState::Failed(format!("{e:#}")),
@@ -488,7 +513,7 @@ impl ViewerApp {
     fn read_stored_dictionary(&mut self, ctx: &egui::Context, version: String) {
         self.load_times.fetching_since = Some(Instant::now());
         // The others are read one after the other, as each one arrives
-        storage::read(&self.inbox, ctx, Key::DictionaryFile(TOKENIZER_FILES[0].to_string()));
+        storage::read(&self.inbox, ctx, Key::DictionaryFile(WEB_DICTIONARY_FILES[0].to_string()));
         self.dictionary = DictionaryState::Loading { version, from_storage: true, compressed: Vec::new(), files: HashMap::new(), received: 0 };
     }
 
@@ -506,6 +531,7 @@ impl ViewerApp {
             settings: self.settings,
             log_scales: self.log_scales.to_vec(),
             debug: self.debug,
+            reader_font_size: self.reader_font_size,
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
             books,
@@ -561,7 +587,7 @@ impl ViewerApp {
 
     fn settings_window(&mut self, ctx: &egui::Context, palette: Palette) {
         let mut open = self.show_settings;
-        egui::Window::new("Word list settings")
+        egui::Window::new("Settings")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -580,6 +606,11 @@ impl ViewerApp {
                     ui.label(RichText::new(text).small().color(palette.secondary_text));
                     ui.add_space(4.0);
                 };
+                ui.label("Reader font size");
+                ui.add(egui::Slider::new(&mut self.reader_font_size, reader::FONT_SIZES).suffix(" pt").fixed_decimals(0));
+                note(ui, "In the reader, you can also pinch, or scroll with Shift held down.");
+                ui.separator();
+
                 ui.label("Coverage target");
                 ui.add(egui::Slider::new(&mut s.target_percentage, 50.0..=100.0).suffix(" %").fixed_decimals(1));
                 note(ui, "Each chapter's list stops once its words cover this share of the chapter's words.");
@@ -596,6 +627,7 @@ impl ViewerApp {
 
                 ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
                 note(ui, "Changing this analyzes the books again.");
+
 
                 ui.separator();
                 ui.checkbox(&mut self.debug, "Show debug information");
@@ -616,7 +648,8 @@ impl ViewerApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Restore defaults").clicked() {
-                        *s = Settings::default();
+                        self.edited_settings = Settings::default();
+                        self.reader_font_size = reader::DEFAULT_FONT_SIZE;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(theme::primary_button("Done", palette)).clicked() {
@@ -626,6 +659,95 @@ impl ViewerApp {
                 });
             });
         self.show_settings &= open;
+    }
+
+    /// The small button at the top left that switches between the statistics and the reader.
+    fn view_toggle(&mut self, ui: &mut Ui) {
+        let (icon, hint) = match self.view {
+            View::Statistics => ("📖", "Read the selected book, from the chapter you learned up to"),
+            View::Reader => ("📊", "Back to the statistics"),
+        };
+        let button = egui::Button::new(RichText::new(icon).size(15.0)).min_size(egui::vec2(28.0, 24.0));
+        if ui.add_enabled(!self.books.is_empty(), button).on_hover_text(hint).clicked() {
+            self.toggle_view();
+        }
+    }
+
+    /// The reader opens the selected book at the chapter learned up to (the first one before any), or
+    /// where it was left if that has not changed since.
+    fn toggle_view(&mut self) {
+        if self.view == View::Reader {
+            self.view = View::Statistics;
+            return;
+        }
+        let Some(book) = self.books.get(self.shown) else { return };
+        if self.reader.as_ref().is_none_or(|r| r.book != book.id || r.opened_at != book.learned) {
+            self.reader = Some(Reader::new(book, book.learned.unwrap_or(0)));
+        }
+        self.view = View::Reader;
+    }
+
+    /// The reader, full screen, under a bar to switch views and chapters.
+    fn reader_view(&mut self, ui: &mut Ui, palette: Palette) {
+        let Some(reader) = self.reader.as_mut() else { return };
+        // The book is missing while it is analyzed again: the chapter stays readable, without navigation
+        let book = self.books.iter().find(|b| b.id == reader.book);
+        let mut chapter = reader.chapter;
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            let button = egui::Button::new(RichText::new("📊").size(15.0)).min_size(egui::vec2(28.0, 24.0));
+            toggle = ui.add(button).on_hover_text("Back to the statistics").clicked();
+            // Phones only have room for the chapter
+            if book.is_none() || ui.available_width() > 520.0 {
+                ui.add(egui::Label::new(RichText::new(reader.book_name()).strong()).truncate());
+            }
+            let Some(book) = book else { return };
+            if ui.add_enabled(chapter > 0, egui::Button::new("‹")).on_hover_text("Previous chapter").clicked() {
+                chapter -= 1;
+            }
+            egui::ComboBox::from_id_salt("reader-chapter")
+                // Leaves room for the next chapter and settings buttons
+                .width((ui.available_width() - 80.0).clamp(60.0, 320.0))
+                .height(400.0)
+                .truncate()
+                .selected_text(book.chapter_label(chapter))
+                .show_ui(ui, |ui| {
+                    list_rows(ui, |ui| {
+                        for pos in 0..book.chapters.len() {
+                            ui.selectable_value(&mut chapter, pos, book.chapter_label(pos));
+                        }
+                    });
+                });
+            if ui.add_enabled(chapter + 1 < book.chapters.len(), egui::Button::new("›")).on_hover_text("Next chapter").clicked() {
+                chapter += 1;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new("⚙").selected(self.show_settings)).on_hover_text("Settings, with the font size").clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+            });
+        });
+        if reader.needs_words() {
+            if let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary {
+                // Every word can be looked up, particles included
+                tokenizer.set_include_particles(true);
+                let started = Instant::now();
+                reader.tokenize(tokenizer);
+                log::info!("Reader: chapter tokenized in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+                tokenizer.set_include_particles(self.settings.include_particles);
+            }
+        }
+        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, palette);
+        let chapter = response.chapter.unwrap_or(chapter);
+        if let Some(book) = book.filter(|_| chapter != reader.chapter) {
+            let opened_at = reader.opened_at;
+            let mut next = Reader::new(book, chapter);
+            next.opened_at = opened_at;
+            self.reader = Some(next);
+        }
+        if toggle {
+            self.toggle_view();
+        }
     }
 
     /// Recompute the shown book's statistics if the books or progress changed.
@@ -644,10 +766,11 @@ impl ViewerApp {
     fn sidebar(&mut self, ui: &mut Ui, palette: Palette) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
+            self.view_toggle(ui);
             ui.label(RichText::new("Books").heading());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let button = ui.add(egui::Button::new("⚙ Settings").selected(self.show_settings));
-                if button.on_hover_text("Coverage target, minimum count and other word list settings").clicked() {
+                if button.on_hover_text("Word list settings and the reader's font size").clicked() {
                     self.show_settings = !self.show_settings;
                 }
             });
@@ -658,7 +781,7 @@ impl ViewerApp {
         }
         ui.label(RichText::new("You can also drop files on the window.").small().color(palette.secondary_text));
 
-        let total = TOKENIZER_FILES.len();
+        let total = WEB_DICTIONARY_FILES.len();
         match &self.dictionary {
             DictionaryState::Checking { .. } => {
                 ui.add(egui::ProgressBar::new(0.0).text("Checking the dictionary…"));
@@ -1175,7 +1298,11 @@ impl eframe::App for ViewerApp {
         };
 
         let content = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::same(18));
-        if ui.available_width() < STACK_BELOW_WIDTH {
+        if self.view == View::Reader && self.reader.is_some() {
+            self.plot_rects.clear();
+            let frame = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::symmetric(16, 8));
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| self.reader_view(ui, palette));
+        } else if ui.available_width() < STACK_BELOW_WIDTH {
             // Phones and narrow windows: the books, then the charts, in one scrolling column
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
                 let viewport_height = ui.available_height();
@@ -1221,9 +1348,11 @@ mod tests {
     fn frame(ctx: &egui::Context, press: &mut LongPress, time: f64, events: Vec<Event>) -> bool {
         let input = RawInput { time: Some(time), events, ..Default::default() };
         let chart = [egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(300.0, 200.0))];
-        let _ = ctx.run_ui(input, |ui| {
+        let mut output = ctx.run_ui(input, |ui| {
             ui.ctx().input(|i| press.update(i, &chart));
         });
+        // No renderer applies the font texture in tests
+        output.textures_delta.clear();
         press.active
     }
 

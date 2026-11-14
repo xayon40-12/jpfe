@@ -3,7 +3,23 @@
 
 use std::sync::{Arc, Mutex};
 
+use jpfe::dictionary::{DEFINITIONS_FILE, KANJI_FILE};
+use jpfe::tokenizer::TOKENIZER_FILES;
+
 use crate::storage::Key;
+
+/// Files of the dictionary the web app downloads: the tokenizer's, then the reader's definitions and kanji.
+pub const WEB_DICTIONARY_FILES: [&str; TOKENIZER_FILES.len() + 2] = {
+    let mut files = [""; TOKENIZER_FILES.len() + 2];
+    let mut i = 0;
+    while i < TOKENIZER_FILES.len() {
+        files[i] = TOKENIZER_FILES[i];
+        i += 1;
+    }
+    files[i] = DEFINITIONS_FILE;
+    files[i + 1] = KANJI_FILE;
+    files
+};
 
 /// Results of dialogs, downloads and storage, which arrive outside of the UI code.
 pub enum Incoming {
@@ -72,6 +88,11 @@ mod native {
         Some(JapaneseTokenizer::new(None, true, false))
     }
 
+    /// The definitions and kanji built into the app.
+    pub fn embedded_lookup() -> Option<crate::reader::Lookup> {
+        Some(crate::reader::Lookup::embedded())
+    }
+
     /// San Francisco, the macOS system font.
     const SYSTEM_UI_FONT: &str = "/System/Library/Fonts/SFNS.ttf";
 
@@ -116,9 +137,9 @@ mod native {
 
 #[cfg(target_arch = "wasm32")]
 mod web {
-    use super::{Inbox, Incoming};
+    use super::{Inbox, Incoming, WEB_DICTIONARY_FILES};
     use anyhow::{anyhow, Result};
-    use jpfe::tokenizer::{JapaneseTokenizer, TOKENIZER_FILES};
+    use jpfe::tokenizer::JapaneseTokenizer;
     use std::io::Read;
     use wasm_bindgen::JsCast;
 
@@ -126,6 +147,11 @@ mod web {
     const FONT_URL: &str = "assets/NotoSansJP-Regular.otf";
 
     pub fn embedded_tokenizer() -> Option<Result<JapaneseTokenizer>> {
+        None
+    }
+
+    /// Downloaded with the dictionary instead.
+    pub fn embedded_lookup() -> Option<crate::reader::Lookup> {
         None
     }
 
@@ -153,7 +179,7 @@ mod web {
 
     /// Download the compressed dictionary files of `version`.
     pub fn download_dictionary(inbox: &Inbox, ctx: &egui::Context, version: &str) {
-        for name in TOKENIZER_FILES {
+        for name in WEB_DICTIONARY_FILES {
             let (inbox, ctx) = (inbox.clone(), ctx.clone());
             // The version in the URL avoids getting older files from the HTTP cache
             ehttp::fetch(ehttp::Request::get(format!("assets/dict/{name}.zst?v={version}")), move |result| {

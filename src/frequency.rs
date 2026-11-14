@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     fn token(word: &str) -> ParsedWord {
-        ParsedWord { base_word: word.into(), pronunciation: String::new(), pos: "名詞".into() }
+        ParsedWord { base_word: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }
     }
 
     #[test]
