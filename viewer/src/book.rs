@@ -204,12 +204,15 @@ impl Book {
                 seen.len()
             })
             .collect();
-        BookStats { chapters, learned_so_far, words, excluded }
+        let chapter_words = book.counts.iter().map(|c| c.total).collect();
+        BookStats { chapters, chapter_words, learned_so_far, words, excluded }
     }
 }
 
 pub struct BookStats {
     pub chapters: Vec<ChapterStat>,
+    /// Words each chapter has (counted like the word lists: no particles, unless they are included)
+    pub chapter_words: Vec<usize>,
     /// Words to learn from the start of the book up to and including each chapter
     pub learned_so_far: Vec<usize>,
     /// Remaining words of each chapter

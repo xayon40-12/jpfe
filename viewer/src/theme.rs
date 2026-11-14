@@ -72,6 +72,8 @@ pub fn apply(ctx: &egui::Context) {
         spacing.interact_size.y = 24.0;
         spacing.menu_margin = Margin::same(6);
         spacing.window_margin = Margin::same(12);
+        // Narrow enough for phones, where wider tooltips are cut at the screen edge
+        spacing.tooltip_width = 300.0;
     });
 }
 

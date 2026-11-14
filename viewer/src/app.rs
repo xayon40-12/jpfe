@@ -87,11 +87,13 @@ impl LoadTimes {
     }
 }
 
-/// The vocabulary density counts new words per this many characters (about a sentence).
-const DENSITY_CHARACTERS: f64 = 100.0;
+/// `count` per 100 of `total` (0 for an empty chapter).
+fn per_100(count: usize, total: usize) -> f64 {
+    if total == 0 { 0.0 } else { 100.0 * count as f64 / total as f64 }
+}
 
-/// Log scale of each plot by default: new words, characters, density, words learned so far.
-const DEFAULT_LOG_SCALES: [bool; 4] = [true, false, true, false];
+/// Log scale of each plot by default, in storage order: new words, characters, density, words learned so far.
+const DEFAULT_LOG_SCALES: [bool; 4] = [true; 4];
 
 /// Everything remembered between sessions, besides the files and analyses.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -105,11 +107,21 @@ struct SavedState {
     books: Vec<SavedBook>,
     /// Show load times and storage errors in the sidebar
     debug: bool,
+    /// The vocabulary density counts new words per 100 words of the chapter, rather than per 100 characters
+    density_per_words: bool,
 }
 
 impl Default for SavedState {
     fn default() -> Self {
-        Self { settings: Settings::default(), log_scales: DEFAULT_LOG_SCALES.to_vec(), shown: None, next_id: 0, books: Vec::new(), debug: false }
+        Self {
+            settings: Settings::default(),
+            log_scales: DEFAULT_LOG_SCALES.to_vec(),
+            shown: None,
+            next_id: 0,
+            books: Vec::new(),
+            debug: false,
+            density_per_words: true,
+        }
     }
 }
 
@@ -126,6 +138,8 @@ pub struct ViewerApp {
     stats: Option<(StatsKey, BookStats)>,
     /// Log scale of each plot, in the order of [`DEFAULT_LOG_SCALES`]
     log_scales: [bool; 4],
+    /// The vocabulary density counts new words per 100 words of the chapter, rather than per 100 characters
+    density_per_words: bool,
     /// Settings the word lists are built with, and the ones being edited in the settings window
     settings: Settings,
     edited_settings: Settings,
@@ -190,6 +204,7 @@ impl ViewerApp {
             generation: 0,
             stats: None,
             log_scales: DEFAULT_LOG_SCALES,
+            density_per_words: true,
             settings: Settings::default(),
             edited_settings: Settings::default(),
             show_settings: false,
@@ -292,6 +307,7 @@ impl ViewerApp {
                 self.edited_settings = state.settings;
                 self.log_scales = std::array::from_fn(|i| state.log_scales.get(i).copied().unwrap_or(DEFAULT_LOG_SCALES[i]));
                 self.debug = state.debug;
+                self.density_per_words = state.density_per_words;
                 self.wanted_shown = state.shown;
                 self.next_id = state.books.iter().map(|b| b.id + 1).max().unwrap_or(0).max(state.next_id);
                 self.to_restore = state.books.clone();
@@ -497,6 +513,7 @@ impl ViewerApp {
             settings: self.settings,
             log_scales: self.log_scales.to_vec(),
             debug: self.debug,
+            density_per_words: self.density_per_words,
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
             books,
@@ -862,6 +879,32 @@ impl ViewerApp {
                 value: |s, i| s.chapters[i].filtered_words as f64,
                 format: format_count,
                 total: false,
+                unit: None,
+            },
+            if self.density_per_words {
+                Metric {
+                    title: "Vocabulary density",
+                    hint: Some("New words per 100 words of the chapter: the share of its words that are new (particles not counted)"),
+                    short: "Density",
+                    scale: 2,
+                    color: palette.blue,
+                    value: |s, i| per_100(s.chapters[i].filtered_words, s.chapter_words[i]),
+                    format: format_ratio,
+                    total: false,
+                    unit: Some(("per 100 words", "per 100 characters")),
+                }
+            } else {
+                Metric {
+                    title: "Vocabulary density",
+                    hint: Some("New words per 100 characters (spaces and punctuation included): how many words to learn for the same amount of text"),
+                    short: "Density",
+                    scale: 2,
+                    color: palette.blue,
+                    value: |s, i| per_100(s.chapters[i].filtered_words, s.chapters[i].characters),
+                    format: format_ratio,
+                    total: false,
+                    unit: Some(("per 100 characters", "per 100 words")),
+                }
             },
             Metric {
                 title: "Words learned so far",
@@ -872,6 +915,7 @@ impl ViewerApp {
                 value: |s, i| s.learned_so_far[i] as f64,
                 format: format_count,
                 total: true,
+                unit: None,
             },
             Metric {
                 title: "Chapter length (characters)",
@@ -882,16 +926,7 @@ impl ViewerApp {
                 value: |s, i| s.chapters[i].characters as f64,
                 format: format_count,
                 total: false,
-            },
-            Metric {
-                title: "Vocabulary density",
-                hint: Some("New words per 100 characters (about a sentence): how many words to learn for the same amount of reading"),
-                short: "Density",
-                scale: 2,
-                color: palette.blue,
-                value: |s, i| s.chapters[i].raw_ratio * DENSITY_CHARACTERS,
-                format: format_ratio,
-                total: false,
+                unit: None,
             },
         ];
         // Fill the window with the cards, each adding its margins, border, title row and the
@@ -905,6 +940,7 @@ impl ViewerApp {
         let finger = if self.inspecting.active { ui.ctx().input(|i| i.pointer.latest_pos()) } else { None };
         let inspect = Inspect { finger, chapter: finger.and(self.inspected_chapter) };
         let mut toggled = None;
+        let mut switched = false;
         let mut plot_rects = Vec::with_capacity(metrics.len());
         let mut inspected = None;
         for metric in &metrics {
@@ -917,6 +953,7 @@ impl ViewerApp {
                 if drawn.toggle {
                     toggled = Some(metric.scale);
                 }
+                switched |= drawn.switch_unit;
             });
         }
         self.plot_rects = plot_rects;
@@ -931,6 +968,9 @@ impl ViewerApp {
         }
         if let Some(i) = toggled {
             self.log_scales[i] = !self.log_scales[i];
+        }
+        if switched {
+            self.density_per_words = !self.density_per_words;
         }
     }
 }
@@ -981,6 +1021,8 @@ struct Metric {
     format: fn(&f64) -> String,
     /// Summarized by its last value (a running total) rather than min, average and max
     total: bool,
+    /// Its unit, and the other one a click switches to
+    unit: Option<(&'static str, &'static str)>,
 }
 
 /// A chart being inspected on a touch screen.
@@ -995,6 +1037,8 @@ struct Inspect {
 struct DrawnPlot {
     /// The scale label was clicked
     toggle: bool,
+    /// The unit label was clicked
+    switch_unit: bool,
     rect: egui::Rect,
     /// Chapter under the finger, if it is on this plot
     inspected: Option<f64>,
@@ -1018,6 +1062,7 @@ fn metric_plot(
     let avg = values.iter().sum::<f64>() / values.len().max(1) as f64;
     let f = m.format;
     let mut toggle = false;
+    let mut switch_unit = false;
     let wide = ui.available_width() > 640.0;
     let summary = if m.total {
         format!("total {}", f(values.last().unwrap_or(&0.0)))
@@ -1037,6 +1082,14 @@ fn metric_plot(
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .on_hover_text(format!("Switch to a {other} scale"))
             .clicked();
+        if let Some((unit, other)) = m.unit {
+            let button = egui::Button::new(RichText::new(format!("{unit} ⇄")).small().color(palette.accent)).frame(false);
+            switch_unit = ui
+                .add(button)
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("Count new words {other}"))
+                .clicked();
+        }
         if wide {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(summary.clone()));
         }
@@ -1056,7 +1109,7 @@ fn metric_plot(
 
     let x_ticks = (ui.available_width() as f64 / 70.0).clamp(3.0, 12.0);
     // The scale is part of the id, so switching it resets the y range
-    let mut plot = Plot::new(("metric", m.short, log))
+    let mut plot = Plot::new(("metric", m.short, m.unit, log))
         .height(height)
         // Hover only: no panning or zooming, and drags go to the page (scrolling on touch screens)
         .sense(egui::Sense::hover())
@@ -1090,7 +1143,7 @@ fn metric_plot(
         let finger = inspect.finger.filter(|&p| plot_ui.response().rect.contains(p));
         finger.map(|p| plot_ui.plot_from_screen(p).x.round())
     });
-    DrawnPlot { toggle, rect: shown.response.rect, inspected: shown.inner }
+    DrawnPlot { toggle, switch_unit, rect: shown.response.rect, inspected: shown.inner }
 }
 
 /// Every metric of the chapter under the cursor.
@@ -1106,13 +1159,15 @@ fn chapter_text(stats: &BookStats, x: f64) -> Option<String> {
     let i = stats.chapters.iter().position(|s| s.chapter_index as f64 == x.round())?;
     let s = &stats.chapters[i];
     Some(format!(
-        "{}: {}\nNew words: {}\nLearned so far: {}\nCharacters: {}\nDensity: {} per 100 characters",
+        "{}: {}\nNew words: {}\nDensity: {} per 100 words, {} per 100 characters\nLearned so far: {}\nLength: {} words, {} characters",
         s.chapter_index,
         s.title,
         format_count(&(s.filtered_words as f64)),
+        format_ratio(&per_100(s.filtered_words, stats.chapter_words[i])),
+        format_ratio(&per_100(s.filtered_words, s.characters)),
         format_count(&(stats.learned_so_far[i] as f64)),
+        format_count(&(stats.chapter_words[i] as f64)),
         format_count(&(s.characters as f64)),
-        format_ratio(&(s.raw_ratio * DENSITY_CHARACTERS)),
     ))
 }
 
