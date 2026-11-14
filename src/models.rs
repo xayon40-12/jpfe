@@ -7,6 +7,9 @@ pub struct Chapter {
 
 pub struct WordEntry {
     pub rank: usize,
+    /// The word's dictionary form, which identifies it across chapters and books
+    pub key: String,
+    /// The word as its book writes it most often
     pub word: String,
     pub pronunciation: String,
     pub pos: String,

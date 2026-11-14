@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Read a jmdict-simplified JSON release on stdin and print the headwords the tokenizer uses, as TSV.
 
-The first line is "# JMdict <version>"; the others, sorted by word, are: word, reading (hiragana), part of speech, kind.
+The first line is "# JMdict <version>"; the others, sorted by word, are: word, reading (hiragana), part of speech,
+kind, and every reading of the word in any entry (・-separated; empty when the reading is the only one).
 - kind "k": a kanji headword, which tokens are merged into (神出鬼没, 魔法使い)
 - kind "r": a kanji spelling JMdict marks as rarely used (遣る, 仕舞う), with the kana spelling to show instead
+- kind "a": a word of an entry written only in kana (いい, which is not a reading of 良い)
 
 Usage: tar -xzOf jmdict-eng-<version>.json.tgz | jmdict-headwords.py <version> > headwords.tsv
 """
@@ -25,15 +27,24 @@ def label(codes):
 
 def main(version):
     data = json.load(sys.stdin)
-    headwords, rare = {}, {}  # word -> (priority, reading, pos)
+    headwords, rare, kana_words = {}, {}, {}  # word -> (priority, reading, pos)
+    readings = {}  # kanji word -> its readings in every entry
     for entry in data["words"]:
         codes = list(dict.fromkeys(c for s in entry["sense"] for c in s["partOfSpeech"]))
         pos = label(codes)
         kana = [k for k in entry["kana"] if not RARE_KANA & set(k["tags"])]
         kana.sort(key=lambda k: not k["common"])
+        if not entry["kanji"]:
+            for k in kana:
+                row = (0 if k["common"] else 1, k["text"], pos)
+                if k["text"] not in kana_words or row < kana_words[k["text"]]:
+                    kana_words[k["text"]] = row
         for kanji in entry["kanji"]:
             word = kanji["text"]
-            reading = next((k["text"] for k in kana if "*" in k["appliesToKanji"] or word in k["appliesToKanji"]), None)
+            applying = [k["text"] for k in kana if "*" in k["appliesToKanji"] or word in k["appliesToKanji"]]
+            known = readings.setdefault(word, [])
+            known.extend(r for r in applying if r not in known)
+            reading = next(iter(applying), None)
             if reading is None:
                 continue
             # Common spellings first, so 今日 reads きょう rather than another entry's reading
@@ -43,13 +54,20 @@ def main(version):
                 target[word] = row
     if len(headwords) < MIN_HEADWORDS:
         sys.exit(f"Only {len(headwords)} headwords in JMdict {version}: is the release broken?")
-    rows = {word: (reading, pos, "r") for word, (_, reading, pos) in rare.items()}
+    rows = {word: (reading, pos, "a") for word, (_, reading, pos) in kana_words.items()}
+    rows.update((word, (reading, pos, "r")) for word, (_, reading, pos) in rare.items())
     rows.update((word, (reading, pos, "k")) for word, (_, reading, pos) in headwords.items())
     print(f"# JMdict {version}")
     # Sorted by code point, which is the byte order of UTF-8: the tokenizer finds words by binary search
     for word, (reading, pos, kind) in sorted(rows.items()):
-        print(f"{word}\t{reading}\t{pos}\t{kind}")
-    print(f"JMdict {version}: {len(headwords)} headwords, {len(rare.keys() - headwords.keys())} rare spellings", file=sys.stderr)
+        # Other readings, only when there are some
+        others = readings.get(word, [reading])
+        print(f"{word}\t{reading}\t{pos}\t{kind}\t{'・'.join(others) if others != [reading] else ''}")
+    print(
+        f"JMdict {version}: {len(headwords)} headwords, {len(rare.keys() - headwords.keys())} rare spellings, "
+        f"{len(rows) - len(headwords.keys() | rare.keys())} kana words",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

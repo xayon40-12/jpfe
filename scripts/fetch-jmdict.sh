@@ -39,9 +39,10 @@ EOF
 fi
 
 version=$(lock_value version)
-# Extracted files are only made again for another release
-up_to_date() { [ -f "$1" ] && [ "$(head -1 "$1")" = "# $2 $version" ]; }
-if up_to_date "$out/headwords.tsv" JMdict && up_to_date "$out/definitions.tsv" JMdict && up_to_date "$out/kanji.tsv" KANJIDIC2; then
+# Extracted files are only made again for another release, or when the script making them changed
+up_to_date() { [ -f "$1" ] && [ "$(head -1 "$1")" = "# $2 $version" ] && [ "$1" -nt "$root/scripts/$3" ]; }
+if up_to_date "$out/headwords.tsv" JMdict jmdict-headwords.py && up_to_date "$out/definitions.tsv" JMdict jmdict-definitions.py \
+  && up_to_date "$out/kanji.tsv" KANJIDIC2 kanjidic.py; then
   exit 0
 fi
 

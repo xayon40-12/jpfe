@@ -8,11 +8,28 @@ use crate::tokenizer::{JapaneseTokenizer, ParsedWord};
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BookWord {
     pub count: usize,
+    /// How the book writes the word, and how often (see [`ParsedWord::spelling`]), in order of appearance
+    pub spellings: Vec<Spelling>,
     pub pronunciation: String,
     pub pos: String,
     /// Position of the first chapter containing the word (titles may repeat, so they are not used as keys).
     pub first_chapter: usize,
     pub first_chapter_title: String,
+}
+
+/// One way a book writes a word, with its reading.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Spelling {
+    pub spelling: String,
+    pub pronunciation: String,
+    pub count: usize,
+}
+
+impl BookWord {
+    /// The spelling the book uses most (the first one used, on a tie), and its reading.
+    pub fn usual_spelling(&self) -> Option<&Spelling> {
+        self.spellings.iter().rev().max_by_key(|s| s.count)
+    }
 }
 
 /// Occurrences of each base word in one chapter.
@@ -49,16 +66,18 @@ impl FrequencyAnalyzer {
         let mut words: HashMap<String, BookWord> = HashMap::new();
         for (chapter_pos, (chapter, tokens)) in chapters.iter().zip(tokenized).enumerate() {
             for t in tokens {
-                if let Some(w) = words.get_mut(&t.base_word) {
-                    w.count += 1;
-                } else {
-                    words.insert(t.base_word.clone(), BookWord {
-                        count: 1,
-                        pronunciation: t.pronunciation.clone(),
-                        pos: t.pos.clone(),
-                        first_chapter: chapter_pos,
-                        first_chapter_title: chapter.title.clone(),
-                    });
+                let word = words.entry(t.base_word.clone()).or_insert_with(|| BookWord {
+                    count: 0,
+                    spellings: Vec::new(),
+                    pronunciation: t.pronunciation.clone(),
+                    pos: t.pos.clone(),
+                    first_chapter: chapter_pos,
+                    first_chapter_title: chapter.title.clone(),
+                });
+                word.count += 1;
+                match word.spellings.iter_mut().find(|s| s.spelling == t.spelling) {
+                    Some(spelling) => spelling.count += 1,
+                    None => word.spellings.push(Spelling { spelling: t.spelling.clone(), pronunciation: t.pronunciation.clone(), count: 1 }),
                 }
             }
         }
@@ -101,10 +120,12 @@ impl FrequencyAnalyzer {
             let cum_pct = cumulative as f64 / chapter_total * 100.0;
             // Keep rank holes for filtered words
             if book.count >= min_book_count && (!hide_previous_words || book.first_chapter == chapter_pos) {
+                let usual = book.usual_spelling();
                 entries.push(WordEntry {
                     rank: i + 1,
-                    word: word.to_string(),
-                    pronunciation: book.pronunciation.clone(),
+                    key: word.to_string(),
+                    word: usual.map_or(word, |s| &s.spelling).to_string(),
+                    pronunciation: usual.map_or(&book.pronunciation, |s| &s.pronunciation).clone(),
                     pos: book.pos.clone(),
                     occurrences: count,
                     chapter_percent: format!("{:.4}%", count as f64 / chapter_total * 100.0),
@@ -128,12 +149,31 @@ mod tests {
     use super::*;
 
     fn token(word: &str) -> ParsedWord {
-        ParsedWord { base_word: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }
+        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }
+    }
+
+    fn spelled(word: &str, spelling: &str) -> ParsedWord {
+        ParsedWord { spelling: spelling.into(), pronunciation: spelling.into(), ..token(word) }
+    }
+
+    #[test]
+    fn lists_each_word_in_the_spelling_its_book_uses_most() {
+        let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("{i}"), text: String::new() }).collect();
+        let tokens = [
+            vec![spelled("出来る", "できる"), spelled("出来る", "出来る"), token("猫")],
+            vec![spelled("出来る", "できる")],
+        ];
+        let analyzer = FrequencyAnalyzer::from_tokens(&chapters, &tokens);
+        let entries = analyzer.analyze_chapter(0, &tokens[0], 100.0, 1, false);
+        // One word, counted under its dictionary form and shown as the book writes it most
+        assert_eq!(entries.iter().map(|e| (e.key.as_str(), e.word.as_str())).collect::<Vec<_>>(), [("出来る", "できる"), ("猫", "猫")]);
+        assert_eq!((entries[0].occurrences, entries[0].book_occurrences), (2, 3));
+        assert_eq!(entries[0].pronunciation, "できる");
     }
 
     #[test]
     fn new_words_are_tracked_per_chapter_even_with_repeated_titles() {
-        let first = BookWord { count: 2, pronunciation: String::new(), pos: "名詞".into(), first_chapter: 0, first_chapter_title: "同じ".into() };
+        let first = BookWord { count: 2, spellings: Vec::new(), pronunciation: String::new(), pos: "名詞".into(), first_chapter: 0, first_chapter_title: "同じ".into() };
         let words = HashMap::from([("猫".to_string(), first)]);
         let analyzer = FrequencyAnalyzer { words, total_words: 2 };
         let tokens = [token("猫")];

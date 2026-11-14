@@ -94,7 +94,8 @@ pub struct Book {
     texts: Vec<Chapter>,
     analyzer: FrequencyAnalyzer,
     counts: Vec<ChapterCounts>,
-    /// Words to learn in each chapter, as in the CLI's `words/` files.
+    /// Words to learn in each chapter, as in the CLI's `words/` files, by dictionary form (which matches
+    /// them across books however each book spells them; see [`Book::spelling`])
     pub words: Vec<Vec<String>>,
     /// Position of the last chapter whose words the reader has learned; `None` before the first one.
     pub learned: Option<usize>,
@@ -178,6 +179,11 @@ impl Book {
         self.texts.get(pos).map_or("", |c| c.text.as_str())
     }
 
+    /// How this book writes a word most often (`word` is its dictionary form).
+    pub fn spelling<'a>(&'a self, word: &'a str) -> &'a str {
+        self.analyzer.words.get(word).and_then(|w| w.usual_spelling()).map_or(word, |s| s.spelling.as_str())
+    }
+
     pub fn chapter_label(&self, pos: usize) -> String {
         let c = &self.chapters[pos];
         format!("{}: {}", c.index, c.title)
@@ -235,7 +241,7 @@ impl BookStats {
             let path = format!("words/{}.txt", chapter_file_stem(chapter.index, &chapter.title, pad_width));
             zip.start_file(path, zip::write::SimpleFileOptions::default())?;
             for word in words {
-                writeln!(zip, "{word}")?;
+                writeln!(zip, "{}", book.spelling(word))?;
             }
         }
         Ok(zip.finish()?.into_inner())
@@ -304,9 +310,9 @@ fn word_lists(analyzer: &FrequencyAnalyzer, counts: &[ChapterCounts], s: &Settin
             analyzer
                 .analyze_counts(i, c, s.target_percentage, s.min_book_count, s.hide_previous_words)
                 .into_iter()
-                .map(|e| e.word)
                 // Like the CLI's other filters, this leaves the coverage cut-off unchanged
-                .filter(|w| !(s.hide_katakana_words && is_katakana_word(w)))
+                .filter(|e| !(s.hide_katakana_words && is_katakana_word(&e.word)))
+                .map(|e| e.key)
                 .collect()
         })
         .collect()
@@ -334,7 +340,7 @@ mod tests {
     }
 
     fn tokens(words: &[&str]) -> Vec<ParsedWord> {
-        words.iter().map(|w| ParsedWord { base_word: w.to_string(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }).collect()
+        words.iter().map(|w| ParsedWord { base_word: w.to_string(), spelling: w.to_string(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0 }).collect()
     }
 
     #[test]
@@ -416,6 +422,25 @@ mod tests {
         // The shown book's own progress does not filter it
         books[1].learned = Some(2);
         assert_eq!(Book::stats(&books, 1).excluded, 2);
+    }
+
+    #[test]
+    fn keeps_words_by_dictionary_form_and_shows_the_books_spelling() {
+        let spelled = |word: &str, spelling: &str| ParsedWord { spelling: spelling.into(), ..tokens(&[word]).remove(0) };
+        let pending = PendingBook {
+            saved: SavedBook { id: 1, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
+            chapters: vec![Chapter { index: 1, title: "第1話".into(), text: String::new() }],
+            tokens: vec![vec![spelled("出来る", "できる"), spelled("出来る", "できる"), spelled("出来る", "出来る")]],
+        };
+        let book = pending.finish(&Settings { min_book_count: 1, ..Settings::default() });
+        // Matched across books by its dictionary form, however this book spells it
+        assert_eq!(book.words, [vec!["出来る"]]);
+        assert_eq!(book.spelling("出来る"), "できる");
+        let stats = Book::stats(std::slice::from_ref(&book), 0);
+        let mut zip = zip::ZipArchive::new(Cursor::new(stats.words_zip(&book).unwrap())).unwrap();
+        let mut text = String::new();
+        zip.by_index(0).unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "できる\n");
     }
 
     #[test]

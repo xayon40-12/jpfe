@@ -3,7 +3,7 @@
 # - the compiled UniDic dictionary, zstd-compressed (about 200 MB raw, ~35 MB compressed),
 #   with its BSD license
 # - from the JMdict and KANJIDIC2 release pinned in jmdict.lock, with their CC BY-SA 4.0 attribution:
-#   the headwords (9 MB raw, ~2 MB compressed), the reader's definitions (28 MB, ~8 MB) and kanji (0.7 MB, ~0.2 MB)
+#   the headwords (13 MB raw, ~2 MB compressed), the reader's definitions (28 MB, ~8 MB) and kanji (0.7 MB, ~0.2 MB)
 # - Noto Sans JP, since browsers do not let the page read system fonts
 set -euo pipefail
 cd "$(dirname "$0")/.."
