@@ -897,12 +897,17 @@ fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[
 /// - after a verb, adjective or auxiliary (or a suffix that conjugates, っぽい): auxiliaries (られる, た, ない,
 ///   ます), the particles that make conjugated forms (て, ば, たり, ながら), the stems of そうだ and ようだ, and
 ///   ない after an adjective (美しくない, 行きたくない; not after a noun: 関係ない)
-/// - after a na-adjective, or the stem of そうだ: the copula (静かだった, 静かな, 寒そうだ)
+/// - after a na-adjective, the stem of そうだ or げ: the copula (静かだった, 静かな, 寒そうだ, 悲しげな)
+/// - the suffixes that make another word of an adjective, na-adjective or noun that can be one (静かさ, 寒がる,
+///   子供っぽさ, 真剣さ), and plurals of nouns (彼ら, 子供達, 私ども): see [`is_derivation`]
 ///
-/// Nouns take nothing (学生だ, 勉強する), and verbs after て stay words of their own (書いて + しまう).
+/// Nouns take nothing else (学生だ, 勉強する), and verbs after て stay words of their own (書いて + しまう).
 fn is_ending(previous: &Token, token: &Token) -> bool {
+    if token.field(0) == "接尾辞" {
+        return is_derivation(previous, token);
+    }
     let previous_pos = previous.field(0);
-    let na = previous_pos == "形状詞";
+    let na = previous_pos == "形状詞" || previous_pos == "接尾辞" && previous.field(1) == "形状詞的";
     let conjugates = na || matches!(previous_pos, "動詞" | "形容詞" | "助動詞") || previous_pos == "接尾辞" && is_set(previous.field(4));
     if !conjugates {
         return false;
@@ -915,6 +920,26 @@ fn is_ending(previous: &Token, token: &Token) -> bool {
             lemma == "無い" && token.field(1) == "非自立可能" && matches!(previous_pos, "形容詞" | "助動詞") && previous.field(5).starts_with("連用形")
         }
         "形状詞" => !na && token.field(1) == "助動詞語幹",
+        _ => false,
+    }
+}
+
+/// Whether the suffix `token` makes another word of the one before it, `previous` (JMdict words made this way
+/// are already whole: 美しさ, 嬉しがる): さ, み, げ, め and がる after the stem of an adjective (寒がる,
+/// 子供っぽさ), a na-adjective (静かさ) or a noun that can be one (真剣さ), and the plurals 達, ら and ども after
+/// a noun or pronoun (子供達, 彼ら, 私ども), which may end in a suffix (ママさんたち, 候補者たち).
+fn is_derivation(previous: &Token, token: &Token) -> bool {
+    let (pos, sub) = (previous.field(0), previous.field(1));
+    let stem = matches!(pos, "形容詞" | "接尾辞") && previous.field(5).starts_with("語幹")
+        || pos == "形状詞" && sub != "助動詞語幹"
+        || pos == "名詞" && previous.field(2) == "形状詞可能";
+    // Also a noun ending in a suffix (ママさん, ケガ人, 候補者)
+    let noun = matches!(pos, "名詞" | "代名詞") && sub != "数詞" || pos == "接尾辞" && sub == "名詞的";
+    match token.field(7) {
+        "さ" | "み" | "気" | "目" | "がる" => stem,
+        "達" => noun,
+        "等" => noun && token.field(6) == "ラ",
+        "共" => noun && token.surface == "ども",
         _ => false,
     }
 }
@@ -951,6 +976,14 @@ fn ending_form(previous: &Token, token: &Token) -> Option<&'static str> {
         ("助詞", "ば") => "conditional (ば)",
         ("助詞", "たり") => "listing (たり)",
         ("助詞", "ながら" | "つつ") => "while (ながら)",
+        ("接尾辞", "さ") => "noun of degree (さ)",
+        ("接尾辞", "み") => "noun (み)",
+        ("接尾辞", "気") => "seeming (げ)",
+        ("接尾辞", "目") => "somewhat (め)",
+        ("接尾辞", "がる") => "shows signs of (がる)",
+        ("接尾辞", "達") => "plural (たち)",
+        ("接尾辞", "等") => "plural (ら)",
+        ("接尾辞", "共") => "plural (ども)",
         _ => return None,
     })
 }
@@ -1374,6 +1407,14 @@ mod dictionary_tests {
         assert_eq!(conjugated("静かだった"), one("静かだった", "静か", "past (た)", "だ, た"));
         assert_eq!(conjugated("高かったら"), one("高かったら", "高い", "conditional (たら)", "た"));
         assert_eq!(conjugated("早く書け").remove(1), one("書け", "書く", "imperative", "").remove(0));
+        // Suffixes that make another word, and plurals; JMdict's words made this way stay whole
+        assert_eq!(conjugated("静かさ"), one("静かさ", "静か", "noun of degree (さ)", "さ"));
+        assert_eq!(conjugated("寒がった"), one("寒がった", "寒い", "shows signs of (がる), past (た)", "がる, た"));
+        assert_eq!(conjugated("悲しげな"), one("悲しげな", "悲しげ", "before a noun (な)", "だ"));
+        assert_eq!(conjugated("彼ら"), one("彼ら", "彼", "plural (ら)", "等"));
+        assert_eq!(conjugated("子供達"), one("子供達", "子供", "plural (たち)", "達"));
+        assert_eq!(conjugated("候補者たち"), one("候補者たち", "候補者", "plural (たち)", "達"));
+        assert_eq!(conjugated("美しさ"), one("美しさ", "美しさ", "", ""));
         // Verbs after て, nouns and what follows them stay words of their own
         let written = |text: &str| conjugated(text).into_iter().map(|(w, ..)| w).collect::<Vec<_>>();
         assert_eq!(written("それによって"), ["それ", "に", "よって"]);
