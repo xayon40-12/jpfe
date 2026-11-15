@@ -374,6 +374,12 @@ The user asked for new defaults: a minimum of 5 occurrences in the book instead 
 
 The user's iPhone 13 reloads the page before Re:ゼロ (807 chapters) is analyzed, probably on a memory limit. The book is listed again after the reload and analyzed again, and only finished books had a remove button, so there was no way out of the loop. Every book card now has the ✕ button: ready, waiting for the dictionary, being analyzed or being restored. Removing a book saves the book list at once, before any more work. Tested in the browser pane: Re:ゼロ dropped, page reloaded mid-analysis, book removed. After another reload it was gone from `state.json` and `books/` was empty.
 
+### 31. Chapters counted as they are tokenized: Re:ゼロ from 1.6 GB to 0.5 GB
+
+**Investigated:** the debug information now shows the most memory the page has used (the WebAssembly memory only grows). In the browser pane, the previous build peaked at 1,595 MB on Re:ゼロ: 284 MB once the dictionary was loaded, 498 MB after reading the PDF, and the rest for its tokens. The viewer kept every chapter's tokens until the end of the analysis, 4.36 million `ParsedWord`s, each with four strings and two vectors. Natively, the CLI, which also keeps them, peaks at 2.1 GB on this book and at 200 MB on 最果てのパラディン. An iPhone 13 does not give a page that much.
+
+**Decided:** `FrequencyAnalyzer::add_chapter` counts one chapter's words, and `PendingBook` calls it as soon as a chapter is tokenized, keeping its `ChapterCounts` and dropping the tokens. Same lists (15,145 words to learn), same time (about 13 s in the pane), peak **512 MB**. The peak now comes from the dictionary and from reading the PDF.
+
 ## How changes were checked
 
 - **Refactors and new features in the CLI:** compared byte for byte with the output from before the change, for the EPUB and both PDFs (`full/`, `words/`, statistics, console log without timings). One measurement was wrong at first because the binary had not been rebuilt after an edit (`cargo test` does not rebuild `jpfe`).
@@ -390,7 +396,7 @@ The user's iPhone 13 reloads the page before Re:ゼロ (807 chapters) is analyze
 | 4 | **Dictionary load time on phones** | About 2 s of unpacking on an iPhone 13. Cached books no longer wait for it, but importing a new book does. Native gzip decompression and a trimmed dictionary were both left aside (decisions 18 and 20). |
 | 5 | **Okurigana left wrong by `adapt_kanji`** | When the fix in decision 21 was made, 躾付ける, 抑さえ込む, 感る and 這る still came out wrong. Not rechecked since the JMdict and grouping work. |
 | 6 | **The in-app browser pane lost stored files between turns** | Seen several times while testing the viewer (the state or every file gone, the folders still there). The viewer was not at fault; `abd6fcb` later made storage safe against it (see [word-grouping.md](word-grouping.md), decision 9). |
-| 7 | **Re:ゼロ makes the page reload on an iPhone 13** | Probably memory. To investigate next, then lower memory use (and maybe speed up analysis). Decision 30 only lets the book be removed. |
+| 7 | **Memory on phones** | Decision 31 brought Re:ゼロ from 1.6 GB to 0.5 GB; not yet confirmed on the iPhone 13. What is left: reading a PDF (+214 MB for Re:ゼロ's 24 MB file, with lopdf loading the whole document), the dictionary (284 MB), and the CLI, which still keeps every token (2.1 GB on Re:ゼロ). Analysis speed not looked at yet. |
 
 ## Kept as they are, on purpose
 

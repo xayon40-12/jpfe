@@ -71,6 +71,14 @@ pub use native::*;
 #[cfg(target_arch = "wasm32")]
 pub use web::*;
 
+/// Size of the WebAssembly memory, which only grows: the most the page has needed so far (web only).
+pub fn memory_bytes() -> Option<usize> {
+    #[cfg(target_arch = "wasm32")]
+    return Some(core::arch::wasm32::memory_size(0) * 65536);
+    #[cfg(not(target_arch = "wasm32"))]
+    None
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::{Inbox, Incoming};

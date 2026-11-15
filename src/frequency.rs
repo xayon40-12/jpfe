@@ -76,6 +76,7 @@ impl Default for ListOptions {
     }
 }
 
+#[derive(Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FrequencyAnalyzer {
     pub words: HashMap<String, BookWord>,
@@ -93,32 +94,40 @@ impl FrequencyAnalyzer {
 
     /// Book-wide counts from already tokenized chapters (`tokenized[i]` belongs to `chapters[i]`).
     pub fn from_tokens(chapters: &[Chapter], tokenized: &[Vec<ParsedWord>], include_particles: bool) -> Self {
-        let mut words: HashMap<String, BookWord> = HashMap::new();
-        for (chapter_pos, (chapter, tokens)) in chapters.iter().zip(tokenized).enumerate() {
-            let mut in_chapter = HashSet::new();
-            for t in tokens.iter().flat_map(ParsedWord::with_affixes).filter(|t| t.is_listed(include_particles)) {
-                let key = t.key();
-                let word = words.entry(key.clone().into_owned()).or_insert_with(|| BookWord {
-                    count: 0,
-                    spellings: Vec::new(),
-                    pronunciation: t.pronunciation.clone(),
-                    pos: t.pos.clone(),
-                    chapters: 0,
-                    first_chapter: chapter_pos,
-                    first_chapter_title: chapter.title.clone(),
-                });
-                word.count += 1;
-                if in_chapter.insert(key.into_owned()) {
-                    word.chapters += 1;
-                }
-                match word.spellings.iter_mut().find(|s| s.spelling == t.spelling) {
-                    Some(spelling) => spelling.count += 1,
-                    None => word.spellings.push(Spelling { spelling: t.spelling.clone(), pronunciation: t.pronunciation.clone(), count: 1 }),
-                }
-            }
+        let mut analyzer = Self::default();
+        for (chapter, tokens) in chapters.iter().zip(tokenized) {
+            analyzer.add_chapter(&chapter.title, tokens, include_particles);
         }
-        let total_words = words.values().map(|w| w.count).sum();
-        Self { words, total_words, chapters: chapters.len().min(tokenized.len()) }
+        analyzer
+    }
+
+    /// Count the words of the book's next chapter, so its tokens need not be kept (a long book's tokens take
+    /// more memory than a phone gives a page).
+    pub fn add_chapter(&mut self, title: &str, tokens: &[ParsedWord], include_particles: bool) {
+        let chapter_pos = self.chapters;
+        let mut in_chapter = HashSet::new();
+        for t in tokens.iter().flat_map(ParsedWord::with_affixes).filter(|t| t.is_listed(include_particles)) {
+            let key = t.key();
+            let word = self.words.entry(key.clone().into_owned()).or_insert_with(|| BookWord {
+                count: 0,
+                spellings: Vec::new(),
+                pronunciation: t.pronunciation.clone(),
+                pos: t.pos.clone(),
+                chapters: 0,
+                first_chapter: chapter_pos,
+                first_chapter_title: title.to_string(),
+            });
+            word.count += 1;
+            if in_chapter.insert(key.into_owned()) {
+                word.chapters += 1;
+            }
+            match word.spellings.iter_mut().find(|s| s.spelling == t.spelling) {
+                Some(spelling) => spelling.count += 1,
+                None => word.spellings.push(Spelling { spelling: t.spelling.clone(), pronunciation: t.pronunciation.clone(), count: 1 }),
+            }
+            self.total_words += 1;
+        }
+        self.chapters += 1;
     }
 
     pub fn analyze_chapter(

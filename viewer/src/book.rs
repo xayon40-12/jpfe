@@ -166,7 +166,7 @@ impl Book {
     /// Start over from the chapter texts, keeping the reader's progress.
     pub fn retokenize(self) -> PendingBook {
         let saved = self.saved();
-        PendingBook { saved, chapters: self.texts, tokens: Vec::new() }
+        PendingBook::new(saved, self.texts)
     }
 
     /// Words learned in every book but `book`.
@@ -259,12 +259,16 @@ impl BookStats {
 }
 
 /// A book being tokenized a few chapters per frame, so the window stays responsive
-/// (the web version has no threads).
+/// (the web version has no threads). Each chapter's words are counted as soon as it is tokenized and its
+/// tokens dropped: kept, the tokens of a long book (Re:ゼロ, 4 million) took more memory than an iPhone gives
+/// a page.
 pub struct PendingBook {
     /// Id, names and the reader's progress, kept when a book is tokenized again
     pub saved: SavedBook,
     chapters: Vec<Chapter>,
-    tokens: Vec<Vec<ParsedWord>>,
+    /// Words of the chapters tokenized so far
+    analyzer: FrequencyAnalyzer,
+    counts: Vec<ChapterCounts>,
 }
 
 impl PendingBook {
@@ -282,34 +286,44 @@ impl PendingBook {
         }
         let name = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem).to_string();
         let saved = SavedBook { id, name, file_name: file_name.to_string(), learned };
-        Ok(Self { saved, chapters, tokens: Vec::new() })
+        Ok(Self::new(saved, chapters))
+    }
+
+    fn new(saved: SavedBook, chapters: Vec<Chapter>) -> Self {
+        Self { saved, chapters, analyzer: FrequencyAnalyzer::default(), counts: Vec::new() }
     }
 
     /// Tokenize again from the first chapter (after a tokenizer setting changed).
     pub fn restart(&mut self) {
-        self.tokens.clear();
+        self.analyzer = FrequencyAnalyzer::default();
+        self.counts.clear();
     }
 
     pub fn progress(&self) -> f32 {
-        self.tokens.len() as f32 / self.chapters.len() as f32
+        self.counts.len() as f32 / self.chapters.len() as f32
     }
 
-    /// Tokenize chapters until `deadline`; true once every chapter is done.
-    pub fn step(&mut self, tokenizer: &mut JapaneseTokenizer, deadline: Instant) -> Result<bool> {
-        while let Some(chapter) = self.chapters.get(self.tokens.len()) {
-            self.tokens.push(tokenizer.tokenize(&chapter.text)?);
+    /// Tokenize and count chapters until `deadline`; true once every chapter is done.
+    pub fn step(&mut self, tokenizer: &mut JapaneseTokenizer, include_particles: bool, deadline: Instant) -> Result<bool> {
+        while let Some(chapter) = self.chapters.get(self.counts.len()) {
+            let tokens = tokenizer.tokenize(&chapter.text)?;
+            self.add_chapter(&tokens, include_particles);
             if Instant::now() >= deadline {
                 break;
             }
         }
-        Ok(self.tokens.len() == self.chapters.len())
+        Ok(self.counts.len() == self.chapters.len())
+    }
+
+    /// Count the words of the next chapter from its tokens.
+    fn add_chapter(&mut self, tokens: &[ParsedWord], include_particles: bool) {
+        let title = &self.chapters[self.counts.len()].title;
+        self.analyzer.add_chapter(title, tokens, include_particles);
+        self.counts.push(ChapterCounts::new(tokens, include_particles));
     }
 
     pub fn finish(self, settings: &Settings) -> Book {
-        let particles = settings.include_particles;
-        let analyzer = FrequencyAnalyzer::from_tokens(&self.chapters, &self.tokens, particles);
-        let counts: Vec<ChapterCounts> = self.tokens.iter().map(|t| ChapterCounts::new(t, particles)).collect();
-        Book::new(self.saved, self.chapters, analyzer, counts, settings)
+        Book::new(self.saved, self.chapters, self.analyzer, self.counts, settings)
     }
 }
 
@@ -351,6 +365,15 @@ mod tests {
         }
     }
 
+    /// A book whose chapters are already tokenized into `tokens`.
+    fn pending(saved: SavedBook, chapters: Vec<Chapter>, tokens: Vec<Vec<ParsedWord>>) -> PendingBook {
+        let mut book = PendingBook::new(saved, chapters);
+        for t in &tokens {
+            book.add_chapter(t, false);
+        }
+        book
+    }
+
     fn tokens(words: &[&str]) -> Vec<ParsedWord> {
         let word = |w: &&str| ParsedWord {
             base_word: w.to_string(),
@@ -370,11 +393,11 @@ mod tests {
     #[test]
     fn settings_change_the_word_lists() {
         let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
-        let pending = PendingBook {
-            saved: SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(1) },
+        let pending = pending(
+            SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(1) },
             chapters,
-            tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥", "パン"])],
-        };
+            vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥", "パン"])],
+        );
         let mut book = pending.finish(&Settings { min_book_count: 1, min_chapters: 1, ..Settings::default() });
         assert_eq!(book.words, [vec!["猫", "犬"], vec!["鳥"]]);
         assert_eq!(book.learned, Some(1));
@@ -392,11 +415,11 @@ mod tests {
     #[test]
     fn reuses_analysis_only_with_the_same_key() {
         let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
-        let pending = PendingBook {
-            saved: SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
+        let pending = pending(
+            SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
             chapters,
-            tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
-        };
+            vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
+        );
         let settings = Settings { min_book_count: 1, min_chapters: 1, ..Settings::default() };
         let book = pending.finish(&settings);
         let key = CacheKey { build: "b1", dictionary: "d1", include_particles: false };
@@ -451,11 +474,11 @@ mod tests {
     #[test]
     fn keeps_words_by_dictionary_form_and_shows_the_books_spelling() {
         let spelled = |word: &str, spelling: &str| ParsedWord { spelling: spelling.into(), ..tokens(&[word]).remove(0) };
-        let pending = PendingBook {
-            saved: SavedBook { id: 1, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
-            chapters: vec![Chapter { index: 1, title: "第1話".into(), text: String::new() }],
-            tokens: vec![vec![spelled("出来る", "できる"), spelled("出来る", "できる"), spelled("出来る", "出来る")]],
-        };
+        let pending = pending(
+            SavedBook { id: 1, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
+            vec![Chapter { index: 1, title: "第1話".into(), text: String::new() }],
+            vec![vec![spelled("出来る", "できる"), spelled("出来る", "できる"), spelled("出来る", "出来る")]],
+        );
         let book = pending.finish(&Settings { min_book_count: 1, min_chapters: 1, ..Settings::default() });
         // Matched across books by its dictionary form, however this book spells it
         assert_eq!(book.words, [vec!["出来る"]]);

@@ -499,7 +499,7 @@ impl ViewerApp {
         let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary else { return };
         let Some(book) = self.pending.first_mut() else { return };
         let started = Instant::now();
-        let stepped = book.step(tokenizer, started + WORK_PER_FRAME);
+        let stepped = book.step(tokenizer, self.settings.include_particles, started + WORK_PER_FRAME);
         self.load_times.add("analyzing books", started.elapsed().as_secs_f64());
         match stepped {
             Ok(false) => {}
@@ -692,7 +692,7 @@ impl ViewerApp {
 
                 ui.separator();
                 ui.checkbox(&mut self.debug, "Show debug information");
-                note(ui, "Load times and storage errors, under the Open button.");
+                note(ui, "Load times, memory and storage errors, under the Open button.");
 
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
@@ -866,6 +866,10 @@ impl ViewerApp {
         }
         if let Some(summary) = self.load_times.summary().filter(|_| self.debug) {
             ui.label(RichText::new(summary).small().color(palette.secondary_text));
+        }
+        if let Some(bytes) = platform::memory_bytes().filter(|_| self.debug) {
+            let text = format!("Memory used at most: {} MB", bytes / 1_000_000);
+            ui.label(RichText::new(text).small().color(palette.secondary_text));
         }
         if self.debug && self.persistent == Some(false) {
             let text = "This browser did not grant persistent storage: it may clear the saved books when it needs room.";
