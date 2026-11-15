@@ -163,6 +163,10 @@ The tokenizer reports every word it finds, with what kind of word it is; word li
 
 This happens before any counting, so occurrences, percentages, ranks and both the `full/` tables and the `words/` lists follow these rules. How each rule was decided, and the grouping problems that remain, are in [docs/word-grouping.md](docs/word-grouping.md).
 
+## Decisions and History
+
+How the project got where it is, what was decided and why, and what remains, is recorded in [docs/](docs/README.md).
+
 ## Usage Examples
 
 ### 1. Default Run on an EPUB (First 3 Chapters)
