@@ -128,9 +128,45 @@ impl Definitions {
             .collect()
     }
 
+    /// The entries of `word` (see [`Self::lookup`]), those of the part of speech `pos` first, as the tokenizer gives it
+    /// (UniDic's `助詞`, `動詞`…, or JMdict's for a merged word): the particle は before the noun 歯, also read は.
+    pub fn lookup_as(&self, word: &str, pos: &str) -> Vec<Entry<'_>> {
+        let mut entries = self.lookup(word);
+        // A stable sort: the common words first among those of the part of speech, as among the others
+        entries.sort_by_key(|e| !e.is_part_of_speech(pos));
+        entries
+    }
+
     /// What a tag means ("noun", "Godan verb with 'ru' ending"…), or the tag itself if unknown.
     pub fn tag<'a>(&'a self, code: &'a str) -> &'a str {
         self.tags.get(code).map_or(code, String::as_str)
+    }
+}
+
+impl Entry<'_> {
+    /// Whether some sense of the entry is of the part of speech `pos`, as the tokenizer gives it (UniDic's `助詞`,
+    /// `動詞`…, or JMdict's for a merged word); true for a part of speech JMdict does not tell apart.
+    pub fn is_part_of_speech(&self, pos: &str) -> bool {
+        // JMdict's codes for each part of speech: a code or a code family (`v` for v1, v5r, vs…)
+        let codes: &[&str] = match pos {
+            "助詞" => &["prt"],
+            "助動詞" => &["aux", "aux-v", "aux-adj", "cop"],
+            "動詞" => &["v"],
+            "形容詞" => &["adj-i", "adj-ix"],
+            "形状詞" => &["adj-na"],
+            "副詞" => &["adv", "adv-to"],
+            "代名詞" => &["pn"],
+            "連体詞" => &["adj-pn"],
+            "接続詞" => &["conj"],
+            "感動詞" => &["int"],
+            "接頭辞" => &["pref"],
+            "接尾辞" => &["suf", "ctr", "n-suf"],
+            "名詞" => &["n", "n-adv", "n-t", "n-pref", "n-suf"],
+            "表現" => &["exp"],
+            _ => return true,
+        };
+        let fits = |tag: &str| codes.iter().any(|&code| tag == code || code == "v" && tag.starts_with('v') && tag != "vt" && tag != "vi");
+        self.senses.iter().any(|s| s.tags.iter().any(|&t| fits(t)))
     }
 }
 
@@ -220,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn puts_entries_of_the_part_of_speech_first() {
+        let definitions = Definitions::parse(
+            "# JMdict 1.0\n#tags\tn=noun\n歯\tは\tn|tooth\n\tは\tprt|topic marker particle\n#index\nは\t0,1\n歯\t0\n",
+        )
+        .unwrap();
+        assert_eq!(definitions.lookup("は")[0].spellings, ["歯"]);
+        assert!(definitions.lookup_as("は", "助詞")[0].spellings.is_empty());
+        assert_eq!(definitions.lookup_as("は", "名詞")[0].spellings, ["歯"]);
+        // A part of speech JMdict does not tell apart keeps the usual order
+        assert_eq!(definitions.lookup_as("は", "記号")[0].spellings, ["歯"]);
+    }
+
+    #[test]
     fn finds_kanji() {
         let kanjidic = Kanjidic::parse(
             "# KANJIDIC2 1.0\n上\tジョウ、ショウ\tうえ、-うえ、あ.げる\t\tabove; up\t3\t1\t4\t35\n生\tセイ\tい.きる\t\tlife\t5\t\t\t\n",
@@ -255,6 +304,11 @@ mod embedded_tests {
         assert!(entries.iter().any(|e| e.readings.contains(&"じょうず") && e.senses[0].glosses.contains("skil")));
         assert!(!definitions.lookup("じょうず").is_empty());
         assert!(!definitions.lookup("食べる").is_empty());
+        // The particle は before the noun 歯, read the same
+        for particle in ["は", "が", "に", "を", "の", "で"] {
+            let first = &definitions.lookup_as(particle, "助詞")[0];
+            assert!(first.senses.iter().any(|s| s.tags.contains(&"prt")), "{particle}: {:?}", first.spellings);
+        }
         let life = kanjidic.lookup('生').unwrap();
         assert!(life.on.contains(&"セイ"));
         assert!(life.meanings.contains(&"life"));

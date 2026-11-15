@@ -732,9 +732,13 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
     let note = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).size(body * 0.8).color(palette.secondary_text));
     ui.spacing_mut().item_spacing.y = body * 0.35;
 
-    let mut entries = lookup.map(|l| l.words.lookup(&word.base_word)).unwrap_or_default();
-    // The entry read as in the text first: its readings go on the first line, with the word
-    if let Some(i) = entries.iter().position(|e| e.readings.contains(&word.pronunciation.as_str())) {
+    // Those of the word's part of speech first (the particle は, not the noun 歯 read the same)
+    let mut entries = lookup.map(|l| l.words.lookup_as(&word.base_word, &word.pos)).unwrap_or_default();
+    // The entry read as in the text first, of the word's part of speech if one is: its readings go on the first
+    // line, with the word
+    let read_so = |e: &jpfe::dictionary::Entry| e.readings.contains(&word.pronunciation.as_str());
+    let first = entries.iter().position(|e| read_so(e) && e.is_part_of_speech(&word.pos)).or_else(|| entries.iter().position(read_so));
+    if let Some(i) = first {
         entries[..=i].rotate_right(1);
     }
     let mut readings: Vec<&str> = entries.first().map(|e| e.readings.clone()).unwrap_or_default();

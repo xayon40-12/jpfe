@@ -206,14 +206,17 @@ After a noun, め (リア充め, この色男め, 魔王め) stayed a fragment, 
 
 On the five books it attaches to about 140 nouns, most of them names (バルトめ, チシャめ) and insults (化け物め, 卑怯者め). The lists do not change: め was a single hiragana, never listed.
 
+### 17. Verbs in じる are counted as the text writes them (commit "Verbs in じる as written, and the particle は in the reader")
+
+UniDic takes the modern verbs in じる for the classical verbs in ずる, whose stem is written the same (信じ is the 連用形 of both), and gives the ずる form as their lemma and base form. JMdict has both as words, so no rule replaced them: 信じる, 感じる and 応じる were never listed, only 信ずる, 感ずる and 応ずる (in Re:ゼロ, 感ずる 2,329 occurrences, 信ずる 1,563, 応ずる 967).
+
+**Decided:** a verb whose dictionary form ends in ずる is counted in じる when the text writes じ after its stem (信じた, 応じて, 封じられた, 先んじて) and JMdict has the じる form. Where the text writes ず or ぜ (信ずる, 信ぜよ, 論ずる), it stays the classical verb.
+
+On the six books, the only changes are these verbs moving from ずる to じる, and 馳せ参じる found whole: UniDic's 馳せ参ずる, which JMdict lacks, was split into 馳せる + 参ずる. A few classical forms remain where the text has them (信ずる 3, 通ずる 15 in Re:ゼロ).
+
 ## What remains
 
-Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16). Found while doing that work, and still to fix:
-
-| # | Problem | Examples | Occurrences | Likely approach |
-|---|---|---|---|---|
-| 1 | **Verbs in じる are counted under their ずる form**: UniDic's lemma for the サ変 verbs is the classical ずる form, whatever the text writes, and JMdict has both as words, so the lemma is kept | 信じる → 信ずる, 応じる → 応ずる, 生じる → 生ずる (also 封じる, 禁じる, 断じる, 通じる, 演じる, 論じる) | 信ずる 1,563 in Re:ゼロ and 273 in 無職転生, where 信じる never appears; 応ずる up to 967 in one book | Count the verb in the form the text writes: when the token's base form as written (UniDic's field 10) ends in じる and JMdict has it, prefer it to the ずる lemma, as `adapt_kanji` and the okurigana rule already prefer the surface |
-| 2 | **The reader looks up the particle は as 歯**: clicking は in the reader shows the noun 歯 "tooth" first, a kanji entry read は, rather than the particle | は (and maybe other particles written like nouns: が, に, を) | Every は clicked in the reader | Have the reader prefer the JMdict entry whose part of speech matches the word's (a particle for `WordKind::Grammar`), or the kana-only entry, over kanji entries that only share the reading |
+Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16), and so are the two found while doing that work (decision 17, and decision 6 of [the reader](decisions-reader.md)).
 
 ### Kept as they are, on purpose
 

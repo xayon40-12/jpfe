@@ -161,7 +161,7 @@ The tokenizer reports every word it finds, with what kind of word it is; word li
 - **Single hiragana** other than conjunctions are never listed: interjections (`あ`, `え`), and prefixes and suffixes such as `お` and `さ` (`高さ`).
 - **Expressions JMdict has are one word when they do not conjugate**, even across a particle: `何もかも`, `いつの間にか`, `あっという間に`, `相変わらず`, `もしかして`. Not nouns joined by `の` (`目の前` is `目` + `前`), phrases that conjugate (`頭を下げる`), or a word and a particle (`本当に`).
 - **Kanji prefixes join the word after them, and stay words**: in `大迷宮`, the reader looks up `迷宮` wherever it is clicked and says `prefix (大)`, while word lists count both `迷宮` and `大`. JMdict's own compounds stay whole (`不気味`, `無意識`, `真っ二つ`).
-- **Everything else is listed**, prefixes and suffixes included (`不`, `超`, `的`, `性`, `者`, `様`, and counters such as `冊` or `枚`). Words are counted under their dictionary form, so a verb written in kana is not mistaken for a contraction (`手にとって` is `取る`, `によって` is `因る`).
+- **Everything else is listed**, prefixes and suffixes included (`不`, `超`, `的`, `性`, `者`, `様`, and counters such as `冊` or `枚`). Words are counted under their dictionary form, so a verb written in kana is not mistaken for a contraction (`手にとって` is `取る`, `によって` is `因る`), and a verb in じる as the text writes it (`信じた` is `信じる`, not UniDic's classical `信ずる`).
 
 This happens before any counting, so occurrences, percentages, ranks and both the `full/` tables and the `words/` lists follow these rules. How each rule was decided, and what UniDic leaves that no rule fixes, are in [docs/word-grouping.md](docs/word-grouping.md).
 

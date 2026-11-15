@@ -89,6 +89,12 @@ The user noticed that 家 (in グレイラット家) and 冊 (in ５冊) could n
 
 **Decided:** the tokenizer reports every word it finds with a `WordKind` (a word, grammar, or a fragment), and word lists decide what to count; the particle setting moved from the tokenizer to the counting. The contractions the list targeted (てる, とく, ちゃう, とる) are auxiliaries for UniDic, so the grammar rule already covers them, and the list was removed. Default word lists grew by 1–2% per book. This is decision 1 of [word-grouping.md](word-grouping.md), which continues from here.
 
+### 6. Entries of the word's part of speech first (commit "Verbs in じる as written, and the particle は in the reader")
+
+Clicking the particle は showed the noun 歯 "tooth" first: the window looks up every entry spelled or read は, most common first, then moves the first one read as in the text to the top, and 歯, 葉 and the particle are all read は.
+
+**Decided:** `Definitions::lookup_as` puts first the entries with a sense of the word's part of speech, as the tokenizer gives it (UniDic's 助詞 is JMdict's `prt`, 助動詞 `aux` or `cop`, 動詞 any `v` code…; JMdict's own label for a merged word), keeping the most common first among them; the window then takes the first of those read as in the text. The particle は comes first, and 歯 follows as another word written the same. A part of speech JMdict does not tell apart (a symbol, a number) keeps the usual order. Checked on は, が, に, を, の and で against the embedded JMdict.
+
 ## Rejected or replaced approaches
 
 - **Egui's own window scrolling** for the dictionary windows: it always takes the maximum height, leaving empty space under short entries. Replaced by a scroll area that shrinks to its content.

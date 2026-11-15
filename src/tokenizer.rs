@@ -572,6 +572,20 @@ impl JapaneseTokenizer {
                 (w.to_string(), raw_reading.to_string())
             };
 
+            // A verb in じる, which UniDic takes for the classical verb in ずる whose stem is written the same (信じた:
+            // 信ずる): the text writes じ (信じる, 信じた), not ず or ぜ (信ずる, 信ぜよ), and JMdict has it
+            let modern = (pos == "動詞").then(|| base_word.strip_suffix("ずる")).flatten().filter(|stem| {
+                surface.strip_prefix(stem).is_some_and(|rest| rest.starts_with('じ'))
+                    && headwords.as_ref().is_some_and(|h| h.get(&format!("{stem}じる")).is_some())
+            });
+            let (base_word, reading_seed) = match modern {
+                Some(stem) => {
+                    let reading = reading_seed.strip_suffix("ズル").map_or_else(|| reading_seed.clone(), |r| format!("{r}ジル"));
+                    (format!("{stem}じる"), reading)
+                }
+                None => (base_word, reading_seed),
+            };
+
             // Written in kana, with a kanji spelling JMdict marks as rarely used (やっ: 遣る → やる)
             let written_in_kana = !surface.chars().any(is_cjk_kanji) && base_word.chars().any(is_cjk_kanji);
             let kana = headwords.as_ref().filter(|_| written_in_kana).and_then(|h| h.kana_spelling(&base_word));
@@ -1829,6 +1843,17 @@ mod dictionary_tests {
             .map(|w| w.base_word.clone())
             .collect();
         assert_eq!(listed, ["美しい", "無い", "た"]);
+    }
+
+    #[test]
+    fn counts_verbs_in_jiru_as_written() {
+        // UniDic takes them for the classical verb in ずる, whose stem is written the same
+        assert_eq!(words("信じた"), ["信じる"]);
+        assert_eq!(words("応じて"), ["応じる"]);
+        assert_eq!(words("封じられた"), ["封じる"]);
+        assert_eq!(words("先んじて"), ["先んじる"]);
+        assert_eq!(words("信ずる"), ["信ずる"]);
+        assert_eq!(words("信ぜよ"), ["信ずる"]);
     }
 
     #[test]
