@@ -116,6 +116,9 @@ pub struct Headwords {
     text: Cow<'static, str>,
     /// Start and end of each word (the first field of each line after the version line)
     words: Vec<(u32, u32)>,
+    /// Start and end of the reading of each rarely used kanji spelling, sorted by reading, with the index of its
+    /// word: kana expressions are found by their reading (それなり for 其れなり)
+    rare_readings: Vec<(u32, u32, u32)>,
     pub version: String,
 }
 
@@ -150,13 +153,21 @@ impl Headwords {
         let first = text.lines().next().unwrap_or_default();
         let version = first.strip_prefix("# JMdict ").context("Not a JMdict headword file")?.to_string();
         let mut words = Vec::new();
+        let mut rare_readings = Vec::new();
         let mut start = first.len() + 1;
         for line in text[start.min(text.len())..].split_terminator('\n') {
             let end = start + line.find('\t').unwrap_or(line.len());
             words.push((u32::try_from(start).context("JMdict headword file too large")?, end as u32));
+            let mut fields = line.split('\t');
+            let (_, reading, _, kind) = (fields.next(), fields.next(), fields.next(), fields.next());
+            if let (Some(reading), Some("r")) = (reading, kind) {
+                let reading_start = end + 1;
+                rare_readings.push((reading_start as u32, (reading_start + reading.len()) as u32, words.len() as u32 - 1));
+            }
             start += line.len() + 1;
         }
-        Ok(Self { text, words, version })
+        rare_readings.sort_by(|a, b| text[a.0 as usize..a.1 as usize].cmp(&text[b.0 as usize..b.1 as usize]));
+        Ok(Self { text, words, rare_readings, version })
     }
 
     /// The headwords extracted when building (needs the `embed-dict` feature).
@@ -239,6 +250,29 @@ impl Headwords {
         let reading = katakana_to_hiragana(reading);
         let headword = self.get(word)?;
         headword.homographs.split('・').any(|r| r == reading).then_some(reading)
+    }
+
+    /// Whether some word, or some reading of a rarely used kanji spelling, starts with `prefix`.
+    fn has_prefix_or_reading(&self, prefix: &str) -> bool {
+        let reading = |&(start, end, _): &(u32, u32, u32)| &self.text[start as usize..end as usize];
+        let i = self.rare_readings.partition_point(|r| reading(r) < prefix);
+        self.has_prefix(prefix) || self.rare_readings.get(i).is_some_and(|r| reading(r).starts_with(prefix))
+    }
+
+    /// A JMdict word that does not conjugate (an adverb, noun or expression), written `text`: a kanji headword, a
+    /// word written only in kana, or the reading of a rarely used kanji spelling (それなり for 其れなり); with the
+    /// word to count it as (the kana, for a rarely used spelling).
+    fn expression(&self, text: &str) -> Option<(String, Headword<'_>)> {
+        let found = if text.chars().any(is_cjk_kanji) {
+            self.headword(text)
+        } else {
+            self.get(text).filter(|h| h.kana).or_else(|| {
+                let reading = |i: usize| &self.text[self.rare_readings[i].0 as usize..self.rare_readings[i].1 as usize];
+                let i = self.rare_readings.partition_point(|&(start, end, _)| &self.text[start as usize..end as usize] < text);
+                (i < self.rare_readings.len() && reading(i) == text).then(|| self.get(self.word(self.rare_readings[i].2 as usize))).flatten()
+            })
+        };
+        found.filter(|h| !matches!(h.pos, "動詞" | "形容詞")).map(|h| (text.to_string(), h))
     }
 
     /// The kana spelling of a rarely used kanji spelling (遣る → やる).
@@ -484,7 +518,8 @@ impl JapaneseTokenizer {
             if index < next {
                 continue;
             }
-            if let Some((end, word, headword)) = headwords.as_ref().and_then(|h| longest_headword(h, &tokens, index)) {
+            let merged = headwords.as_ref().and_then(|h| longest_expression(h, &tokens, index).or_else(|| longest_headword(h, &tokens, index)));
+            if let Some((end, word, headword)) = merged {
                 next = end;
                 words.push(ParsedWord {
                     pronunciation: if *reading_in_hiragana { headword.reading.to_string() } else { hiragana_to_katakana(headword.reading) },
@@ -1196,6 +1231,64 @@ fn own_form(token: &Token) -> Option<&'static str> {
     }
 }
 
+/// The longest run of tokens from `start` that is a JMdict expression merging leaves apart otherwise (see
+/// [`longest_headword`]), when JMdict has the whole as a word that does not conjugate (see
+/// [`Headwords::expression`]): (end, word, its JMdict entry). The run either has a particle between words
+/// (何もかも, いつの間にか, あっという間に, それにしても), or starts at a prefix (相変わらず) or at a pronoun and なり
+/// (それなり). Not only nouns joined by の (目の前, 心の中 read as their parts), not from a verb, and not a conjugated
+/// form JMdict lists when the conjugation goes on in the text.
+fn longest_expression<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize) -> Option<(usize, String, Headword<'h>)> {
+    let field = |i: usize, f: usize| tokens[i].field(f);
+    let grammar = |i: usize| matches!(field(i, 0), "助詞" | "助動詞");
+    // Not from a verb: verbs after て stay words (考えて + みれば, して + もいい)
+    if grammar(start) || matches!(field(start, 0), "補助記号" | "記号" | "空白" | "動詞") {
+        return None;
+    }
+    // Next to each other in the text, with no symbol: the longest run expressions are looked for in
+    let mut last = start + 1;
+    while last < tokens.len().min(start + MAX_RUN)
+        && tokens[last - 1].span.end == tokens[last].span.start
+        && !matches!(field(last, 0), "補助記号" | "記号" | "空白")
+    {
+        last += 1;
+    }
+    // Every candidate starts with the first token and the first character of the next one: most starts end here
+    if last < start + 2 {
+        return None;
+    }
+    let next = tokens[start + 1].surface.chars().next()?;
+    if !headwords.has_prefix_or_reading(&format!("{}{next}", tokens[start].surface)) {
+        return None;
+    }
+    // A pronoun and なり (それなり, 彼女なり; not 俺様 or お前さん, whose suffix is a word of its own)
+    let pronoun = field(start, 0) == "代名詞" && start + 1 < last && field(start + 1, 0) == "接尾辞" && field(start + 1, 7) == "形";
+    for end in (start + 2..=last).rev() {
+        // Not a form JMdict lists of a phrase that goes on conjugating (気をつけ + ます)
+        let conjugated = matches!(field(end - 1, 0), "動詞" | "形容詞") && end < tokens.len() && is_ending(&tokens[end - 1], &tokens[end]);
+        if conjugated {
+            continue;
+        }
+        // A prefix with an auxiliary (相変わらず), which `longest_headword` does not take
+        let prefix = pronoun || field(start, 0) == "接頭辞" && (start + 1..end).any(|i| field(i, 0) == "助動詞");
+        // A particle after a word and before another one
+        let inside = |j: usize| field(j, 0) == "助詞" && !grammar(j - 1) && (j + 1..end).any(|k| !grammar(k));
+        let particles = (start + 1..end - 1).filter(|&j| inside(j)).count();
+        if particles == 0 && !prefix {
+            continue;
+        }
+        // Only nouns joined by の (目の前, 心の中), with no other particle (いつの間にか is an expression)
+        let of_nouns = (start..end).all(|i| matches!(field(i, 0), "名詞" | "代名詞" | "接尾辞" | "形状詞") || tokens[i].surface == "の");
+        if of_nouns && particles > 0 {
+            continue;
+        }
+        let text: String = tokens[start..end].iter().map(|t| t.surface.as_str()).collect();
+        if let Some((word, headword)) = headwords.expression(&text) {
+            return Some((end, word, headword));
+        }
+    }
+    None
+}
+
 /// The longest run of tokens from `start` that is a JMdict headword, as written or with its last word in its
 /// base form (気に入っ → 気に入る): (end, headword, its JMdict entry).
 fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize) -> Option<(usize, String, Headword<'h>)> {
@@ -1439,6 +1532,26 @@ mod dictionary_tests {
         assert_eq!(words("至近距離で"), ["至近距離"]);
         assert_eq!(words("冒険者の拍子抜け"), ["冒険者", "拍子抜け"]);
         assert_eq!(words("気に入った"), ["気", "入る"]);
+    }
+
+    #[test]
+    fn merges_expressions_that_do_not_conjugate() {
+        assert_eq!(words("何もかも。"), ["何もかも"]);
+        assert_eq!(words("いつの間にか"), ["いつの間にか"]);
+        assert_eq!(words("あっという間に"), ["あっという間に"]);
+        assert_eq!(words("一刻も早く"), ["一刻も早く"]);
+        assert_eq!(words("相変わらず"), ["相変わらず"]);
+        // In kana, also the reading of a rarely used kanji spelling (若しかして, 其れなり)
+        assert_eq!(words("もしかして"), ["もしかして"]);
+        assert_eq!(words("それなり"), ["それなり"]);
+        // Not nouns joined by の, phrases that conjugate, or a word and a particle
+        assert_eq!(words("目の前"), ["目", "前"]);
+        assert_eq!(words("気のせい")[0], "気");
+        assert_eq!(words("それは本当に"), ["それ", "本当"]);
+        assert_eq!(words("それらの"), ["それ"]);
+        assert_eq!(words("俺様"), ["俺", "様"]);
+        assert_eq!(words("考えてみれば"), ["考える", "みる"]);
+        assert_eq!(words("気をつけます"), ["気", "つける"]);
     }
 
     #[test]

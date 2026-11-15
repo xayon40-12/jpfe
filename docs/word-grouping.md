@@ -162,15 +162,38 @@ UniDic makes prefixes of 大, 超, 聖, 不, 無, 全, 約, 小, 各, 老, 副, 
 
 **Found on the way:** JMdict words made of a prefix and a number were never merged, since merging stops at a number with its counter: 真っ二つ was 真っ + つ (read まふたつ once the prefix joined it), 小一時間 was 小 + 時間. Merging now goes on after a prefix other than 第 (which makes ordinals: decision 5), and finds 真っ二つ, 小一時間, 大一番, 今一度 and お三方. These are the only changes in the six books' lists, since prefixes are still counted.
 
+### 14. JMdict expressions across particles (commit "JMdict expressions that do not conjugate are one word")
+
+JMdict merging (`longest_headword`) builds words, not phrases: it stops at particles and auxiliaries, so that 頭を下げる stays apart, and never starts at a pronoun. So it split expressions JMdict has: 何もかも (何 + も + か + も), それなり, 相変わらず (相 + 変わら + ず, which decision 13 then made 変わる with "prefix (相)").
+
+**Measured first:** JMdict has tens of thousands of entries that do not conjugate and contain a particle, most of them a word and a particle (には 17,772 occurrences in five books, それは 9,769, 本当に 2,035, 何か 3,616, について 1,561). Merging every one would empty the lists of common words and particles. Phrases that conjugate are marked as verbs or adjectives (頭を下げる, 気がする), and so are left out.
+
+**Decided, with the user:** a new step, `longest_expression`, tried before `longest_headword`, merges a run when JMdict has the whole as a word that does not conjugate (adverb, noun, interjection or expression), and the run:
+
+- has a particle **between two words**, not only at its end (何もかも, いつの間にか, あっという間に, 一刻も早く, それにしても, もしかして);
+- or starts at a prefix with an auxiliary in it (相変わらず, お願いします, おめでとうございます);
+- or is a pronoun and なり (それなり, 彼女なり).
+
+Kana runs are also looked up as the reading of a rarely used kanji spelling (それなり for 其れなり, もしかして for 若しかして), through a new index of those readings in `Headwords` (about 22,000 readings, 6 ms more to parse the file).
+
+**Left apart:**
+
+- **Nouns joined by の**, chosen by the user (目の前: 1,415 occurrences, 心の中, 森の奥, 自分の力, ~8,000 in five books): they read as their parts, and merging them would take their occurrences from common nouns. A run with another particle is an expression (いつの間にか, 自分のために).
+- **Runs from a verb** (考えて + みれば, して + もいい, 行って + きます), found on the six books: verbs after て stay words (decision 2).
+- **A conjugated form JMdict lists, when the text goes on conjugating it** (気をつけ + ます), found on the six books.
+- **A pronoun and a name suffix** (俺様, お前さん), found on the six books: name suffixes are words of their own.
+- **それなり before 。**, where UniDic reads なり as the classical copula.
+
+On the six books, the merged expressions take about 3,600 occurrences in 無職転生 and 7,200 in Re:ゼロ from their parts (何, ない, それ, もし, いつ, 変わる…): in Re:ゼロ, 何もかも 367 (and なにもかも 127), 相変わらず 247, もしかして 175, それにしても 169, それなりに 143, いつの間にか 111. Every word gained is a JMdict expression; some are plain phrases JMdict happens to list (間にある, 年に一度). Tokenizing is about 14% slower (無職転生: 3.2 s to 3.65 s for the whole CLI run), with the same early exit as `longest_headword`.
+
 ## What remains
 
 Counts are occurrences in five of the six books (the 無職転生 PDF repeats the EPUB), scanned on 2026-11-15 with commit `abd6fcb`.
 
 | # | Problem | Examples | Occurrences | Likely approach |
 |---|---|---|---|---|
-| 1 | **JMdict expressions split apart**: merging stops at particles and auxiliaries (to keep phrases such as 頭を下げる apart) and never starts at a pronoun | 何もかも; それなり; 相変わらず | 555 / 534 / 318 | Merge a run across a particle, auxiliary or pronoun start only when JMdict has the whole as an expression |
-| 2 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
-| 3 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
+| 1 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
+| 2 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
 
 ### Kept as they are, on purpose
 
