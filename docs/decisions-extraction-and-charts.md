@@ -368,6 +368,12 @@ The user asked for new defaults: a minimum of 5 occurrences in the book instead 
 
 **Measured** on the six books (total words over all chapter lists, old defaults → new): 最果てのパラディン 7,628 → 5,022, 無職転生 EPUB 13,541 → 9,555, 無職転生 PDF 13,531 → 9,536, 蜘蛛ですが 9,358 → 6,546, 陰の実力者になりたくて 4,844 → 3,234, Re:ゼロ 21,655 → 16,572. On 無職転生, each change alone: 98% → 13,123, `-m 5` → 9,772, 3 chapters → 12,530; on top of `-m 5`, 3 chapters removes another 213 words, such as アンジェ (113 times, in 2 chapters) and ぬいぐるみ (7 times, in 2). With `-p 99 -m 3 --min-chapters 1`, the lists are identical to the previous commit.
 
+## Large books on phones
+
+### 30. Books can be removed while they are analyzed or restored
+
+The user's iPhone 13 reloads the page before Re:ゼロ (807 chapters) is analyzed, probably on a memory limit. The book is listed again after the reload and analyzed again, and only finished books had a remove button, so there was no way out of the loop. Every book card now has the ✕ button: ready, waiting for the dictionary, being analyzed or being restored. Removing a book saves the book list at once, before any more work. Tested in the browser pane: Re:ゼロ dropped, page reloaded mid-analysis, book removed. After another reload it was gone from `state.json` and `books/` was empty.
+
 ## How changes were checked
 
 - **Refactors and new features in the CLI:** compared byte for byte with the output from before the change, for the EPUB and both PDFs (`full/`, `words/`, statistics, console log without timings). One measurement was wrong at first because the binary had not been rebuilt after an edit (`cargo test` does not rebuild `jpfe`).
@@ -384,6 +390,7 @@ The user asked for new defaults: a minimum of 5 occurrences in the book instead 
 | 4 | **Dictionary load time on phones** | About 2 s of unpacking on an iPhone 13. Cached books no longer wait for it, but importing a new book does. Native gzip decompression and a trimmed dictionary were both left aside (decisions 18 and 20). |
 | 5 | **Okurigana left wrong by `adapt_kanji`** | When the fix in decision 21 was made, 躾付ける, 抑さえ込む, 感る and 這る still came out wrong. Not rechecked since the JMdict and grouping work. |
 | 6 | **The in-app browser pane lost stored files between turns** | Seen several times while testing the viewer (the state or every file gone, the folders still there). The viewer was not at fault; `abd6fcb` later made storage safe against it (see [word-grouping.md](word-grouping.md), decision 9). |
+| 7 | **Re:ゼロ makes the page reload on an iPhone 13** | Probably memory. To investigate next, then lower memory use (and maybe speed up analysis). Decision 30 only lets the book be removed. |
 
 ## Kept as they are, on purpose
 

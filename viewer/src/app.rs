@@ -880,7 +880,15 @@ impl ViewerApp {
         ui.add_space(8.0);
 
         let remaining = self.remaining_counts();
+        // Id of the book to remove, whether it is ready, being analyzed or being restored
         let mut remove = None;
+        let remove_button = |ui: &mut Ui, remove: &mut Option<u64>, id: u64| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Remove this book").clicked() {
+                    *remove = Some(id);
+                }
+            });
+        };
         {
             let any_learned = self.books.iter().any(|b| b.learned.is_some());
             for (i, book) in self.books.iter_mut().enumerate() {
@@ -899,11 +907,7 @@ impl ViewerApp {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new(RichText::new(&book.name).strong()).truncate());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add(egui::Button::new("✕").frame(false)).on_hover_text("Remove this book").clicked() {
-                                    remove = Some(i);
-                                }
-                            });
+                            remove_button(ui, &mut remove, book.id);
                         });
                         let total: usize = book.words.iter().map(Vec::len).sum();
                         ui.label(
@@ -945,7 +949,10 @@ impl ViewerApp {
             for book in &self.pending {
                 theme::card(palette).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(&book.saved.name).strong());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&book.saved.name).strong()).truncate());
+                        remove_button(ui, &mut remove, book.saved.id);
+                    });
                     let waiting = !matches!(self.dictionary, DictionaryState::Ready { .. });
                     let text = if waiting { "Waiting for the dictionary…" } else { "Analyzing chapters…" };
                     ui.add(egui::ProgressBar::new(book.progress()).text(text));
@@ -955,7 +962,10 @@ impl ViewerApp {
             for saved in self.restoring.iter().chain(&self.to_restore) {
                 theme::card(palette).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new(&saved.name).strong());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&saved.name).strong()).truncate());
+                        remove_button(ui, &mut remove, saved.id);
+                    });
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label(RichText::new("Restoring…").small().color(palette.secondary_text));
@@ -972,14 +982,31 @@ impl ViewerApp {
                 }
             }
         }
-        if let Some(i) = remove {
-            let book = self.books.remove(i);
-            storage::remove_book(&self.inbox, ui.ctx(), book.id);
-            self.generation += 1;
+        if let Some(id) = remove {
+            self.remove_book(ui.ctx(), id);
+        }
+    }
+
+    /// Forget a book and its stored files, at any stage: ready, being analyzed, or being restored (so a book
+    /// whose analysis makes the page reload can still be removed).
+    fn remove_book(&mut self, ctx: &egui::Context, id: u64) {
+        if let Some(i) = self.books.iter().position(|b| b.id == id) {
+            self.books.remove(i);
             if self.shown > i {
                 self.shown -= 1;
             }
+            self.generation += 1;
         }
+        // Answers still to come for a restored book are ignored once it is no longer listed
+        self.pending.retain(|b| b.saved.id != id);
+        self.restoring.retain(|b| b.id != id);
+        self.to_restore.retain(|b| b.id != id);
+        if self.wanted_shown == Some(id) {
+            self.wanted_shown = None;
+        }
+        storage::remove_book(&self.inbox, ctx, id);
+        // Save the book list now, before any further work that could make the page reload
+        self.save_state(ctx);
     }
 
     /// `viewport_height` is the visible height (the content scrolls when it does not fit).
