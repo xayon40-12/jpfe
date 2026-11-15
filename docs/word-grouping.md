@@ -208,7 +208,12 @@ On the five books it attaches to about 140 nouns, most of them names (バルト�
 
 ## What remains
 
-Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16).
+Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16). Found while doing that work, and still to fix:
+
+| # | Problem | Examples | Occurrences | Likely approach |
+|---|---|---|---|---|
+| 1 | **Verbs in じる are counted under their ずる form**: UniDic's lemma for the サ変 verbs is the classical ずる form, whatever the text writes, and JMdict has both as words, so the lemma is kept | 信じる → 信ずる, 応じる → 応ずる, 生じる → 生ずる (also 封じる, 禁じる, 断じる, 通じる, 演じる, 論じる) | 信ずる 1,563 in Re:ゼロ and 273 in 無職転生, where 信じる never appears; 応ずる up to 967 in one book | Count the verb in the form the text writes: when the token's base form as written (UniDic's field 10) ends in じる and JMdict has it, prefer it to the ずる lemma, as `adapt_kanji` and the okurigana rule already prefer the surface |
+| 2 | **The reader looks up the particle は as 歯**: clicking は in the reader shows the noun 歯 "tooth" first, a kanji entry read は, rather than the particle | は (and maybe other particles written like nouns: が, に, を) | Every は clicked in the reader | Have the reader prefer the JMdict entry whose part of speech matches the word's (a particle for `WordKind::Grammar`), or the kana-only entry, over kanji entries that only share the reading |
 
 ### Kept as they are, on purpose
 
