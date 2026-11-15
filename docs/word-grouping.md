@@ -91,7 +91,7 @@ Guards added after the six-book runs:
 
 **Decided:**
 
-- **Derivations:** さ, み, げ, め and がる after the stem of an adjective, a na-adjective or a noun that can be one are part of it (静かさ is 静か, "noun of degree (さ)"; 寒がった is 寒い, "shows signs of (がる), past (た)"; 子供っぽさ; 真剣さ).
+- **Derivations:** さ, み, げ, め and がる after the stem of an adjective, a na-adjective or a noun that can be one are part of it (静かさ is 静か, "noun of degree (さ)"; 寒がった is 寒い, "shows signs of (がる), past (た)"; 子供っぽさ; 真剣さ). Since decision 12, 寒がった is JMdict's 寒がる and 子供っぽさ JMdict's 子供っぽい: their conjugated forms were not found in JMdict then.
 - **Plurals:** ら, 達 and ども after a noun or pronoun are part of it, also after a noun ending in a suffix (彼ら, 子供達, ママさんたち, 候補者たち).
 - **JMdict words made this way stay whole** (美しさ, 強さ, 嬉しがる, 悲しげ), because they have dictionary entries of their own.
 
@@ -135,17 +135,30 @@ UniDic makes suffixes of 方 (かた), 難い (がたい, にくい), 易い (�
 
 Counted in five books before the change: 方 1,044 occurrences without a JMdict word (戦い方 172, 喋り方 54), 難い 485, 易い 685 and 辛い 249 without one, and 800 more for the adjectives with one. On the six books, the only list changes are these suffixes leaving the lists (in Re:ゼロ, 難い loses 692 occurrences, やすい 487, づらい 282, 方 824) and the most used spelling of 方 becoming ほう in two books, since its kanji now mostly attaches. What remains of them is right: the adjective 易い (口で言うのは易い), nouns UniDic gives (揺らぎやすい), and 方 read ほう (行った方がいい).
 
+### 12. っぽい and めく, and conjugated JMdict words made with a suffix (commit "っぽい and めく belong to their word")
+
+**Decided:**
+
+- **っぽい** after a noun (メイドっぽい is メイド, "-ish (っぽい)"), or after a verb, adjective or auxiliary in any form (助かるっぽい, 来たっぽい is 来る, "past (た), -ish (っぽい)").
+- **めく and めかす** after a noun (儀式めいた is 儀式, "-like (めく), past (た)"; 冗談めかして) or after a verb's 連用形 used as a noun (脅しめいた is 脅す).
+- **JMdict words made this way stay whole**, as decision 6 says, **also when conjugated**. JMdict merging looked a conjugated ending up in its base form only for verbs and adjectives, so it found 嘘っぽい but not 嘘っぽかった, 嬉しがる but not 嬉しがった. It now does the same for suffixes that conjugate (UniDic gives them a conjugation type): 嘘っぽかった is 嘘っぽい, "past (た)". A suffix is still tried as written first, as before, so no earlier merge changes: 強がり (the noun) stays 強がり rather than the verb 強がる, and 人たらし is not looked up as 人たらしい.
+
+This reaches beyond っぽい and めく: every conjugated JMdict word made with a suffix is now found (嫌がる, 怖がる, 可愛がる, 男らしい, 胡散臭い, 耐えかねる, 芝居がかる, 大人ぶる, 恩着せがましい). In Re:ゼロ, 嫌がる goes from 41 to 141 occurrences and 怖がる from 9 to 67, taken from 嫌 and 怖い. The test of decision 6 that expected 寒がった as 寒い now expects 寒がる, and uses 眩しがった (not in JMdict) for the rule.
+
+On the six books, besides those merges, っぽい leaves the lists (350 occurrences in 蜘蛛ですが, 285 in Re:ゼロ, 186 in 無職転生), and so do めく (249 in Re:ゼロ) and めかす. What remains of っぽい follows letters UniDic does not make words of (DQNっぽい) or a particle (だけっぽい).
+
+**Kept as words:** 的 (入門的な, ~730), productive but with many JMdict words of its own. Kana-only JMdict words are not merged (merging needs a kanji), so それっぽい is それ, "-ish (っぽい)".
+
 ## What remains
 
 Counts are occurrences in five of the six books (the 無職転生 PDF repeats the EPUB), scanned on 2026-11-15 with commit `abd6fcb`.
 
 | # | Problem | Examples | Occurrences | Likely approach |
 |---|---|---|---|---|
-| 1 | **Suffixes that derive a word from a noun or verb** | メイドっぽい, 助かるっぽい; 儀式めいた | ~320 / ~300 | Attach like decision 6: 儀式めいた is 儀式, "-like (めく)". 的 (入門的な, ~730) is borderline: productive, but JMdict has many 〜的 words, so it stays a word for now |
-| 2 | **JMdict expressions split apart**: merging stops at particles and auxiliaries (to keep phrases such as 頭を下げる apart) and never starts at a pronoun | 何もかも; それなり; 相変わらず | 555 / 534 / 318 | Merge a run across a particle, auxiliary or pronoun start only when JMdict has the whole as an expression |
-| 3 | **Kanji prefixes** are listed as words of their own | 大 (大銅貨), 不, 聖 | ~1,600 for 大 | Decide whether they attach like お, with the noun as the word |
-| 4 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
-| 5 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
+| 1 | **JMdict expressions split apart**: merging stops at particles and auxiliaries (to keep phrases such as 頭を下げる apart) and never starts at a pronoun | 何もかも; それなり; 相変わらず | 555 / 534 / 318 | Merge a run across a particle, auxiliary or pronoun start only when JMdict has the whole as an expression |
+| 2 | **Kanji prefixes** are listed as words of their own | 大 (大銅貨), 不, 聖 | ~1,600 for 大 | Decide whether they attach like お, with the noun as the word |
+| 3 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
+| 4 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
 
 ### Kept as they are, on purpose
 

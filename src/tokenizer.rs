@@ -1077,7 +1077,9 @@ fn is_ending(previous: &Token, token: &Token) -> bool {
 /// 子供っぽさ), a na-adjective (静かさ) or a noun that can be one (真剣さ), the plurals 達, ら and ども after
 /// a noun or pronoun (子供達, 彼ら, 私ども), which may end in a suffix (ママさんたち, 候補者たち), and after the
 /// stem of a verb, 方 (戦い方) and the adjectives 難い, にくい, やすい and づらい (耐え難い, 使いやすい), which
-/// JMdict merging leaves apart even where JMdict has the whole (see [`longest_headword`]).
+/// JMdict merging leaves apart even where JMdict has the whole (see [`longest_headword`]); っぽい after a noun, verb,
+/// adjective or auxiliary (メイドっぽい, 助かるっぽい), and めく and めかす after a noun (儀式めいた, 冗談めかして) or
+/// the 連用形 of a verb, which makes nouns (脅しめいた).
 fn is_derivation(previous: &Token, token: &Token) -> bool {
     let (pos, sub) = (previous.field(0), previous.field(1));
     let stem = matches!(pos, "形容詞" | "接尾辞") && previous.field(5).starts_with("語幹")
@@ -1092,6 +1094,10 @@ fn is_derivation(previous: &Token, token: &Token) -> bool {
         "さ" | "み" | "気" | "目" | "がる" => stem,
         "方" => verb_stem && token.field(6) == "カタ",
         "難い" | "易い" | "辛い" => verb_stem,
+        // After a noun, or a verb, adjective or auxiliary in any form (メイドっぽい, 助かるっぽい, 来たっぽい, 飽きっぽい)
+        "ぽい" => noun || pos == "形状詞" || matches!(pos, "動詞" | "形容詞" | "助動詞"),
+        // After a noun, also the 連用形 of a verb used as one (脅しめいた)
+        "めく" | "めかす" => noun || pos == "形状詞" || verb_stem,
         "達" => noun,
         "等" => noun && token.field(6) == "ラ",
         "共" => noun && token.surface == "ども",
@@ -1141,6 +1147,9 @@ fn ending_form(previous: &Token, token: &Token) -> Option<&'static str> {
         ("接尾辞", "難い") => "hard to (にくい)",
         ("接尾辞", "易い") => "easy to (やすい)",
         ("接尾辞" | "形容詞", "辛い") => "hard to (づらい)",
+        ("接尾辞", "ぽい") => "-ish (っぽい)",
+        ("接尾辞", "めく") => "-like (めく)",
+        ("接尾辞", "めかす") => "making it seem (めかす)",
         ("接尾辞", "達") => "plural (たち)",
         ("接尾辞", "等") => "plural (ら)",
         ("接尾辞", "共") => "plural (ども)",
@@ -1203,10 +1212,12 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
         }
         let head: String = tokens[start..tail].iter().map(|t| t.surface.as_str()).collect();
         let (surface, base) = (tokens[tail].surface.as_str(), field(tail, 10));
-        let conjugated = matches!(field(tail, 0), "動詞" | "形容詞") && is_set(base) && surface != base;
+        // Also a suffix that conjugates (嘘っぽかった → 嘘っぽい, 謎めいた → 謎めく)
+        let conjugates = matches!(field(tail, 0), "動詞" | "形容詞") || field(tail, 0) == "接尾辞" && is_set(field(tail, 4));
+        let conjugated = conjugates && is_set(base) && surface != base;
         // A conjugated ending is looked up in its base form (気に入っ → 気に入る), or as written when it is the
-        // 連用形 that also makes nouns (拍子抜け, 魔法使い)
-        let written = (!conjugated || field(tail, 5).starts_with("連用形")).then(|| format!("{head}{surface}"));
+        // 連用形 that also makes nouns (拍子抜け, 魔法使い), or a suffix (人たらし, not 人たらしい)
+        let written = (!conjugated || field(tail, 5).starts_with("連用形") || field(tail, 0) == "接尾辞").then(|| format!("{head}{surface}"));
         let base = conjugated.then(|| format!("{head}{base}"));
         if !head.chars().chain(surface.chars()).any(is_cjk_kanji) {
             continue;
@@ -1215,7 +1226,9 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
         if field(tail, 7) == "無い" && headwords.headword(&head).is_some() {
             continue;
         }
-        for candidate in base.into_iter().chain(written) {
+        // A suffix as written first, as before suffixes were looked up in their base form (強がり, not 強がる)
+        let candidates = if field(tail, 0) == "接尾辞" { [written, base] } else { [base, written] };
+        for candidate in candidates.into_iter().flatten() {
             if let Some(headword) = headwords.headword(&candidate) {
                 return Some((end, candidate, headword));
             }
@@ -1593,7 +1606,9 @@ mod dictionary_tests {
         assert_eq!(conjugated("早く書け").remove(1), one("書け", "書く", "imperative", "").remove(0));
         // Suffixes that make another word, and plurals; JMdict's words made this way stay whole
         assert_eq!(conjugated("静かさ"), one("静かさ", "静か", "noun of degree (さ)", "さ"));
-        assert_eq!(conjugated("寒がった"), one("寒がった", "寒い", "shows signs of (がる), past (た)", "がる, た"));
+        assert_eq!(conjugated("眩しがった"), one("眩しがった", "眩しい", "shows signs of (がる), past (た)", "がる, た"));
+        // JMdict's word, also conjugated
+        assert_eq!(conjugated("寒がった"), one("寒がった", "寒がる", "past (た)", "た"));
         assert_eq!(conjugated("悲しげな"), one("悲しげな", "悲しげ", "before a noun (な)", "だ"));
         assert_eq!(conjugated("彼ら"), one("彼ら", "彼", "plural (ら)", "等"));
         assert_eq!(conjugated("子供達"), one("子供達", "子供", "plural (たち)", "達"));
@@ -1608,6 +1623,15 @@ mod dictionary_tests {
         assert_eq!(conjugated("騙されやすい"), one("騙されやすい", "騙す", "passive (れる), easy to (やすい)", "れる, 易い"));
         assert_eq!(conjugated("居づらい"), one("居づらい", "居る", "hard to (づらい)", "辛い"));
         assert_eq!(conjugated("食べ辛い"), one("食べ辛い", "食べる", "hard to (づらい)", "辛い"));
+        // っぽい after a noun or verb, めく and めかす after a noun, unless JMdict has the whole, also conjugated
+        assert_eq!(conjugated("メイドっぽい"), one("メイドっぽい", "メイド", "-ish (っぽい)", "っぽい"));
+        assert_eq!(conjugated("来たっぽい"), one("来たっぽい", "来る", "past (た), -ish (っぽい)", "た, っぽい"));
+        assert_eq!(conjugated("儀式めいた"), one("儀式めいた", "儀式", "-like (めく), past (た)", "めく, た"));
+        assert_eq!(conjugated("脅しめいた").remove(0).2, "-like (めく), past (た)");
+        assert_eq!(conjugated("嘘っぽかった"), one("嘘っぽかった", "嘘っぽい", "past (た)", "た"));
+        assert_eq!(conjugated("子供っぽさ"), one("子供っぽさ", "子供っぽい", "noun of degree (さ)", "さ"));
+        assert_eq!(conjugated("謎めいた"), one("謎めいた", "謎めく", "past (た)", "た"));
+        assert_eq!(conjugated("嬉しがった"), one("嬉しがった", "嬉しがる", "past (た)", "た"));
         // Polite prefixes, unless JMdict has the whole word
         assert_eq!(conjugated("お二人"), one("お二人", "人", "polite (お)", "御"));
         assert_eq!(conjugated("ご出席"), one("ご出席", "出席", "polite (ご)", "御"));
@@ -1624,6 +1648,7 @@ mod dictionary_tests {
         assert_eq!(written("お、おじゃま"), ["お", "おじゃま"]);
         assert_eq!(written("行った方がいい"), ["行った", "方", "が", "いい"]);
         assert_eq!(written("塩辛い"), ["塩辛い"]);
+        assert_eq!(written("強がりを言った"), ["強がり", "を", "言った"]);
         // Word lists count the word once, and its endings as grammar
         assert_eq!(words("食べさせられた"), ["食べる"]);
         let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
