@@ -380,6 +380,43 @@ The user's iPhone 13 reloads the page before Re:ゼロ (807 chapters) is analyze
 
 **Decided:** `FrequencyAnalyzer::add_chapter` counts one chapter's words, and `PendingBook` calls it as soon as a chapter is tokenized, keeping its `ChapterCounts` and dropping the tokens. Same lists (15,145 words to learn), same time (about 13 s in the pane), peak **512 MB**. The peak now comes from the dictionary and from reading the PDF.
 
+### 32. Where the analysis time goes
+
+The user asked which part of loading a book takes the longest, and why. The debug information now also times reading books (EPUB or PDF extraction), next to analyzing them.
+
+**Stages** for Re:ゼロ (807 chapters, 10.3 million characters, 4.36 million tokens). Natively, with the viewer's features (no `parallel`, so the PDF is read on one thread as on the web):
+
+| Stage | Native | Browser pane (wasm) |
+|---|---|---|
+| Reading the PDF | 0.69 s | 1.0 s |
+| Tokenizing | 11.37 s (905,000 characters/s) | 13.2 s, with counting |
+| Counting (`add_chapter`, `ChapterCounts`) | 0.52 s | |
+| Word lists, saving the analysis (43 MB), loading it back | 0.18 s | |
+
+wasm runs at about 0.9 times native speed here, so the native profile stands for the web. 無職転生 (EPUB) has the same split: 3.3 s of tokenizing out of 3.7 s.
+
+**Inside tokenizing**, from macOS `sample` (8 s, 6,305 samples, inclusive):
+
+| Share | What | Why |
+|---|---|---|
+| 24% | `Token::field` | A token's 17 UniDic fields are one joined string, and each `field(i)` splits it again from the start. The rules call it dozens of times per token (`longest_headword` and `longest_expression` check fields 0, 1, 2, 5, 7 and 10 of each token in their run, again for each candidate end). |
+| 17% | `Headwords::lower_bound` | Binary search over JMdict's 230,000 sorted words (about 18 string comparisons each, spread across the file). Half comes from `has_prefix`/`has_prefix_or_reading`, tried at almost every token by the longest-match functions. The other half is `get`, mostly for `homograph` (4%) and `kana_form` (2%), which look up the same lemmas again and again. |
+| 16% | lindera's segmentation (Viterbi) | The morphological analysis itself. |
+| 15% | Copying lindera's tokens | lindera decodes each token's details from the dictionary (`details`, 12%), then they are joined into one string (3%). |
+| about 20% | The rest of the grouping rules | `is_ending`, `own_form`, readings, allocations of `ParsedWord` strings. |
+
+So about 40% (`field` and `lower_bound`) is overhead of how the data is accessed rather than real work. Ways to cut it are listed in "What remains".
+
+### 33. Tokenizing a quarter faster: field offsets and JMdict searched by first character
+
+The user asked to fix the two biggest costs found in decision 32. Neither changes what is found: on the six books, the CLI output (defaults, and `-p 100 -m 1 --min-chapters 1 --show-previous-words`) and console logs are identical to the previous commit.
+
+- **Field offsets:** each token keeps where each of its fields ends, so `Token::field` slices the string instead of splitting it from the start. Tokenizing Re:ゼロ natively: 11.37 → 9.48 s.
+- **JMdict searched by first character:** `Headwords` keeps the index of the first word of each first character (the words are sorted, so they follow each other), and a binary search only covers the words with the query's first character. 9.48 → 8.57 s. Parsing the file now fails if it is not sorted, which the search always assumed.
+- **Rejected: a cache of search results** (a map of the words and prefixes already searched, cleared at 100,000 entries). Only 1% faster (8.45 s), for a `RefCell`, its memory and its state, so it was dropped.
+
+**Result:** tokenizing Re:ゼロ, 11.37 → 8.57 s natively (−25%); in the browser pane, analyzing 13.2 → 10.0 s. What is left of tokenizing is mostly lindera: segmentation (21%) and decoding token details (16%), with the JMdict search still at 16%, now mostly string comparisons inside a first character's words.
+
 ## How changes were checked
 
 - **Refactors and new features in the CLI:** compared byte for byte with the output from before the change, for the EPUB and both PDFs (`full/`, `words/`, statistics, console log without timings). One measurement was wrong at first because the binary had not been rebuilt after an edit (`cargo test` does not rebuild `jpfe`).
@@ -396,7 +433,8 @@ The user's iPhone 13 reloads the page before Re:ゼロ (807 chapters) is analyze
 | 4 | **Dictionary load time on phones** | About 2 s of unpacking on an iPhone 13. Cached books no longer wait for it, but importing a new book does. Native gzip decompression and a trimmed dictionary were both left aside (decisions 18 and 20). |
 | 5 | **Okurigana left wrong by `adapt_kanji`** | When the fix in decision 21 was made, 躾付ける, 抑さえ込む, 感る and 這る still came out wrong. Not rechecked since the JMdict and grouping work. |
 | 6 | **The in-app browser pane lost stored files between turns** | Seen several times while testing the viewer (the state or every file gone, the folders still there). The viewer was not at fault; `abd6fcb` later made storage safe against it (see [word-grouping.md](word-grouping.md), decision 9). |
-| 7 | **Memory on phones** | Decision 31 brought Re:ゼロ from 1.6 GB to 0.5 GB; not yet confirmed on the iPhone 13. What is left: reading a PDF (+214 MB for Re:ゼロ's 24 MB file, with lopdf loading the whole document), the dictionary (284 MB), and the CLI, which still keeps every token (2.1 GB on Re:ゼロ). Analysis speed not looked at yet. |
+| 7 | **Memory on phones** | Decision 31 brought Re:ゼロ from 1.6 GB to 0.5 GB; not yet confirmed on the iPhone 13. What is left: reading a PDF (+214 MB for Re:ゼロ's 24 MB file, with lopdf loading the whole document), the dictionary (284 MB), and the CLI, which still keeps every token (2.1 GB on Re:ゼロ). Speed: see item 8. |
+| 8 | **Analysis speed** | Decisions 32 and 33: tokenizing is now 25% faster. Left: lindera's own work (about 37%), the JMdict search (16%, its cache was not worth it), and copying lindera's details (a few %). |
 
 ## Kept as they are, on purpose
 

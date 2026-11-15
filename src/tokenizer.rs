@@ -91,19 +91,42 @@ impl ParsedWord {
 /// Longest run of tokens tried as one JMdict headword.
 const MAX_RUN: usize = 6;
 
-/// A token: its surface and its UniDic fields, joined by [`FIELD_SEPARATOR`] (one allocation instead of 17).
+/// A token: its surface and its UniDic fields, joined in one string (one allocation instead of 17).
 struct Token {
     surface: String,
     fields: String,
+    /// Where each field ends in `fields`, so a field is found without scanning the ones before it (the rules
+    /// read fields dozens of times per token: splitting the string each time took a quarter of tokenizing)
+    field_ends: [u16; MAX_FIELDS],
+    field_count: u8,
     /// Bytes of the surface in the text
     span: Range<usize>,
 }
 
-const FIELD_SEPARATOR: char = '\u{1f}';
+/// UniDic gives 17 fields, IPADIC 9; any further ones read as unset.
+const MAX_FIELDS: usize = 24;
 
 impl Token {
+    fn new<'a>(surface: String, span: Range<usize>, details: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut fields = String::new();
+        let mut field_ends = [0; MAX_FIELDS];
+        let mut field_count = 0;
+        for detail in details.into_iter().take(MAX_FIELDS) {
+            fields.push_str(detail);
+            // A field past 64 KB of details reads as unset (never happens with UniDic or IPADIC)
+            let Ok(end) = u16::try_from(fields.len()) else { break };
+            field_ends[field_count] = end;
+            field_count += 1;
+        }
+        Self { surface, fields, field_ends, field_count: field_count as u8, span }
+    }
+
     fn field(&self, i: usize) -> &str {
-        self.fields.split(FIELD_SEPARATOR).nth(i).unwrap_or("*")
+        if i >= self.field_count as usize {
+            return "*";
+        }
+        let start = if i == 0 { 0 } else { self.field_ends[i - 1] as usize };
+        &self.fields[start..self.field_ends[i] as usize]
     }
 }
 
@@ -116,6 +139,10 @@ pub struct Headwords {
     text: Cow<'static, str>,
     /// Start and end of each word (the first field of each line after the version line)
     words: Vec<(u32, u32)>,
+    /// Each first character of the words, with the index of its first word (words are sorted, so the words
+    /// with the same first character follow each other): a search only covers those, instead of the whole
+    /// file (the binary search took a sixth of tokenizing)
+    first_chars: Vec<(char, u32)>,
     /// Start and end of the reading of each rarely used kanji spelling, sorted by reading, with the index of its
     /// word: kana expressions are found by their reading (それなり for 其れなり)
     rare_readings: Vec<(u32, u32, u32)>,
@@ -167,7 +194,16 @@ impl Headwords {
             start += line.len() + 1;
         }
         rare_readings.sort_by(|a, b| text[a.0 as usize..a.1 as usize].cmp(&text[b.0 as usize..b.1 as usize]));
-        Ok(Self { text, words, rare_readings, version })
+        let mut first_chars: Vec<(char, u32)> = Vec::new();
+        for (i, &(start, end)) in words.iter().enumerate() {
+            let first = text[start as usize..end as usize].chars().next().unwrap_or_default();
+            match first_chars.last() {
+                Some(&(last, _)) if last == first => {}
+                Some(&(last, _)) if last > first => anyhow::bail!("JMdict headword file not sorted"),
+                _ => first_chars.push((first, i as u32)),
+            }
+        }
+        Ok(Self { text, words, first_chars, rare_readings, version })
     }
 
     /// The headwords extracted when building (needs the `embed-dict` feature).
@@ -183,7 +219,14 @@ impl Headwords {
 
     /// Index of the first word that is not before `word`.
     fn lower_bound(&self, word: &str) -> usize {
-        let (mut low, mut high) = (0, self.words.len());
+        let first = word.chars().next().unwrap_or_default();
+        // Words with an earlier first character are all before `word`, those with a later one all after it
+        let group = self.first_chars.partition_point(|&(c, _)| c < first);
+        let group_start = |g: usize| self.first_chars.get(g).map_or(self.words.len(), |&(_, i)| i as usize);
+        if self.first_chars.get(group).is_none_or(|&(c, _)| c != first) {
+            return group_start(group);
+        }
+        let (mut low, mut high) = (group_start(group), group_start(group + 1));
         while low < high {
             let middle = (low + high) / 2;
             if self.word(middle) < word {
@@ -503,14 +546,12 @@ impl JapaneseTokenizer {
         let mut words = Vec::new();
         // The tokens each word is made of
         let mut sources: Vec<Range<usize>> = Vec::new();
-        let separator = FIELD_SEPARATOR.to_string();
         let tokens: Vec<Token> = segmenter
             .segment(Cow::Borrowed(text))?
             .into_iter()
-            .map(|mut t| Token {
-                surface: t.surface.to_string(),
-                span: t.byte_start..t.byte_end,
-                fields: t.details().join(&separator),
+            .map(|mut t| {
+                let (surface, span) = (t.surface.to_string(), t.byte_start..t.byte_end);
+                Token::new(surface, span, t.details())
             })
             .collect();
         let mut next = 0;

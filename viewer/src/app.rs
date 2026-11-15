@@ -267,7 +267,7 @@ impl ViewerApp {
                     self.next_id += 1;
                     self.ask_persistence(ctx);
                     storage::write(&self.inbox, ctx, Key::Source(id), &bytes);
-                    match PendingBook::parse(id, &name, bytes, None) {
+                    match self.load_times.timed("reading books", || PendingBook::parse(id, &name, bytes, None)) {
                         Ok(book) => self.pending.push(book),
                         Err(e) => {
                             storage::remove_book(&self.inbox, ctx, id);
@@ -407,7 +407,8 @@ impl ViewerApp {
             Key::Source(id) => {
                 let Some(pos) = self.restoring.iter().position(|b| b.id == id) else { return };
                 let saved = self.restoring.remove(pos);
-                match bytes.map(|b| PendingBook::parse(saved.id, &saved.file_name, b, saved.learned)) {
+                let parsed = self.load_times.timed("reading books", || bytes.map(|b| PendingBook::parse(saved.id, &saved.file_name, b, saved.learned)));
+                match parsed {
                     Some(Ok(book)) => self.pending.push(book),
                     Some(Err(e)) => self.errors.push(format!("{e:#}")),
                     None => self.errors.push(format!("{}: the stored file is missing; open it again", saved.name)),
