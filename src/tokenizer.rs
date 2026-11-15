@@ -1044,7 +1044,8 @@ fn attach_prefixes(words: Vec<ParsedWord>) -> Vec<ParsedWord> {
 ///   ない after an adjective (美しくない, 行きたくない; not after a noun: 関係ない)
 /// - after a na-adjective, the stem of そうだ or げ: the copula (静かだった, 静かな, 寒そうだ, 悲しげな)
 /// - the suffixes that make another word of an adjective, na-adjective or noun that can be one (静かさ, 寒がる,
-///   子供っぽさ, 真剣さ), and plurals of nouns (彼ら, 子供達, 私ども): see [`is_derivation`]
+///   子供っぽさ, 真剣さ), plurals of nouns (彼ら, 子供達, 私ども), and 方, 難い, やすい and づらい after the stem
+///   of a verb (戦い方, 使いやすい, 食べ辛い): see [`is_derivation`]
 ///
 /// Nouns take nothing else (学生だ, 勉強する), and verbs after て stay words of their own (書いて + しまう).
 fn is_ending(previous: &Token, token: &Token) -> bool {
@@ -1063,6 +1064,8 @@ fn is_ending(previous: &Token, token: &Token) -> bool {
         "助詞" => !na && matches!(lemma, "て" | "ば" | "たり" | "ながら" | "つつ"),
         "形容詞" => {
             lemma == "無い" && token.field(1) == "非自立可能" && matches!(previous_pos, "形容詞" | "助動詞") && previous.field(5).starts_with("連用形")
+                // 辛い after the stem of a verb, which UniDic sometimes takes for the adjective (食べ辛い)
+                || lemma == "辛い" && matches!(token.field(6), "ツライ" | "ヅライ") && previous_pos == "動詞" && previous.field(5).starts_with("連用形")
         }
         "形状詞" => !na && token.field(1) == "助動詞語幹",
         _ => false,
@@ -1070,9 +1073,11 @@ fn is_ending(previous: &Token, token: &Token) -> bool {
 }
 
 /// Whether the suffix `token` makes another word of the one before it, `previous` (JMdict words made this way
-/// are already whole: 美しさ, 嬉しがる): さ, み, げ, め and がる after the stem of an adjective (寒がる,
-/// 子供っぽさ), a na-adjective (静かさ) or a noun that can be one (真剣さ), and the plurals 達, ら and ども after
-/// a noun or pronoun (子供達, 彼ら, 私ども), which may end in a suffix (ママさんたち, 候補者たち).
+/// are already whole: 美しさ, 嬉しがる, 言い方): さ, み, げ, め and がる after the stem of an adjective (寒がる,
+/// 子供っぽさ), a na-adjective (静かさ) or a noun that can be one (真剣さ), the plurals 達, ら and ども after
+/// a noun or pronoun (子供達, 彼ら, 私ども), which may end in a suffix (ママさんたち, 候補者たち), and after the
+/// stem of a verb, 方 (戦い方) and the adjectives 難い, にくい, やすい and づらい (耐え難い, 使いやすい), which
+/// JMdict merging leaves apart even where JMdict has the whole (see [`longest_headword`]).
 fn is_derivation(previous: &Token, token: &Token) -> bool {
     let (pos, sub) = (previous.field(0), previous.field(1));
     let stem = matches!(pos, "形容詞" | "接尾辞") && previous.field(5).starts_with("語幹")
@@ -1080,8 +1085,13 @@ fn is_derivation(previous: &Token, token: &Token) -> bool {
         || pos == "名詞" && previous.field(2) == "形状詞可能";
     // Also a noun ending in a suffix (ママさん, ケガ人, 候補者)
     let noun = matches!(pos, "名詞" | "代名詞") && sub != "数詞" || pos == "接尾辞" && sub == "名詞的";
+    // Also of a passive or causative form (誤解されやすい)
+    let verb_stem = previous.field(5).starts_with("連用形")
+        && (pos == "動詞" || pos == "助動詞" && matches!(previous.field(7), "れる" | "られる" | "せる" | "させる"));
     match token.field(7) {
         "さ" | "み" | "気" | "目" | "がる" => stem,
+        "方" => verb_stem && token.field(6) == "カタ",
+        "難い" | "易い" | "辛い" => verb_stem,
         "達" => noun,
         "等" => noun && token.field(6) == "ラ",
         "共" => noun && token.surface == "ども",
@@ -1126,6 +1136,11 @@ fn ending_form(previous: &Token, token: &Token) -> Option<&'static str> {
         ("接尾辞", "気") => "seeming (げ)",
         ("接尾辞", "目") => "somewhat (め)",
         ("接尾辞", "がる") => "shows signs of (がる)",
+        ("接尾辞", "方") => "way of (方)",
+        ("接尾辞", "難い") if token.field(6) == "ガタイ" => "hard to (がたい)",
+        ("接尾辞", "難い") => "hard to (にくい)",
+        ("接尾辞", "易い") => "easy to (やすい)",
+        ("接尾辞" | "形容詞", "辛い") => "hard to (づらい)",
         ("接尾辞", "達") => "plural (たち)",
         ("接尾辞", "等") => "plural (ら)",
         ("接尾辞", "共") => "plural (ども)",
@@ -1584,6 +1599,15 @@ mod dictionary_tests {
         assert_eq!(conjugated("子供達"), one("子供達", "子供", "plural (たち)", "達"));
         assert_eq!(conjugated("候補者たち"), one("候補者たち", "候補者", "plural (たち)", "達"));
         assert_eq!(conjugated("美しさ"), one("美しさ", "美しさ", "", ""));
+        // After the stem of a verb: 方 unless JMdict has the whole, and 難い, やすい and づらい always
+        assert_eq!(conjugated("戦い方"), one("戦い方", "戦う", "way of (方)", "方"));
+        assert_eq!(conjugated("言い方"), one("言い方", "言い方", "", ""));
+        assert_eq!(conjugated("耐え難い"), one("耐え難い", "耐える", "hard to (がたい)", "難い"));
+        assert_eq!(conjugated("書きにくかった"), one("書きにくかった", "書く", "hard to (にくい), past (た)", "難い, た"));
+        assert_eq!(conjugated("使いやすい"), one("使いやすい", "使う", "easy to (やすい)", "易い"));
+        assert_eq!(conjugated("騙されやすい"), one("騙されやすい", "騙す", "passive (れる), easy to (やすい)", "れる, 易い"));
+        assert_eq!(conjugated("居づらい"), one("居づらい", "居る", "hard to (づらい)", "辛い"));
+        assert_eq!(conjugated("食べ辛い"), one("食べ辛い", "食べる", "hard to (づらい)", "辛い"));
         // Polite prefixes, unless JMdict has the whole word
         assert_eq!(conjugated("お二人"), one("お二人", "人", "polite (お)", "御"));
         assert_eq!(conjugated("ご出席"), one("ご出席", "出席", "polite (ご)", "御"));
@@ -1598,6 +1622,8 @@ mod dictionary_tests {
         assert_eq!(written("関係なかった"), ["関係", "なかった"]);
         assert_eq!(written("学生だった"), ["学生", "だった"]);
         assert_eq!(written("お、おじゃま"), ["お", "おじゃま"]);
+        assert_eq!(written("行った方がいい"), ["行った", "方", "が", "いい"]);
+        assert_eq!(written("塩辛い"), ["塩辛い"]);
         // Word lists count the word once, and its endings as grammar
         assert_eq!(words("食べさせられた"), ["食べる"]);
         let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
