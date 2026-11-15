@@ -597,6 +597,25 @@ impl JapaneseTokenizer {
                 }
                 None => (base_word, reading_seed, spelling),
             };
+            // 一人 and 二人 (or ひとり, ふたり), which UniDic keeps as one word: counted under their counter like
+            // 三人, read as a whole (see `attach_counters`)
+            if pos == "名詞" && matches!(lemma, "一人" | "二人") {
+                let reading = katakana_to_hiragana(raw_reading);
+                words.push(ParsedWord {
+                    pronunciation: if *reading_in_hiragana { "にん".to_string() } else { "ニン".to_string() },
+                    pos: "接尾辞".to_string(),
+                    base_word: "人".to_string(),
+                    spelling: "人".to_string(),
+                    span,
+                    kind: WordKind::Word,
+                    affixes: Vec::new(),
+                    forms: Vec::new(),
+                    homograph: headwords.as_ref().and_then(|h| h.homograph("人", "人", "ニン")),
+                    written_reading: Some(if *reading_in_hiragana { reading } else { hiragana_to_katakana(&reading) }),
+                });
+                sources.push(source);
+                continue;
+            }
             let spelling = spelling.unwrap_or_else(|| base_word.clone());
             let homograph = headwords.as_ref().and_then(|h| h.homograph(&base_word, lemma, raw_reading));
 
@@ -663,6 +682,7 @@ fn attach_counters(
         source.start == previous_source.end && word.span.start == previous.span.end
     };
     let in_kana = |reading: String| if reading_in_hiragana { reading } else { hiragana_to_katakana(&reading) };
+    let is_ordinal = |s: &Range<usize>| single(s).is_some_and(|t| t.field(0) == "接尾辞" && t.field(7) == "目");
     let (mut attached, mut attached_sources) = (Vec::with_capacity(words.len()), Vec::with_capacity(words.len()));
     let mut items = words.into_iter().zip(sources).peekable();
     while let Some((word, source)) = items.next() {
@@ -675,6 +695,17 @@ fn attach_counters(
             false => (None, (word, source)),
         };
         if !is_number(&source) {
+            // A number and its counter UniDic keeps as one word (一人): with an ordinal 目 after it (一人目), which
+            // UniDic may take for the noun 目 there (二人目を産む)
+            let mut source = source;
+            let counted = word.written_reading.is_some();
+            let is_ordinal = |s: &Range<usize>| single(s).is_some_and(|t| t.field(7) == "目" && matches!(t.field(0), "接尾辞" | "名詞"));
+            if let Some((ordinal, ordinal_source)) = items.next_if(|(w, s)| counted && next_to(&word, &source, w, s) && is_ordinal(s)) {
+                word.span.end = ordinal.span.end;
+                source.end = ordinal_source.end;
+                word.written_reading.iter_mut().for_each(|reading| reading.push_str(&in_kana("め".to_string())));
+                word.forms.push("ordinal (目)");
+            }
             // A single kana UniDic takes for a number is not one (the シ of シッ), nor kana it takes for 第 (the ダイ
             // of ダイスキヤキ, the だい of だいぃぶ)
             let kana_number = single(&source).is_some_and(|t| t.field(1) == "数詞") && word.spelling.chars().count() == 1;
@@ -739,7 +770,6 @@ fn attach_counters(
             word.affixes.push(prefix);
             word.forms.push("ordinal (第)");
         }
-        let is_ordinal = |s: &Range<usize>| single(s).is_some_and(|t| t.field(0) == "接尾辞" && t.field(7) == "目");
         if let Some((ordinal, ordinal_source)) = items.next_if(|(w, s)| next_to(&word, &source, w, s) && is_ordinal(s)) {
             word.span.end = ordinal.span.end;
             source.end = ordinal_source.end;
@@ -980,6 +1010,10 @@ fn attach_prefixes(words: Vec<ParsedWord>) -> Vec<ParsedWord> {
             let fits = if ordinal { word.spelling.starts_with(is_numeral_char) } else { !matches!(word.pos.as_str(), "接頭辞" | "感動詞") };
             if polite.span.end == word.span.start && word.kind == WordKind::Word && fits {
                 word.span.start = polite.span.start;
+                // A counter is read with its number, and now its prefix too (お二人 おふたり)
+                if let Some(reading) = word.written_reading.as_mut() {
+                    reading.insert_str(0, &polite.pronunciation);
+                }
                 word.forms.insert(0, match polite.spelling.as_str() {
                     _ if ordinal => "ordinal (第)",
                     "ご" => "polite (ご)",
@@ -1144,9 +1178,10 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
         if field(tail, 0) == "助動詞" || field(tail, 1) == "助動詞語幹" || field(tail, 1) == "数詞"
             // Productive endings: plurals, auxiliary verbs and adjectives (歩き始める, 大きくなる, 言いにくい)
             || matches!(field(tail, 7), "達" | "等" | "共" | "始める" | "続ける" | "過ぎる" | "終わる" | "出す" | "掛ける" | "成る" | "出来る" | "難い" | "易い" | "辛い")
-            // Numbers with counters (三人, 一年生)
+            // Numbers with counters (三人, 一年生), and 一人 or 二人 with an ordinal (二人目; not 二人連れ)
             || (start..tail).any(|i| {
                 field(i, 1) == "数詞" && (field(i + 1, 0) == "接尾辞" || field(i + 1, 2).starts_with("助数詞"))
+                    || matches!(field(i, 7), "一人" | "二人") && field(i + 1, 7) == "目"
             })
         {
             continue;
@@ -1471,6 +1506,15 @@ mod dictionary_tests {
         assert_eq!(counted_with_numbers("三日"), one("三日", "日", "みっか"));
         assert_eq!(counted_with_numbers("三階"), one("三階", "階", "さんがい"));
         assert_eq!(counted_with_numbers("一つ目"), one("一つ目", "つ", "ひとつめ"));
+        // Also 一人 and 二人, which UniDic keeps as one word, in kanji or kana, and with an ordinal; not the words
+        // JMdict makes of them (一人一人, 二人組)
+        assert_eq!(counted_with_numbers("二人で"), one("二人", "人【にん】", "ふたり"));
+        assert_eq!(counted_with_numbers("ひとりで"), one("ひとり", "人【にん】", "ひとり"));
+        assert_eq!(counted_with_numbers("一人目"), one("一人目", "人【にん】", "ひとりめ"));
+        assert_eq!(counted_with_numbers("二人目"), one("二人目", "人【にん】", "ふたりめ"));
+        assert_eq!(counted_with_numbers("二人目を産む"), one("二人目", "人【にん】", "ふたりめ"));
+        assert_eq!(counted_with_numbers("お二人"), one("お二人", "人【にん】", "おふたり"));
+        assert_eq!(counted("一人一人の二人組と二人連れ"), ["一人一人", "二人組", "二人連れ"]);
         // 第 makes an ordinal
         assert_eq!(counted_with_numbers("第二話"), one("第二話", "話【わ】", "だいにわ"));
         // Numbers in digits, read from their value
@@ -1541,7 +1585,7 @@ mod dictionary_tests {
         assert_eq!(conjugated("候補者たち"), one("候補者たち", "候補者", "plural (たち)", "達"));
         assert_eq!(conjugated("美しさ"), one("美しさ", "美しさ", "", ""));
         // Polite prefixes, unless JMdict has the whole word
-        assert_eq!(conjugated("お二人"), one("お二人", "二人", "polite (お)", "御"));
+        assert_eq!(conjugated("お二人"), one("お二人", "人", "polite (お)", "御"));
         assert_eq!(conjugated("ご出席"), one("ご出席", "出席", "polite (ご)", "御"));
         assert_eq!(conjugated("お聞き"), one("お聞き", "聞く", "polite (お)", "御"));
         assert_eq!(conjugated("お茶"), one("お茶", "お茶", "", ""));

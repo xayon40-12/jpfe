@@ -97,7 +97,7 @@ Guards added after the six-book runs:
 
 ### 7. Polite prefixes (commit `bef0f22`)
 
-**Decided:** お and ご (or 御) are part of the word after them (お二人 is 二人, ご出席 is 出席, お聞き is 聞く), shown as "polite (お)". JMdict words with the prefix stay whole (お茶, ご飯, お母さん), and the interjection お stays apart (お、おじゃま). This is why `endings` became `affixes`.
+**Decided:** お and ご (or 御) are part of the word after them (お二人 is 二人, since decision 10 人; ご出席 is 出席, お聞き is 聞く), shown as "polite (お)". JMdict words with the prefix stay whole (お茶, ご飯, お母さん), and the interjection お stays apart (お、おじゃま). This is why `endings` became `affixes`.
 
 ### 8. How tokenizer changes are checked
 
@@ -107,19 +107,30 @@ Every tokenizer change is run on the six books in `source/` against the last com
 
 Not a grouping rule, but decided during this work. While testing in the desktop app's browser pane, a stored book disappeared. The pane's storage for that origin had been emptied (it is not persistent), and the next book opened reused id 0. The viewer now asks the browser for persistent storage once books are stored, gives new books an id after every stored `books/<id>` folder, and keeps and reports folders missing from the book list. Test books go in an origin with no real books (127.0.0.1:8766 rather than localhost:8766).
 
+### 10. 一人 and 二人 are counted under 人 (commit "一人 and 二人 are counted under their counter")
+
+UniDic keeps 一人 and 二人 as one noun (lemma 一人, 二人, read ヒトリ, フタリ), also written ひとり, ふたり, １人 and ２人, while 三人 is 三 + 人. They were listed as words of their own (about 5,500 and 3,900 occurrences), against decision 5.
+
+**Decided:** a token whose lemma is 一人 or 二人 is the counter 人【にん】, with the whole as its written reading (二人【ふたり】), like 三人【さんにん】. With an ordinal it is 二人目【ふたりめ】, also when UniDic tags that 目 as the noun "eye" (二人目を産む), which it does after 二人 but not after 三人. JMdict's 二人目 is no longer merged, like 三人目. The written reading of a counter now includes a polite prefix before it (お二人【おふたり】, お一つ【おひとつ】; it was お二人【ふたり】).
+
+**Kept as words:** the JMdict words made of them that UniDic keeps whole or that merging finds (一人一人, 一人前, 一人暮らし, 二人組, 二人連れ, 二人がかり). A first version also kept merging from taking 二人 + any suffix, which split 二人連れ and 二人がかり into 人 and a suffix of no use alone: only the ordinal 目 is held back now.
+
+**Found while checking:** 一つ and いくつ, listed in the table of what remained, were already counted under つ: UniDic splits them (一 + つ, いく + つ) in every context tried, and the six books list no 一つ or いくつ. 独り (alone) has its own lemma and stays a word.
+
+On the six books, the only changes are 一人, 二人, １人, ２人 and 二人目 moving under 人【にん】 (in 無職転生, 人【にん】 goes from 1,128 to 3,616 occurrences, the sum of the six).
+
 ## What remains
 
 Counts are occurrences in five of the six books (the 無職転生 PDF repeats the EPUB), scanned on 2026-11-15 with commit `abd6fcb`.
 
 | # | Problem | Examples | Occurrences | Likely approach |
 |---|---|---|---|---|
-| 1 | **Number words UniDic keeps as one token** are listed as words of their own, while 三人 and 3つ go under their counter: inconsistent with decision 5 | 二人, 一人, 一つ (tagged as a suffix), いくつ | 5,507 / 3,917 / ~2,000 / ~580 | Treat a single token made of a number and a counter like a grouped one: counted under 人 or つ, with 二人【ふたり】 as its written reading |
-| 2 | **Grammar suffixes after a verb stem** are listed apart from the verb | 落ち方, 戦い方 (方); 耐え難い, 説明しにくい; 使いやすい; 居づらい | ~1,000 / ~730 / ~530 / ~100 | Attach like がる and たい: 使いやすい is 使う, "easy to (やすい)" |
-| 3 | **Suffixes that derive a word from a noun or verb** | メイドっぽい, 助かるっぽい; 儀式めいた | ~320 / ~300 | Attach like decision 6: 儀式めいた is 儀式, "-like (めく)". 的 (入門的な, ~730) is borderline: productive, but JMdict has many 〜的 words, so it stays a word for now |
-| 4 | **JMdict expressions split apart**: merging stops at particles and auxiliaries (to keep phrases such as 頭を下げる apart) and never starts at a pronoun | 何もかも; それなり; 相変わらず | 555 / 534 / 318 | Merge a run across a particle, auxiliary or pronoun start only when JMdict has the whole as an expression |
-| 5 | **Kanji prefixes** are listed as words of their own | 大 (大銅貨), 不, 聖 | ~1,600 for 大 | Decide whether they attach like お, with the noun as the word |
-| 6 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
-| 7 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
+| 1 | **Grammar suffixes after a verb stem** are listed apart from the verb | 落ち方, 戦い方 (方); 耐え難い, 説明しにくい; 使いやすい; 居づらい | ~1,000 / ~730 / ~530 / ~100 | Attach like がる and たい: 使いやすい is 使う, "easy to (やすい)" |
+| 2 | **Suffixes that derive a word from a noun or verb** | メイドっぽい, 助かるっぽい; 儀式めいた | ~320 / ~300 | Attach like decision 6: 儀式めいた is 儀式, "-like (めく)". 的 (入門的な, ~730) is borderline: productive, but JMdict has many 〜的 words, so it stays a word for now |
+| 3 | **JMdict expressions split apart**: merging stops at particles and auxiliaries (to keep phrases such as 頭を下げる apart) and never starts at a pronoun | 何もかも; それなり; 相変わらず | 555 / 534 / 318 | Merge a run across a particle, auxiliary or pronoun start only when JMdict has the whole as an expression |
+| 4 | **Kanji prefixes** are listed as words of their own | 大 (大銅貨), 不, 聖 | ~1,600 for 大 | Decide whether they attach like お, with the noun as the word |
+| 5 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
+| 6 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
 
 ### Kept as they are, on purpose
 
