@@ -1132,7 +1132,8 @@ fn is_ending(previous: &Token, token: &Token) -> bool {
 
 /// Whether the suffix `token` makes another word of the one before it, `previous` (JMdict words made this way
 /// are already whole: 美しさ, 嬉しがる, 言い方): さ, み, げ, め and がる after the stem of an adjective (寒がる,
-/// 子供っぽさ), a na-adjective (静かさ) or a noun that can be one (真剣さ), the plurals 達, ら and ども after
+/// 子供っぽさ), a na-adjective (静かさ) or a noun that can be one (真剣さ), also さ after any noun (不気味さ) and
+/// the め of contempt after a noun or pronoun (リア充め), the plurals 達, ら and ども after
 /// a noun or pronoun (子供達, 彼ら, 私ども), which may end in a suffix (ママさんたち, 候補者たち), and after the
 /// stem of a verb, 方 (戦い方) and the adjectives 難い, にくい, やすい and づらい (耐え難い, 使いやすい), which
 /// JMdict merging leaves apart even where JMdict has the whole (see [`longest_headword`]); っぽい after a noun, verb,
@@ -1149,7 +1150,14 @@ fn is_derivation(previous: &Token, token: &Token) -> bool {
     let verb_stem = previous.field(5).starts_with("連用形")
         && (pos == "動詞" || pos == "助動詞" && matches!(previous.field(7), "れる" | "られる" | "せる" | "させる"));
     match token.field(7) {
-        "さ" | "み" | "気" | "目" | "がる" => stem,
+        // さ after any noun but a name: UniDic tags it a suffix only when it makes a noun of degree (不気味さ, 浅慮さ)
+        // (in kana: the サ of the name サテラ is not one)
+        "さ" => stem || pos == "名詞" && !matches!(sub, "数詞" | "固有名詞") && token.surface == "さ",
+        // め after a noun or pronoun, in kana: contempt (リア充め, 貴様め; not the 目 of 境目)
+        "目" => stem || noun && token.surface == "め",
+        // UniDic's own lemma for it before 。 (リア充め。)
+        "奴" => noun && token.surface == "め",
+        "み" | "気" | "がる" => stem,
         "方" => verb_stem && token.field(6) == "カタ",
         "難い" | "易い" | "辛い" => verb_stem,
         // After a noun, or a verb, adjective or auxiliary in any form (メイドっぽい, 助かるっぽい, 来たっぽい, 飽きっぽい)
@@ -1198,6 +1206,11 @@ fn ending_form(previous: &Token, token: &Token) -> Option<&'static str> {
         ("接尾辞", "さ") => "noun of degree (さ)",
         ("接尾辞", "み") => "noun (み)",
         ("接尾辞", "気") => "seeming (げ)",
+        // Of oneself, humble (私め, わたくしめ); of others, contempt (リア充め)
+        ("接尾辞", "目" | "奴") if previous.field(0) == "代名詞" && matches!(previous.field(7).split('-').next(), Some("私" | "僕" | "俺" | "我" | "己" | "拙者" | "小生" | "手前")) => {
+            "humble (め)"
+        }
+        ("接尾辞", "目" | "奴") if matches!(previous.field(0), "名詞" | "代名詞") || previous.field(0) == "接尾辞" && previous.field(1) == "名詞的" => "contempt (め)",
         ("接尾辞", "目") => "somewhat (め)",
         ("接尾辞", "がる") => "shows signs of (がる)",
         ("接尾辞", "方") => "way of (方)",
@@ -1751,6 +1764,14 @@ mod dictionary_tests {
         assert_eq!(conjugated("子供達"), one("子供達", "子供", "plural (たち)", "達"));
         assert_eq!(conjugated("候補者たち"), one("候補者たち", "候補者", "plural (たち)", "達"));
         assert_eq!(conjugated("美しさ"), one("美しさ", "美しさ", "", ""));
+        // さ after any noun but a name, also after a merged JMdict word, and め of contempt after a noun
+        assert_eq!(conjugated("不気味さを").remove(0), one("不気味さ", "不気味", "noun of degree (さ)", "さ").remove(0));
+        assert_eq!(conjugated("浅慮さを").remove(0), one("浅慮さ", "浅慮", "noun of degree (さ)", "さ").remove(0));
+        assert_eq!(conjugated("リア充め"), one("リア充め", "リア充", "contempt (め)", "目"));
+        assert_eq!(conjugated("馬鹿め"), one("馬鹿め", "馬鹿", "contempt (め)", "目"));
+        assert_eq!(conjugated("私め"), one("私め", "私", "humble (め)", "目"));
+        assert_eq!(conjugated("リア充め。").remove(0).2, "contempt (め)");
+        assert_eq!(conjugated("この色男め").remove(1), one("色男め", "色男", "contempt (め)", "目").remove(0));
         // After the stem of a verb: 方 unless JMdict has the whole, and 難い, やすい and づらい always
         assert_eq!(conjugated("戦い方"), one("戦い方", "戦う", "way of (方)", "方"));
         assert_eq!(conjugated("言い方"), one("言い方", "言い方", "", ""));

@@ -186,14 +186,29 @@ Kana runs are also looked up as the reading of a rarely used kanji spelling (そ
 
 On the six books, the merged expressions take about 3,600 occurrences in 無職転生 and 7,200 in Re:ゼロ from their parts (何, ない, それ, もし, いつ, 変わる…): in Re:ゼロ, 何もかも 367 (and なにもかも 127), 相変わらず 247, もしかして 175, それにしても 169, それなりに 143, いつの間にか 111. Every word gained is a JMdict expression; some are plain phrases JMdict happens to list (間にある, 年に一度). Tokenizing is about 14% slower (無職転生: 3.2 s to 3.65 s for the whole CLI run), with the same early exit as `longest_headword`.
 
+### 15. さ after any noun (commit "さ after any noun, and め of contempt or humility")
+
+The derivation rule of decision 6 took さ only after the stem of an adjective, a na-adjective or a noun UniDic marks as one that can be a na-adjective. So it missed さ after a JMdict word merged from tokens (不気味さ: the last token, 気味, is a plain noun) and after nouns UniDic does not mark (浅慮さ, 切迫さ, 洗練さ).
+
+**Decided:** さ attaches after any noun but a number or a name, when UniDic tags it as a suffix and it is written in hiragana (不気味さ is 不気味, "noun of degree (さ)"). On the five books, UniDic tags it a suffix after a plain noun only when it makes a noun of degree (不気味さ 19, 不機嫌さ 16, 非常識さ 9, 浅慮さ 6). Where it is the sentence-final particle (努力次第さ。), UniDic tags it as a particle, which never attaches.
+
+**Guards found on the books:** a name (ルディさ、, a vocative), and katakana: UniDic splits the name サテラ into サ (the suffix さ) and テラ, which made 偽サテラ 偽 + "noun of degree".
+
+**Not changed:** after a na-adjective, UniDic sometimes tags the sentence-final さ as the suffix (大丈夫さ。, 十分さ。, 当たり前さ」), which decision 6's rule attaches as "noun of degree". Before punctuation, the suffix is mostly a noun of degree (の大きさ、, の冷たさ。, の迅速さ、), so no guard was added.
+
+The six books' lists do not change: さ was a single hiragana, never listed. It changes what the reader says.
+
+### 16. め of contempt, and of humility (same commit)
+
+After a noun, め (リア充め, この色男め, 魔王め) stayed a fragment, and after a noun UniDic marks as a possible na-adjective it was taken for the "somewhat" of decision 6 (馬鹿め).
+
+**Decided:** め written in hiragana after a noun or pronoun is part of it: "contempt (め)" (リア充め is リア充, 馬鹿め is 馬鹿), or "humble (め)" after a first-person pronoun (私め, わたくしめ). After the stem of an adjective or a na-adjective, it stays "somewhat (め)" (JMdict has most of these whole: 早め, 大きめ). UniDic gives it the lemma 目, or 奴 before 。 (リア充め。): both count. The kanji 目 after a noun is not this suffix (境目, and ordinals: decision 5).
+
+On the five books it attaches to about 140 nouns, most of them names (バルトめ, チシャめ) and insults (化け物め, 卑怯者め). The lists do not change: め was a single hiragana, never listed.
+
 ## What remains
 
-Counts are occurrences in five of the six books (the 無職転生 PDF repeats the EPUB), scanned on 2026-11-15 with commit `abd6fcb`.
-
-| # | Problem | Examples | Occurrences | Likely approach |
-|---|---|---|---|---|
-| 1 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
-| 2 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
+Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16).
 
 ### Kept as they are, on purpose
 
@@ -205,4 +220,5 @@ Counts are occurrences in five of the six books (the 無職転生 PDF repeats th
 
 - **Sound words and laughs** are cut into pieces (ふよふよ, ふはは). They have no dictionary entries to look up.
 - **Katakana names** are split into known words (ミリス → ミ + リス, グレイ + ラット).
+- **Context changes the split:** 何もかもが is 何 + も + か + もが, so 何もかも is not found there; before 。, なり is the classical copula (それなり。 is それ + なり); the sentence-final さ is sometimes tagged as the suffix (大丈夫さ。).
 - **Readings chosen out of context:** 三本 alone is read as the surname みもと, 千 alone as a person's name, the 七 of the name 七陰 as a prefix, 第一 as the adverb "first of all" (第一話 is then 第一 + 話 read はなし), and あの方 as ほう.
