@@ -54,7 +54,7 @@ pub struct ParsedWord {
     /// word lists.
     pub affixes: Vec<ParsedWord>,
     /// What the word's affixes mean, in order ("polite (お)", "passive or potential (られる)", "past (た)")
-    pub forms: Vec<&'static str>,
+    pub forms: Vec<Cow<'static, str>>,
     /// For a word with the same dictionary form as another word but read differently (the 様 of ようだ, not
     /// the 様 of エミリア様), its reading, which keeps the two apart in counts (see [`Self::key`])
     pub homograph: Option<String>,
@@ -704,7 +704,7 @@ fn attach_counters(
                 word.span.end = ordinal.span.end;
                 source.end = ordinal_source.end;
                 word.written_reading.iter_mut().for_each(|reading| reading.push_str(&in_kana("め".to_string())));
-                word.forms.push("ordinal (目)");
+                word.forms.push("ordinal (目)".into());
             }
             // A single kana UniDic takes for a number is not one (the シ of シッ), nor kana it takes for 第 (the ダイ
             // of ダイスキヤキ, the だい of だいぃぶ)
@@ -753,7 +753,7 @@ fn attach_counters(
                 span: first.0..span_end,
                 kind: WordKind::Number,
                 affixes: Vec::new(),
-                forms: if prefix.is_some() { vec!["ordinal (第)"] } else { Vec::new() },
+                forms: if prefix.is_some() { vec!["ordinal (第)".into()] } else { Vec::new() },
                 homograph: None,
                 written_reading: None,
             };
@@ -768,13 +768,13 @@ fn attach_counters(
         if let Some((mut prefix, _)) = prefix {
             prefix.kind = WordKind::Grammar;
             word.affixes.push(prefix);
-            word.forms.push("ordinal (第)");
+            word.forms.push("ordinal (第)".into());
         }
         if let Some((ordinal, ordinal_source)) = items.next_if(|(w, s)| next_to(&word, &source, w, s) && is_ordinal(s)) {
             word.span.end = ordinal.span.end;
             source.end = ordinal_source.end;
             reading.push('め');
-            word.forms.push("ordinal (目)");
+            word.forms.push("ordinal (目)".into());
         }
         word.written_reading = Some(in_kana(reading));
         attached.push(word);
@@ -968,7 +968,7 @@ fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[
             && last_token.is_some_and(|last| last + 1 == source.start && is_ending(&tokens[last], &tokens[source.start]));
         let (Some(head), true) = (attached.last_mut(), ending) else {
             let last = &tokens[source.end - 1];
-            word.forms.extend(own_form(last));
+            word.forms.extend(own_form(last).map(Cow::Borrowed));
             last_token = Some(source.end - 1);
             attached.push(word);
             continue;
@@ -986,8 +986,8 @@ fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[
         word.kind = WordKind::Grammar;
         head.span.end = word.span.end;
         for form in ending_form(previous, token).into_iter().chain(own_form(token)) {
-            if head.forms.last() != Some(&form) {
-                head.forms.push(form);
+            if head.forms.last().map(|f| f.as_ref()) != Some(form) {
+                head.forms.push(form.into());
             }
         }
         head.affixes.push(word);
@@ -996,45 +996,68 @@ fn attach_endings(words: Vec<ParsedWord>, sources: Vec<Range<usize>>, tokens: &[
     attached
 }
 
-/// Puts each polite prefix お or ご into the word after it (お二人 is 二人, ご出席 is 出席, お聞き is 聞く), unless
-/// JMdict has the whole word (お茶, ご飯), which is then already one word; and 第 into a word that starts with a
-/// number (第一軍 is 一軍), which UniDic sometimes reads as one word (第 before numbers is part of them: see
-/// [`attach_counters`]).
+/// Puts each prefix into the word after it, unless JMdict has the whole word (お茶, ご飯, 不気味), which is then
+/// already one word:
+/// - the polite お or ご (お二人 is 人, ご出席 is 出席, お聞き is 聞く), as grammar
+/// - 第 into a word that starts with a number (第一軍 is 一軍), which UniDic sometimes reads as one word (第 before
+///   numbers is part of them: see [`attach_counters`]), as grammar
+/// - a kanji prefix (大迷宮 is 迷宮, "prefix (大)"), which stays a word to learn: word lists count it, while the
+///   reader looks up the word after it wherever it is clicked
 fn attach_prefixes(words: Vec<ParsedWord>) -> Vec<ParsedWord> {
+    #[derive(PartialEq)]
+    enum Prefix {
+        Polite,
+        Ordinal,
+        Kanji,
+    }
     let mut attached: Vec<ParsedWord> = Vec::with_capacity(words.len());
-    let mut prefix: Option<ParsedWord> = None;
+    let mut pending: Option<(ParsedWord, Prefix)> = None;
     for mut word in words {
-        if let Some(mut polite) = prefix.take() {
-            // A word to learn, next to the prefix in the text: not a particle or another interjection (お、お…)
-            let ordinal = polite.base_word == "第";
-            let fits = if ordinal { word.spelling.starts_with(is_numeral_char) } else { !matches!(word.pos.as_str(), "接頭辞" | "感動詞") };
-            if polite.span.end == word.span.start && word.kind == WordKind::Word && fits {
-                word.span.start = polite.span.start;
-                // A counter is read with its number, and now its prefix too (お二人 おふたり)
+        if let Some((mut prefix, kind)) = pending.take() {
+            // A word to learn, next to the prefix in the text: not a particle, another prefix or an interjection (お、お…)
+            let fits = match kind {
+                Prefix::Ordinal => word.spelling.starts_with(is_numeral_char),
+                _ => !matches!(word.pos.as_str(), "接頭辞" | "感動詞"),
+            };
+            if prefix.span.end == word.span.start && word.kind == WordKind::Word && fits {
+                word.span.start = prefix.span.start;
+                // A counter is read with its number, and now its prefix too (お二人 おふたり, 約一年 やくいちねん)
                 if let Some(reading) = word.written_reading.as_mut() {
-                    reading.insert_str(0, &polite.pronunciation);
+                    reading.insert_str(0, &prefix.pronunciation);
                 }
-                word.forms.insert(0, match polite.spelling.as_str() {
-                    _ if ordinal => "ordinal (第)",
-                    "ご" => "polite (ご)",
-                    _ => "polite (お)",
-                });
-                polite.kind = WordKind::Grammar;
-                word.affixes.insert(0, polite);
+                let form: Cow<'static, str> = match kind {
+                    Prefix::Ordinal => "ordinal (第)".into(),
+                    Prefix::Polite if prefix.spelling == "ご" => "polite (ご)".into(),
+                    Prefix::Polite => "polite (お)".into(),
+                    Prefix::Kanji => format!("prefix ({})", prefix.spelling).into(),
+                };
+                word.forms.insert(0, form);
+                if kind != Prefix::Kanji {
+                    prefix.kind = WordKind::Grammar;
+                }
+                word.affixes.insert(0, prefix);
                 attached.push(word);
                 continue;
             }
-            attached.push(polite);
+            attached.push(prefix);
         }
-        let polite = word.pos == "接頭辞"
-            && (word.base_word == "御" && matches!(word.spelling.as_str(), "お" | "ご" | "御") || word.spelling == "第" && word.kind == WordKind::Word);
-        if polite {
-            prefix = Some(word);
+        let kind = if word.pos != "接頭辞" {
+            None
+        } else if word.base_word == "御" && matches!(word.spelling.as_str(), "お" | "ご" | "御") {
+            Some(Prefix::Polite)
+        } else if word.spelling == "第" && word.kind == WordKind::Word {
+            Some(Prefix::Ordinal)
+        } else if word.kind == WordKind::Word && word.spelling.chars().any(is_cjk_kanji) {
+            Some(Prefix::Kanji)
         } else {
-            attached.push(word);
+            None
+        };
+        match kind {
+            Some(kind) => pending = Some((word, kind)),
+            None => attached.push(word),
         }
     }
-    attached.extend(prefix);
+    attached.extend(pending.map(|(prefix, _)| prefix));
     attached
 }
 
@@ -1202,8 +1225,9 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
         if field(tail, 0) == "助動詞" || field(tail, 1) == "助動詞語幹" || field(tail, 1) == "数詞"
             // Productive endings: plurals, auxiliary verbs and adjectives (歩き始める, 大きくなる, 言いにくい)
             || matches!(field(tail, 7), "達" | "等" | "共" | "始める" | "続ける" | "過ぎる" | "終わる" | "出す" | "掛ける" | "成る" | "出来る" | "難い" | "易い" | "辛い")
-            // Numbers with counters (三人, 一年生), and 一人 or 二人 with an ordinal (二人目; not 二人連れ)
-            || (start..tail).any(|i| {
+            // Numbers with counters (三人, 一年生), and 一人 or 二人 with an ordinal (二人目; not 二人連れ), unless
+            // after a prefix other than 第 (真っ二つ, 小一時間)
+            || !(field(start, 0) == "接頭辞" && field(start, 7) != "第") && (start..tail).any(|i| {
                 field(i, 1) == "数詞" && (field(i + 1, 0) == "接尾辞" || field(i + 1, 2).starts_with("助数詞"))
                     || matches!(field(i, 7), "一人" | "二人") && field(i + 1, 7) == "目"
             })
@@ -1501,7 +1525,7 @@ mod dictionary_tests {
             .iter()
             .map(|w| {
                 let endings = join(w.affixes.iter().map(|e| e.base_word.as_str()).collect());
-                (text[w.span.clone()].to_string(), w.base_word.clone(), join(w.forms.clone()), endings)
+                (text[w.span.clone()].to_string(), w.base_word.clone(), join(w.forms.iter().map(|f| f.as_ref()).collect()), endings)
             })
             .collect()
     }
@@ -1637,6 +1661,16 @@ mod dictionary_tests {
         assert_eq!(conjugated("ご出席"), one("ご出席", "出席", "polite (ご)", "御"));
         assert_eq!(conjugated("お聞き"), one("お聞き", "聞く", "polite (お)", "御"));
         assert_eq!(conjugated("お茶"), one("お茶", "お茶", "", ""));
+        // Kanji prefixes too, unless JMdict has the whole word, but they stay words in word lists
+        assert_eq!(conjugated("大迷宮"), one("大迷宮", "迷宮", "prefix (大)", "大"));
+        assert_eq!(conjugated("超可愛い"), one("超可愛い", "可愛い", "prefix (超)", "超"));
+        assert_eq!(conjugated("不気味"), one("不気味", "不気味", "", ""));
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        let tokens = tokenizer.tokenize("大迷宮").unwrap();
+        let listed: Vec<&str> = tokens.iter().flat_map(|w| w.with_affixes()).filter(|w| w.is_listed(false)).map(|w| w.base_word.as_str()).collect();
+        assert_eq!(listed, ["迷宮", "大"]);
+        assert_eq!(counted_with_numbers("約一年"), [("約一年".to_string(), "年".to_string(), "やくいちねん".to_string())]);
+        assert_eq!(conjugated("真っ二つ"), one("真っ二つ", "真っ二つ", "", ""));
         // Verbs after て, nouns and what follows them stay words of their own
         let written = |text: &str| conjugated(text).into_iter().map(|(w, ..)| w).collect::<Vec<_>>();
         assert_eq!(written("それによって"), ["それ", "に", "よって"]);

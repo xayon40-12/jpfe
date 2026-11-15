@@ -149,6 +149,19 @@ On the six books, besides those merges, っぽい leaves the lists (350 occurren
 
 **Kept as words:** 的 (入門的な, ~730), productive but with many JMdict words of its own. Kana-only JMdict words are not merged (merging needs a kanji), so それっぽい is それ, "-ish (っぽい)".
 
+### 13. Kanji prefixes are part of the word's span, and still words (commit "Kanji prefixes join the word after them and stay words")
+
+UniDic makes prefixes of 大, 超, 聖, 不, 無, 全, 約, 小, 各, 老, 副, 準, 再 and others. JMdict merging already joins the compounds JMdict has (不気味, 無意識, 非常識); the others were two words, the prefix and the noun (大迷宮: 2,028 occurrences of 大 left in five books, 超 413, 聖 321, 不 286, 無 213).
+
+**Decided, with the user:** both. The prefix is part of the span of the word after it, so the reader looks up that word wherever the compound is clicked and says "prefix (大)" (大迷宮 is 迷宮; 約一年 is 年, read やくいちねん). But the prefix stays a word of kind `Word` among the affixes, so word lists still count it, as before: 大 is learned once, and 大迷宮 then reads as 大 + 迷宮. Clicking 大 no longer shows 大's own entry. `forms` became `Cow<'static, str>` to hold "prefix (X)" for any prefix.
+
+**Rejected:**
+
+- **Attach like お**, counted as grammar: 大, 超 and 不 would drop out of the lists, although each has to be learned once.
+- **Keep them as words**, as they were: the reader would keep looking up 大 and 迷宮 apart.
+
+**Found on the way:** JMdict words made of a prefix and a number were never merged, since merging stops at a number with its counter: 真っ二つ was 真っ + つ (read まふたつ once the prefix joined it), 小一時間 was 小 + 時間. Merging now goes on after a prefix other than 第 (which makes ordinals: decision 5), and finds 真っ二つ, 小一時間, 大一番, 今一度 and お三方. These are the only changes in the six books' lists, since prefixes are still counted.
+
 ## What remains
 
 Counts are occurrences in five of the six books (the 無職転生 PDF repeats the EPUB), scanned on 2026-11-15 with commit `abd6fcb`.
@@ -156,9 +169,8 @@ Counts are occurrences in five of the six books (the 無職転生 PDF repeats th
 | # | Problem | Examples | Occurrences | Likely approach |
 |---|---|---|---|---|
 | 1 | **JMdict expressions split apart**: merging stops at particles and auxiliaries (to keep phrases such as 頭を下げる apart) and never starts at a pronoun | 何もかも; それなり; 相変わらず | 555 / 534 / 318 | Merge a run across a particle, auxiliary or pronoun start only when JMdict has the whole as an expression |
-| 2 | **Kanji prefixes** are listed as words of their own | 大 (大銅貨), 不, 聖 | ~1,600 for 大 | Decide whether they attach like お, with the noun as the word |
-| 3 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
-| 4 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
+| 2 | **さ after a merged JMdict word**: the derivation rule looks at the last token only (気味), not at the word (不気味) | 不気味さ | 200 | Look at the merged word's part of speech, or accept さ after any noun |
+| 3 | **The insult suffix め** stays a fragment | リア充め, この色男め | 139 | Attach to the noun, "contempt (め)" |
 
 ### Kept as they are, on purpose
 
