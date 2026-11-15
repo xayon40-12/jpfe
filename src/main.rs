@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 
 use jpfe::epub::extract_epub_chapters;
 use jpfe::exporter::{export_chapter_entries, pad, ExportFormat};
-use jpfe::frequency::FrequencyAnalyzer;
+use jpfe::frequency::{FrequencyAnalyzer, ListOptions};
 use jpfe::models::{vocabulary_ratio, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters;
 use jpfe::statistics::export_statistics;
@@ -34,8 +34,8 @@ struct Args {
     #[arg(short = 'o', long = "output-dir")]
     output_dir: Option<PathBuf>,
 
-    /// Target cumulative percentage of vocabulary to learn per chapter (e.g. 99.0)
-    #[arg(short = 'p', long = "target-percentage", default_value_t = 99.0)]
+    /// Target cumulative percentage of vocabulary to learn per chapter (e.g. 98.0)
+    #[arg(short = 'p', long = "target-percentage", default_value_t = ListOptions::default().target_percentage)]
     target_percentage: f64,
 
     /// Number of chapters to output (e.g. 3 for first 3 chapters)
@@ -58,9 +58,13 @@ struct Args {
     #[arg(long = "include-particles", visible_alias = "include-grammar", default_value_t = false)]
     include_particles: bool,
 
-    /// Minimum occurrences across the entire novel to be included (default: 3)
-    #[arg(short = 'm', long = "min-book-count", visible_alias = "min-count", default_value_t = 3)]
+    /// Minimum occurrences across the entire novel to be included
+    #[arg(short = 'm', long = "min-book-count", visible_alias = "min-count", default_value_t = ListOptions::default().min_book_count)]
     min_book_count: usize,
+
+    /// Minimum number of chapters a word must appear in to be included (capped at the book's chapter count)
+    #[arg(long = "min-chapters", default_value_t = ListOptions::default().min_chapters)]
+    min_chapters: usize,
 
     /// Show all words including those that appeared in previous chapters (default is to hide previous words with rank holes)
     #[arg(long = "show-previous-words", visible_alias = "show-seen", visible_alias = "show-all", default_value_t = false)]
@@ -107,6 +111,7 @@ fn main() -> Result<()> {
     println!("Output directory: {:?}", output_dir);
     println!("Target cumulative percentage: {:.1}%", args.target_percentage);
     println!("Min occurrences in whole novel: {}", args.min_book_count);
+    println!("Min chapters containing the word: {}", args.min_chapters);
     println!("Pronunciation: {:?}", args.reading);
     println!("Grammar filtering: {}", if args.include_particles { "Particles/auxiliaries included" } else { "Particles, auxiliaries and contractions excluded" });
     println!("Hide previously seen words: {hide_previous_words}\n{RULE}");
@@ -166,10 +171,13 @@ fn main() -> Result<()> {
     );
 
     let show_first_seen = args.show_previous_words || args.show_first_appearance;
-    let analyze = |i: usize| {
-        let chapter = &tokenized_chapters[i];
-        analyzer.analyze_chapter(i, chapter, args.target_percentage, args.min_book_count, hide_previous_words, args.include_particles)
+    let options = ListOptions {
+        target_percentage: args.target_percentage,
+        min_book_count: args.min_book_count,
+        min_chapters: args.min_chapters,
+        hide_previous_words,
     };
+    let analyze = |i: usize| analyzer.analyze_chapter(i, &tokenized_chapters[i], &options, args.include_particles);
     // Vocabulary-ratio baseline: the first chapter (the prologue if there is one, otherwise chapter 1)
     let baseline_ratio = vocabulary_ratio(analyze(0).len(), char_counts[0]);
     let filter_mode_desc = if hide_previous_words {

@@ -16,8 +16,9 @@ A fast, precision Rust CLI tool designed for Japanese language learners and NLP 
 - **Punctuation & Symbol Filtering**: Non-word sequences, ellipses, and punctuation (e.g., `「――――`, `　………`, `―――`, `！　`, `　『`, `ーーー`) are strictly excluded from token counts and output files.
 - **Visually Aligned Columns**: Automatically pads columns taking into account East Asian display widths (Kanji/Kana = width 2, Latin/digits = width 1), ensuring all columns align vertically in terminal pagers and text editors.
 - **Clean Percentages**: Redundant decimal frequencies are omitted, showing clean, readable percentage metrics (`chapter_percent`, `cumulative_percent`, and `book_percent`).
-- **Whole-Novel Min Count (`-m`, default: 3)**: Filters out hapax legomena and words that occur less than 3 times across the entire novel, focusing your study effort on recurring vocabulary.
-- **Target Vocabulary Coverage (Default: 99.0%)**: Calculates running cumulative frequency percentages and filters down to any chosen threshold (e.g., 99%, 95%, 90%) to prioritize high-yield words.
+- **Whole-Novel Min Count (`-m`, default: 5)**: Filters out hapax legomena and words that occur less than 5 times across the entire novel, focusing your study effort on recurring vocabulary.
+- **Minimum Chapters (`--min-chapters`, default: 3)**: Filters out words found in fewer than 3 chapters, such as a name or object repeated in a single scene. A book with fewer chapters keeps the words found in all of them.
+- **Target Vocabulary Coverage (Default: 98.0%)**: Calculates running cumulative frequency percentages and filters down to any chosen threshold (e.g., 99%, 95%, 90%) to prioritize high-yield words.
 - **Hiding Previously Seen Words (Default: Active)**: Automatically hides words that already appeared in earlier chapters while preserving the word's true chapter rank (creating natural rank "holes"). This allows learners to focus strictly on new vocabulary introduced in each chapter.
 - **Two Parallel Output Formats (`full/` and `words/`)**:
   - `full/`: Comprehensive, visually aligned TSV/CSV tables with full statistics for analysis.
@@ -103,6 +104,7 @@ Contains visually aligned tab-separated (`.tsv`) or comma-separated (`.csv`) fil
 | `cumulative_percent` | Running cumulative coverage of this chapter | `50.61%` |
 | `book_occurrences` | Total occurrences across the entire novel | `88` |
 | `book_percent` | Relative frequency across the entire novel (percentage) | `0.0058%` |
+| `book_chapters` | Number of chapters of the novel the word appears in | `42` |
 | `first_appearance_chapter`* | Chapter where word is first encountered (*included when showing all words) | `第一話` |
 
 ### 3. `statistics/` Directory
@@ -128,7 +130,7 @@ To see these statistics as charts, use the viewer below.
 - **Download word lists (.zip)**: the shown book's filtered word lists, one `words/chapter_…txt` per chapter, as in the CLI output.
 - **Reader** (📖 button at the top left; 📊 goes back): the selected book's text, full screen, opened at the chapter you learned up to (the first chapter before any), or where you left it if that has not changed. The text is set on a grid, one full-width character per cell (half-width letters and digits are shown full-width), vertically by default (縦書き: columns from right to left, with the mouse wheel moving on through them), or horizontally (**⚙ Settings**). Punctuation and closing brackets never start a line. PDF page numbers are shown small, after the paragraph where the page ends. Click or tap any word to see its JMdict definitions in a window titled with the word as the text writes it: first the word, its other spellings and its readings, then what its conjugation means (`passive or potential (られる), past (た)`). The kanji of the word and of its other spellings can be clicked for their on and kun readings, name readings, meanings, stroke count, school grade and frequency (from KANJIDIC2). Escape or a click beside the words closes the windows. Change the font size by pinching, with Shift + scroll wheel (or Cmd/Ctrl + scroll), or in **⚙ Settings**; it is remembered.
 
-Each book entry also shows how many of its words are left once the words learned in your other books are removed. **⚙ Settings** has the reader's font size and changes how the word lists are built, with the same meaning and defaults as the CLI options: coverage target (`-p 99`), minimum occurrences in the book (`-m 3`), only words new to the book (opposite of `--show-previous-words`), leaving out katakana-only words (on by default; viewer only), and including particles and auxiliary verbs (`--include-particles`, which analyzes the books again). At the bottom, **Show debug information** (off by default) shows load times and storage errors in the sidebar. The look follows macOS colors and controls, in light or dark mode depending on the system setting.
+Each book entry also shows how many of its words are left once the words learned in your other books are removed. **⚙ Settings** has the reader's font size and changes how the word lists are built, with the same meaning and defaults as the CLI options: coverage target (`-p 98`), minimum occurrences in the book (`-m 5`), minimum chapters in the book (`--min-chapters 3`), only words new to the book (opposite of `--show-previous-words`), leaving out katakana-only words (on by default; viewer only), and including particles and auxiliary verbs (`--include-particles`, which analyzes the books again). At the bottom, **Show debug information** (off by default) shows load times and storage errors in the sidebar. The look follows macOS colors and controls, in light or dark mode depending on the system setting.
 
 Imported books, your progress in each, the settings and the plot scales are remembered: in the browser's private storage (OPFS) on the web, and in the user data folder (e.g. `~/Library/Application Support/jpfe-viewer`) on the desktop. Each book's analysis is cached too, and reused only by the same build of the viewer with the same dictionary; after an update, books are analyzed again from their stored file. On the web, the viewer asks the browser for persistent storage once books are stored, since a browser may otherwise clear the storage of a site when it needs room; a browser may refuse (Chrome grants it to sites used often or installed, Firefox asks), which **Show debug information** reports. A new book never takes the place of files already stored: files of books missing from the book list are kept, and reported in the sidebar.
 
@@ -172,7 +174,7 @@ How the project got where it is, what was decided and why, and what remains, is 
 ## Usage Examples
 
 ### 1. Default Run on an EPUB (First 3 Chapters)
-Exports the first 3 chapters to `<path>/book.epub_frequency/` with default 99% coverage, minimum whole-book count of 3, and previously seen words hidden:
+Exports the first 3 chapters to `<path>/book.epub_frequency/` with default 98% coverage, minimum whole-book count of 5, words found in at least 3 chapters, and previously seen words hidden:
 ```bash
 jpfe path/to/book.epub -n 3
 ```
@@ -201,9 +203,9 @@ jpfe book.epub -c 0-5
 ```
 
 ### 6. Adjust Whole-Novel Minimum Count Threshold
-To include words appearing at least 5 times across the whole novel (or set to 1 to include all words):
+To include words appearing at least 10 times across the whole novel (or set `-m 1 --min-chapters 1` to include all words):
 ```bash
-jpfe book.epub -n 3 -m 5
+jpfe book.epub -n 3 -m 10
 ```
 
 ### 7. Custom Target Percentage (e.g., Top 95%)
@@ -239,8 +241,9 @@ Within each chapter, vocabulary is sorted using a multi-level priority:
 | :--- | :--- | :--- | :--- |
 | `<INPUT_FILE>` | | *(required)* | Path to the input `.epub` or `.pdf` file |
 | `--output-dir` | `-o` | `<input>_frequency` | Directory where per-chapter `full/` and `words/` files are saved |
-| `--min-book-count` | `-m` | `3` | Minimum occurrences across entire novel (alias: `--min-count`) |
-| `--target-percentage` | `-p` | `99.0` | Target cumulative frequency threshold (0.0 - 100.0) |
+| `--min-book-count` | `-m` | `5` | Minimum occurrences across entire novel (alias: `--min-count`) |
+| `--min-chapters` | | `3` | Minimum number of chapters a word appears in (capped at the book's chapter count) |
+| `--target-percentage` | `-p` | `98.0` | Target cumulative frequency threshold (0.0 - 100.0) |
 | `--show-previous-words` | | `false` | Show all words including those seen earlier (aliases: `--show-seen`, `--show-all`) |
 | `--show-first-appearance` | | `false` | Force including `first_appearance_chapter` column when hiding previous words |
 | `--include-particles` | | `false` | Include grammatical particles (`助詞`) and auxiliary verbs (`助動詞`) (alias: `--include-grammar`) |

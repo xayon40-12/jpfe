@@ -142,7 +142,7 @@ After trying it, the user said the new-words plot matters most and should be on 
 
 **Decided:**
 
-- **The settings** mirror the CLI options with the same defaults: coverage target, minimum count, only words new to the book, particles.
+- **The settings** mirror the CLI options with the same defaults: coverage target, minimum count, only words new to the book, particles (and, since decision 29, minimum chapters).
 - **Recomputing:** books keep their per-chapter word counts (`ChapterCounts`, `analyze_counts` in the library), so lists are rebuilt without tokenizing again. Only the particles option tokenizes the books again. Changes apply when a slider is released, not while it is dragged.
 - **Remaining words:** for example, with 無職転生 learned up to chapter 9, 最果てのパラディン showed 5,165 of its 7,646 words left.
 
@@ -352,6 +352,21 @@ The user: "now that we have the viewer, we can retire the old svg output to have
 ### 28. Cargo's new build directory layout (commit `cdd015e`)
 
 After `61d6f99`, the Pages build failed: `build-web-assets.sh` could not find the compiled UniDic. CI installs the latest stable Rust (cargo 1.101), and since cargo 1.100 build script outputs live in `build/<pkg>/<hash>/out` instead of `build/<pkg>-<hash>/out`. Locally, Rust was 1.99. The script now looks for the newest build under either layout, and stops with a clear message if there is none. Before, it went on and failed later in zstd. The user confirmed that CI passed.
+
+## Defaults
+
+### 29. Stricter defaults: 98%, 5 occurrences, 3 chapters
+
+The user asked for new defaults: a minimum of 5 occurrences in the book instead of 3, a coverage target of 98% instead of 99%, and a new filter on **dispersion**, the number of chapters a word appears in, with a minimum of 3.
+
+**Decided:**
+
+- **Each word records its chapter count** (`BookWord::chapters`), shown in the `full/` tables as `book_chapters`. `--min-chapters` (CLI) and *Minimum chapters in the book* (viewer settings) leave out the words found in fewer chapters. Like the minimum count, it keeps rank holes and does not move the coverage cut-off.
+- **The minimum is capped at the book's chapter count,** so a PDF without headings (one chapter) or a short book does not end up with empty lists: it keeps the words found in all its chapters.
+- **The defaults live in one place,** `ListOptions::default()` in the library, used by both the CLI and the viewer, which share the options as `ListOptions` instead of four arguments.
+- **Saved viewer settings are kept:** a state saved before this change keeps 99% and 3; *Restore defaults* applies the new ones.
+
+**Measured** on the six books (total words over all chapter lists, old defaults → new): 最果てのパラディン 7,628 → 5,022, 無職転生 EPUB 13,541 → 9,555, 無職転生 PDF 13,531 → 9,536, 蜘蛛ですが 9,358 → 6,546, 陰の実力者になりたくて 4,844 → 3,234, Re:ゼロ 21,655 → 16,572. On 無職転生, each change alone: 98% → 13,123, `-m 5` → 9,772, 3 chapters → 12,530; on top of `-m 5`, 3 chapters removes another 213 words, such as アンジェ (113 times, in 2 chapters) and ぬいぐるみ (7 times, in 2). With `-p 99 -m 3 --min-chapters 1`, the lists are identical to the previous commit.
 
 ## How changes were checked
 

@@ -6,7 +6,7 @@ use std::io::{Cursor, Write};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use jpfe::epub::extract_epub_chapters_from_bytes;
-use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer};
+use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer, ListOptions};
 use jpfe::models::{chapter_file_stem, Chapter, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters_from_bytes;
 use jpfe::tokenizer::{is_katakana_word, JapaneseTokenizer, ParsedWord};
@@ -22,6 +22,8 @@ pub struct Settings {
     pub target_percentage: f64,
     /// `--min-book-count`: words seen fewer times in the whole book are left out
     pub min_book_count: usize,
+    /// `--min-chapters`: words found in fewer chapters of the book are left out
+    pub min_chapters: usize,
     /// Opposite of `--show-previous-words`: only list words new to the book
     pub hide_previous_words: bool,
     /// `--include-particles`; changing it analyzes the books again (which takes them from their text)
@@ -32,12 +34,18 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            target_percentage: 99.0,
-            min_book_count: 3,
-            hide_previous_words: true,
-            include_particles: false,
-            hide_katakana_words: true,
+        let ListOptions { target_percentage, min_book_count, min_chapters, hide_previous_words } = ListOptions::default();
+        Self { target_percentage, min_book_count, min_chapters, hide_previous_words, include_particles: false, hide_katakana_words: true }
+    }
+}
+
+impl Settings {
+    fn list_options(&self) -> ListOptions {
+        ListOptions {
+            target_percentage: self.target_percentage,
+            min_book_count: self.min_book_count,
+            min_chapters: self.min_chapters,
+            hide_previous_words: self.hide_previous_words,
         }
     }
 }
@@ -306,12 +314,13 @@ impl PendingBook {
 }
 
 fn word_lists(analyzer: &FrequencyAnalyzer, counts: &[ChapterCounts], s: &Settings) -> Vec<Vec<String>> {
+    let options = s.list_options();
     counts
         .iter()
         .enumerate()
         .map(|(i, c)| {
             analyzer
-                .analyze_counts(i, c, s.target_percentage, s.min_book_count, s.hide_previous_words)
+                .analyze_counts(i, c, &options)
                 .into_iter()
                 // Like the CLI's other filters, this leaves the coverage cut-off unchanged
                 .filter(|e| !(s.hide_katakana_words && is_katakana_word(&e.word)))
@@ -366,17 +375,17 @@ mod tests {
             chapters,
             tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥", "パン"])],
         };
-        let mut book = pending.finish(&Settings { min_book_count: 1, ..Settings::default() });
+        let mut book = pending.finish(&Settings { min_book_count: 1, min_chapters: 1, ..Settings::default() });
         assert_eq!(book.words, [vec!["猫", "犬"], vec!["鳥"]]);
         assert_eq!(book.learned, Some(1));
-        book.apply(&Settings { min_book_count: 2, ..Settings::default() });
+        book.apply(&Settings { min_book_count: 2, min_chapters: 1, ..Settings::default() });
         assert_eq!(book.words, [vec!["猫"], Vec::<&str>::new()]);
-        let all = Settings { min_book_count: 1, hide_previous_words: false, hide_katakana_words: false, ..Settings::default() };
+        let all = Settings { min_book_count: 1, min_chapters: 1, hide_previous_words: false, hide_katakana_words: false, ..Settings::default() };
         book.apply(&all);
         assert_eq!(book.words[1], ["猫", "パン", "鳥"]);
-        book.apply(&Settings { min_book_count: 1, hide_katakana_words: true, ..Settings::default() });
+        book.apply(&Settings { min_book_count: 1, min_chapters: 1, hide_katakana_words: true, ..Settings::default() });
         assert_eq!(book.words[1], ["鳥"]);
-        book.apply(&Settings { min_book_count: 1, hide_katakana_words: false, ..Settings::default() });
+        book.apply(&Settings { min_book_count: 1, min_chapters: 1, hide_katakana_words: false, ..Settings::default() });
         assert_eq!(book.words[1], ["パン", "鳥"]);
     }
 
@@ -388,7 +397,7 @@ mod tests {
             chapters,
             tokens: vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
         };
-        let settings = Settings { min_book_count: 1, ..Settings::default() };
+        let settings = Settings { min_book_count: 1, min_chapters: 1, ..Settings::default() };
         let book = pending.finish(&settings);
         let key = CacheKey { build: "b1", dictionary: "d1", include_particles: false };
         let bytes = book.analysis_bytes(&key);
@@ -447,7 +456,7 @@ mod tests {
             chapters: vec![Chapter { index: 1, title: "第1話".into(), text: String::new() }],
             tokens: vec![vec![spelled("出来る", "できる"), spelled("出来る", "できる"), spelled("出来る", "出来る")]],
         };
-        let book = pending.finish(&Settings { min_book_count: 1, ..Settings::default() });
+        let book = pending.finish(&Settings { min_book_count: 1, min_chapters: 1, ..Settings::default() });
         // Matched across books by its dictionary form, however this book spells it
         assert_eq!(book.words, [vec!["出来る"]]);
         assert_eq!(book.spelling("出来る"), "できる");

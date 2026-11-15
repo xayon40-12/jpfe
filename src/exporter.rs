@@ -45,7 +45,7 @@ pub fn export_chapter_entries(
 
     let mut header = vec![
         "rank", "word", "pronunciation", "pos", "occurrences",
-        "chapter_percent", "cumulative_percent", "book_occurrences", "book_percent",
+        "chapter_percent", "cumulative_percent", "book_occurrences", "book_percent", "book_chapters",
     ];
     if include_first_appearance_col {
         header.push("first_appearance_chapter");
@@ -55,7 +55,7 @@ pub fn export_chapter_entries(
             let mut row = vec![
                 e.rank.to_string(), e.word.clone(), e.pronunciation.clone(), e.pos.clone(),
                 e.occurrences.to_string(), e.chapter_percent.clone(), e.cumulative_percent.clone(),
-                e.book_occurrences.to_string(), e.book_percent.clone(),
+                e.book_occurrences.to_string(), e.book_percent.clone(), e.book_chapters.to_string(),
             ];
             if include_first_appearance_col {
                 row.push(e.first_appearance_chapter.clone());

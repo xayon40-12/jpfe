@@ -676,6 +676,10 @@ impl ViewerApp {
                 ui.add(egui::Slider::new(&mut s.min_book_count, 1..=20));
                 note(ui, "Words that appear fewer times in the whole book are left out.");
 
+                ui.label("Minimum chapters in the book");
+                ui.add(egui::Slider::new(&mut s.min_chapters, 1..=20));
+                note(ui, "Words found in fewer chapters are left out, so that a word repeated in a single scene is not listed.");
+
                 ui.checkbox(&mut s.hide_previous_words, "Only words new to the book");
                 note(ui, "Leave out words already listed in an earlier chapter of the same book.");
 

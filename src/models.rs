@@ -18,6 +18,8 @@ pub struct WordEntry {
     pub cumulative_percent: String,
     pub book_occurrences: usize,
     pub book_percent: String,
+    /// Number of chapters of the book the word appears in
+    pub book_chapters: usize,
     pub first_appearance_chapter: String,
 }
 
