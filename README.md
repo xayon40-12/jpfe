@@ -161,7 +161,7 @@ The tokenizer reports every word it finds, with what kind of word it is; word li
 - **Single hiragana** other than conjunctions are never listed: interjections (`あ`, `え`), and prefixes and suffixes such as `お` and `さ` (`高さ`).
 - **Everything else is listed**, prefixes and suffixes included (`不`, `超`, `的`, `性`, `者`, `様`, and counters such as `冊` or `枚`). Words are counted under their dictionary form, so a verb written in kana is not mistaken for a contraction (`手にとって` is `取る`, `によって` is `因る`).
 
-This happens before any counting, so occurrences, percentages, ranks and both the `full/` tables and the `words/` lists follow these rules.
+This happens before any counting, so occurrences, percentages, ranks and both the `full/` tables and the `words/` lists follow these rules. How each rule was decided, and the grouping problems that remain, are in [docs/word-grouping.md](docs/word-grouping.md).
 
 ## Usage Examples
 
