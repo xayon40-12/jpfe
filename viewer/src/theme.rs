@@ -30,6 +30,8 @@ pub struct Palette {
 #[derive(Clone, Copy)]
 pub struct WordFills {
     pub noun: Color32,
+    /// A darker tint of the noun's color, for names of people and places
+    pub proper_noun: Color32,
     pub verb: Color32,
     /// い- and な-adjectives
     pub adjective: Color32,
@@ -68,6 +70,7 @@ const LIGHT: Palette = Palette {
     marker: Color32::from_rgb(0x0A, 0x7A, 0x8C),
     words: WordFills {
         noun: Color32::from_rgb(0xDC, 0xE8, 0xFA),
+        proper_noun: Color32::from_rgb(0xBF, 0xD5, 0xF7),
         verb: Color32::from_rgb(0xF9, 0xDA, 0xDA),
         adjective: Color32::from_rgb(0xD9, 0xF0, 0xD6),
         adverb: Color32::from_rgb(0xEA, 0xDC, 0xF8),
@@ -99,6 +102,7 @@ const DARK: Palette = Palette {
     marker: Color32::from_rgb(0x5C, 0xD0, 0xE3),
     words: WordFills {
         noun: Color32::from_rgb(0x25, 0x3A, 0x5C),
+        proper_noun: Color32::from_rgb(0x13, 0x2A, 0x58),
         verb: Color32::from_rgb(0x56, 0x2A, 0x30),
         adjective: Color32::from_rgb(0x22, 0x49, 0x2B),
         adverb: Color32::from_rgb(0x43, 0x30, 0x5E),

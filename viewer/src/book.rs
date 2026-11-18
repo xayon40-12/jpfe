@@ -566,6 +566,7 @@ mod tests {
             forms: Vec::new(),
             homograph: None,
             written_reading: None,
+            proper_noun: false,
         };
         words.iter().map(word).collect()
     }

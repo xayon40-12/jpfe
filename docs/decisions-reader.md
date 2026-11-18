@@ -132,9 +132,9 @@ Planned in [plans-sync-and-highlighting.md](plans-sync-and-highlighting.md), whe
 
 **A *Highlight words* setting** in the settings window, beside *Paginate*, saved in the state like the font size and direction (`reader_highlight`), and reset by *Restore defaults*. **Off by default**, as planned (the user has not confirmed the default yet). Old state files load with it off.
 
-**Every word on a rounded rectangle**, the one the reader already drew under the hovered word, split into colored regions by the word's parts. **No tokenizer change was needed** for the parts: each `ParsedWord` already has its `span`, `kind`, UniDic `pos` and `affixes`, each affix with its own span and part of speech.
+**Every word on a rounded rectangle**, the one the reader already drew under the hovered word, split into colored regions by the word's parts. Each `ParsedWord` already had its `span`, `kind`, UniDic `pos` and `affixes`, each affix with its own span and part of speech; the one tokenizer change is a `proper_noun` flag (below).
 
-- **The stem** (the word's span minus its affixes), by part of speech: noun (名詞), verb (動詞), adjective (形容詞 and the な-adjectives 形状詞), adverb (副詞), pronoun (代名詞), counter (a word with a `written_reading`: a counter with its number, ５冊, 三人), a suffix that is a word of its own (the 家 of グレイラット家), and other (interjections, conjunctions, adnominals, expressions).
+- **The stem** (the word's span minus its affixes), by part of speech: noun (名詞), proper noun (名詞-固有名詞: names of people, places and organizations, in a darker tint of the noun's blue), verb (動詞), adjective (形容詞 and the な-adjectives 形状詞), adverb (副詞), pronoun (代名詞), counter (a word with a `written_reading`: a counter with its number, ５冊, 三人), a suffix that is a word of its own (the 家 of グレイラット家), and other (interjections, conjunctions, adnominals, expressions).
 - **The affixes**, by role, from their UniDic part of speech: the prefix before the word (接頭辞: the polite お and ご, 第, kanji prefixes such as 大), the suffixes (接尾辞: さ, ら, たち, っぽい, and the adjective づらい, which works like やすい), and the conjugation endings and auxiliaries (everything else: られる, た, て, the ない of 美しくない, the stems of そうだ and ようだ).
 - **Particles and other grammar** that are words of their own: a quiet grey, so the words stand out. Their endings take the same color (だった is one quiet rectangle).
 - **Numbers and fragments**: grey, endings included.
@@ -145,6 +145,7 @@ Planned in [plans-sync-and-highlighting.md](plans-sync-and-highlighting.md), whe
 | Part | Light | Dark |
 |---|---|---|
 | Noun | blue `#DCE8FA` | `#253A5C` |
+| Proper noun | darker blue `#BFD5F7` | darker, bluer `#132A58` |
 | Verb | red `#F9DADA` | `#562A30` |
 | Adjective | green `#D9F0D6` | `#22492B` |
 | Adverb | purple `#EADCF8` | `#43305E` |
@@ -157,9 +158,13 @@ Planned in [plans-sync-and-highlighting.md](plans-sync-and-highlighting.md), whe
 | Grammar | light grey `#F1F1F3` | `#2C2C2E` |
 | Number, fragment | grey `#E2E2E6` | `#38383B` |
 
-**One rectangle per word.** A word is still hit-tested and clicked as one word; its regions are only colors. The reader draws the word's rectangle in its stem's color, then each other part's region over it with square corners where the parts meet, so the parts touch with no gap or rounding between them. Between two words, each rectangle is inset by 6% of the font size (1 to 2.5 points) on each side, so word boundaries show.
+**One rectangle per word.** A word is still hit-tested and clicked as one word; its regions are only colors. The reader draws the word's rectangle in its stem's color, then each other part's region over it with square corners where the parts meet, so the parts touch with no gap or rounding between them. **No gap between words.** Each rectangle covers its characters' whole cells, along the line (top to bottom in vertical text, left to right in horizontal text), so two words' rectangles meet, and their rounded corners alone show where one word ends and the next starts, as Japanese has no spaces between words. The first version left a gap of 6% of the font size on each side of a word; the user found the rectangles too short, with part of the last character sticking out below, and asked for none.
 
-**The corner rule.** A word cut by the end of a line or column gets one rectangle per line, with **square corners on the side of the cut** and rounded corners only at the word's real start and end: the top and bottom of a column in vertical text, the left and right of a line in horizontal text (egui's per-corner `CornerRadius`). The hover and selection rectangles follow the same rule and the same insets, with highlighting on or off; they are drawn over the word fills and under the text. The rounding grew from a fixed 3 points to 20% of the font size (3 to 8 points), because at large sizes 3 points looked square and the corner rule could not be seen.
+**Characters centered by their em box.** The glyph sticking out was not only the gap: each character was centered in its cell by its line box, which leaves room above for accents, so Japanese glyphs sat about 0.06 em low and the bottom of a column's last character could pass its cell. Characters are now placed so that the middle of a Japanese font's em box (0.38 em above the baseline: the box goes from 0.12 em below it to 0.88 em above it) is the middle of the cell, in both directions. Checked at 10, 20 and 48 points, vertical and horizontal, magnified: kanji, small kana and rotated long vowel marks stay inside their rectangles.
+
+**Proper nouns: a `proper_noun` flag on `ParsedWord`** (`src/tokenizer.rs`), true when UniDic tags the word's token 名詞-固有名詞 (田中, 東京, クレア, ミドガル). It was the least invasive choice: a boolean rather than UniDic's whole second level, set where single tokens become words, and false for words merged from several tokens into a JMdict headword (JMdict holds common words, not names), for counters and numbers. `ParsedWord` is not serialized (the viewer caches counts, keyed by a hash of the code, so stored books are analyzed again once). The CLI's outputs for the six test books are identical before and after the change.
+
+**The corner rule.** A word cut by the end of a line or column gets one rectangle per line, with **square corners on the side of the cut** and rounded corners only at the word's real start and end: the top and bottom of a column in vertical text, the left and right of a line in horizontal text (egui's per-corner `CornerRadius`). The hover and selection rectangles follow the same rule and cover the same whole cells, with highlighting on or off; they are drawn over the word fills and under the text. The rounding grew from a fixed 3 points to 20% of the font size (3 to 8 points), because at large sizes 3 points looked square and the corner rule could not be seen.
 
 **Only what is visible is painted**, line by line like the text, finding the line's first word by binary search: one rectangle per word piece and one per affix region. Turning 20 pages quickly in the web build kept 60 frames a second (median frame 16.7 ms, longest 18.6 ms, no long tasks).
 
@@ -193,8 +198,8 @@ Planned in [plans-sync-and-highlighting.md](plans-sync-and-highlighting.md), whe
 - **Phrases UniDic misreads as one kana verb** show in kana (役にたちそう as たちそう, from 立ち添う); they were wrong before too, under a kanji lemma.
 - **PDF paragraphs** whose sentence ends exactly at the end of a full line are not joined to the next line when it is not indented, which some PDFs do for continuations (陰の実力者になりたくて).
 - **On phones, the chapter list** in the reader's top bar is cut short (e.g. "0: プ…"); it still works.
-- **Proper nouns are highlighted as nouns.** The plan listed a color for them, but `ParsedWord::pos` keeps only UniDic's first level (名詞, not 名詞-固有名詞), so the reader cannot tell them apart. It needs the tokenizer to keep the second level (or a flag), which was left for the user to decide.
-- **Word highlighting is off by default**, and its colors (twelve hues, some close: pronoun olive and adjective green, prefix orange and ending yellow) have not been reviewed by the user yet.
+- **Names UniDic does not tag as names** are highlighted as plain nouns: proper nouns follow UniDic's tag, which some invented katakana names of the novels do not get.
+- **Word highlighting is off by default**, and its colors (thirteen hues, some close: pronoun olive and adjective green, prefix orange and ending yellow) have not been reviewed by the user yet.
 - **Shading the okurigana inside a stem** (the べ of 食べ) needs a split of the stem the tokenizer does not give yet.
 - **A scheduled JMdict update** (a pull request moving `jmdict.lock` to the latest release) is not set up; `scripts/fetch-jmdict.sh --update` does it by hand.
 

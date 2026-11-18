@@ -66,4 +66,4 @@ It can be added later as a second storage provider (see the design below).
 
 ## Word highlighting in the reader
 
-Built: its decisions (the parts and their colors, the corner rule) are now decision 8 of [decisions-reader.md](decisions-reader.md), with what is left open (proper nouns, which need the tokenizer to keep UniDic's second level; okurigana shading; the default and the colors, not reviewed by the user yet).
+Built: its decisions (the parts and their colors, the corner rule) are now decision 8 of [decisions-reader.md](decisions-reader.md), with what is left open (names UniDic does not know, which show as plain nouns; okurigana shading; the default and the colors, not reviewed by the user yet).

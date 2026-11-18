@@ -197,7 +197,7 @@ mod tests {
     use super::*;
 
     fn token(word: &str) -> ParsedWord {
-        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word, affixes: Vec::new(), forms: Vec::new(), homograph: None, written_reading: None }
+        ParsedWord { base_word: word.into(), spelling: word.into(), pronunciation: String::new(), pos: "名詞".into(), span: 0..0, kind: WordKind::Word, affixes: Vec::new(), forms: Vec::new(), homograph: None, written_reading: None, proper_noun: false }
     }
 
     /// Every word of every chapter.

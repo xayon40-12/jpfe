@@ -61,6 +61,9 @@ pub struct ParsedWord {
     /// How the whole span is read, when it is more than the word: a number with its counter, which is the
     /// word (一つ is つ, read ひとつ; 三本 is 本, read さんぼん)
     pub written_reading: Option<String>,
+    /// A proper noun (UniDic's 名詞-固有名詞: names of people, places, organizations), as UniDic tags the word's
+    /// token; false for words merged from several tokens into a JMdict headword
+    pub proper_noun: bool,
 }
 
 impl ParsedWord {
@@ -573,6 +576,7 @@ impl JapaneseTokenizer {
                     forms: Vec::new(),
                     homograph: None,
                     written_reading: None,
+                    proper_noun: false,
                 });
                 sources.push(index..end);
                 continue;
@@ -680,6 +684,7 @@ impl JapaneseTokenizer {
                             forms: Vec::new(),
                             homograph: None,
                             written_reading: None,
+                            proper_noun: false,
                         });
                         sources.push(index..index + 1);
                     }
@@ -702,6 +707,7 @@ impl JapaneseTokenizer {
                     forms: Vec::new(),
                     homograph: headwords.as_ref().and_then(|h| h.homograph("人", "人", "ニン")),
                     written_reading: Some(if *reading_in_hiragana { reading } else { hiragana_to_katakana(&reading) }),
+                    proper_noun: false,
                 });
                 sources.push(source);
                 continue;
@@ -740,6 +746,7 @@ impl JapaneseTokenizer {
                 forms: Vec::new(),
                 homograph,
                 written_reading: None,
+                proper_noun: pos == "名詞" && token.field(1) == "固有名詞",
             });
             sources.push(source);
         }
@@ -846,6 +853,7 @@ fn attach_counters(
                 forms: if prefix.is_some() { vec!["ordinal (第)".into()] } else { Vec::new() },
                 homograph: None,
                 written_reading: None,
+                proper_noun: false,
             };
             attached.push(number);
             attached_sources.push(first.1..end);
@@ -1567,6 +1575,14 @@ mod dictionary_tests {
         assert_eq!(keys("手にとって"), pairs(&[("手", "手"), ("取る", "とる")]));
         // (JMdict marks 其れ and 因る as rarely used spellings)
         assert_eq!(keys("それによって"), pairs(&[("それ", "それ"), ("よる", "よる")]));
+    }
+
+    #[test]
+    fn marks_proper_nouns() {
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        let text = "田中さんは東京の本屋で地図を買った";
+        let proper: Vec<&str> = tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.proper_noun).map(|w| &text[w.span]).collect();
+        assert_eq!(proper, ["田中", "東京"]);
     }
 
     /// Dictionary form and spelling of each word.

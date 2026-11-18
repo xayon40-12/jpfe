@@ -30,9 +30,9 @@ pub const DEFAULT_HIGHLIGHT: bool = false;
 /// least and at most).
 const WORD_RADIUS: f32 = 0.2;
 const WORD_RADIUS_POINTS: RangeInclusive<f32> = 3.0..=8.0;
-/// Room left between the rectangles of two words, on each side, in font sizes (and in points, at least and at most).
-const WORD_GAP: f32 = 0.06;
-const WORD_GAP_POINTS: RangeInclusive<f32> = 1.0..=2.5;
+/// Height of the middle of a Japanese font's em box above the baseline, in font sizes (the em box goes from 0.12
+/// below the baseline to 0.88 above it).
+const EM_BOX_MIDDLE: f32 = 0.38;
 /// Distance from one line (or column) to the next, in font sizes.
 const LINE_PITCH: f32 = 1.75;
 /// Longest horizontal line, in characters.
@@ -155,6 +155,8 @@ struct Word {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
     Noun,
+    /// Names of people, places, organizations (名詞-固有名詞)
+    ProperNoun,
     Verb,
     /// い- and な-adjectives
     Adjective,
@@ -177,14 +179,14 @@ enum Part {
 }
 
 impl Part {
-    /// The word itself (its affixes left out), from its kind and part of speech. UniDic's part of speech is only
-    /// its first level (名詞, not 名詞-固有名詞), so proper nouns are nouns.
+    /// The word itself (its affixes left out), from its kind and part of speech.
     fn of_stem(word: &ParsedWord) -> Self {
         match word.kind {
             WordKind::Grammar => Self::Grammar,
             WordKind::Number | WordKind::Fragment => Self::Faint,
             WordKind::Word if word.written_reading.is_some() => Self::Counter,
             WordKind::Word => match word.pos.as_str() {
+                "名詞" if word.proper_noun => Self::ProperNoun,
                 "名詞" => Self::Noun,
                 "動詞" => Self::Verb,
                 "形容詞" | "形状詞" => Self::Adjective,
@@ -211,6 +213,7 @@ impl Part {
     fn fill(self, fills: &WordFills) -> Color32 {
         match self {
             Self::Noun => fills.noun,
+            Self::ProperNoun => fills.proper_noun,
             Self::Verb => fills.verb,
             Self::Adjective => fills.adjective,
             Self::Adverb => fills.adverb,
@@ -261,30 +264,13 @@ fn word_parts(word: &ParsedWord, surface: &str) -> Vec<(Range<usize>, Part)> {
     parts.into_iter().map(|(span, part)| (char_at(span.start)..char_at(span.end), part)).collect()
 }
 
-/// Where the rectangle of some characters of a word is drawn, and its corners: rounded at the word's real start
-/// and end (`start`, `end`), and inset there a little so that two words' rectangles do not touch; square where
-/// the word goes on, on the next line or in its next part. The start is the left side in horizontal text and the
-/// top in vertical text.
-fn word_shape(rect: Rect, start: bool, end: bool, vertical: bool, (gap, radius): (f32, u8)) -> (Rect, CornerRadius) {
-    let mut rect = rect;
+/// The corners of the rectangle of some characters of a word: rounded at the word's real start and end (`start`,
+/// `end`), square where the word goes on, on the next line or in its next part. The start is the left side in
+/// horizontal text and the top in vertical text. Rectangles cover their characters' whole cells, so two words'
+/// rectangles meet, and their rounded corners show where one word ends and the next starts.
+fn word_corners(start: bool, end: bool, vertical: bool, radius: u8) -> CornerRadius {
     let (s, e) = (if start { radius } else { 0 }, if end { radius } else { 0 });
-    if vertical {
-        if start {
-            rect.min.y += gap;
-        }
-        if end {
-            rect.max.y -= gap;
-        }
-        (rect, CornerRadius { nw: s, ne: s, sw: e, se: e })
-    } else {
-        if start {
-            rect.min.x += gap;
-        }
-        if end {
-            rect.max.x -= gap;
-        }
-        (rect, CornerRadius { nw: s, sw: s, ne: e, se: e })
-    }
+    if vertical { CornerRadius { nw: s, ne: s, sw: e, se: e } } else { CornerRadius { nw: s, sw: s, ne: e, se: e } }
 }
 
 /// The word whose definitions are shown, in a window whose `pivot` corner is at `anchor`.
@@ -474,11 +460,9 @@ impl Layout {
         self.lines[lines].iter().filter_map(|line| self.piece(line, chars, origin)).collect()
     }
 
-    /// Room left between the rectangles of two words, on each side, and the rounding of their corners.
-    fn word_gap(&self) -> (f32, u8) {
-        let size = self.key.size;
-        let gap = (size * WORD_GAP).clamp(*WORD_GAP_POINTS.start(), *WORD_GAP_POINTS.end());
-        (gap, (size * WORD_RADIUS).clamp(*WORD_RADIUS_POINTS.start(), *WORD_RADIUS_POINTS.end()).round() as u8)
+    /// Rounding of the corners of the rectangles under words.
+    fn word_radius(&self) -> u8 {
+        (self.key.size * WORD_RADIUS).clamp(*WORD_RADIUS_POINTS.start(), *WORD_RADIUS_POINTS.end()).round() as u8
     }
 
     /// Pages are made of items: the lines, then, when `end` is not zero, room of that thickness after the
@@ -620,7 +604,11 @@ fn draw_char(painter: &Painter, c: char, cell: Rect, font: &FontId, color: Color
             VerticalForm::Upright => {}
         }
     }
-    painter.galley(center - size / 2.0, galley, color);
+    // Its em box in the middle of the cell, rather than its line box, whose room for accents above makes the glyph
+    // sit low: a Japanese font's em box goes from 0.12 em below the baseline to 0.88 em above it
+    let baseline = galley.rows.first().and_then(|row| row.row.glyphs.first().map(|g| row.pos.y + g.pos.y));
+    let top = baseline.map_or(center.y - size.y / 2.0, |baseline| center.y - baseline + EM_BOX_MIDDLE * font.size);
+    painter.galley(pos2(center.x - size.x / 2.0, top), galley, color);
 }
 
 pub struct Reader {
@@ -1146,7 +1134,7 @@ impl Reader {
     #[allow(clippy::too_many_arguments)]
     fn paint(&self, painter: &Painter, layout: &Layout, origin: Pos2, drawn: Range<usize>, lines: Range<usize>, highlights: [(Option<usize>, Color32); 2], colors: Colors) {
         let (size, vertical) = (layout.key.size, layout.key.vertical);
-        let gap = layout.word_gap();
+        let radius = layout.word_radius();
         if let Some(fills) = &colors.words {
             for line in &layout.lines[drawn.clone()] {
                 self.paint_word_fills(painter, layout, line, origin, fills);
@@ -1155,8 +1143,7 @@ impl Reader {
         for (word, fill) in highlights {
             if let Some(word) = word.and_then(|w| self.words.get(w)) {
                 for piece in layout.rects(word.paragraph, &word.chars, origin, lines.clone()) {
-                    let (rect, corners) = word_shape(piece.rect, piece.start, piece.end, vertical, gap);
-                    painter.rect_filled(rect, corners, fill);
+                    painter.rect_filled(piece.rect, word_corners(piece.start, piece.end, vertical, radius), fill);
                 }
             }
         }
@@ -1182,20 +1169,18 @@ impl Reader {
         if paragraph.page_number || line.chars.is_empty() {
             return;
         }
-        let (vertical, gap) = (layout.key.vertical, layout.word_gap());
+        let (vertical, radius) = (layout.key.vertical, layout.word_radius());
         let words = &self.words[paragraph.words.clone()];
         let first = words.partition_point(|w| w.chars.end <= line.chars.start);
         for word in words[first..].iter().take_while(|w| w.chars.start < line.chars.end) {
             let Some(piece) = layout.piece(line, &word.chars, origin) else { continue };
             let stem = Part::of_stem(&word.parsed);
-            let (rect, corners) = word_shape(piece.rect, piece.start, piece.end, vertical, gap);
-            painter.rect_filled(rect, corners, stem.fill(fills));
+            painter.rect_filled(piece.rect, word_corners(piece.start, piece.end, vertical, radius), stem.fill(fills));
             for (chars, part) in word.parts.iter().filter(|(_, part)| *part != stem) {
                 let (start, end) = (chars.start.max(piece.chars.start), chars.end.min(piece.chars.end));
                 if start < end {
                     let rect = layout.chars_rect(line, start..end, origin);
-                    let (rect, corners) = word_shape(rect, start == word.chars.start, end == word.chars.end, vertical, gap);
-                    painter.rect_filled(rect, corners, part.fill(fills));
+                    painter.rect_filled(rect, word_corners(start == word.chars.start, end == word.chars.end, vertical, radius), part.fill(fills));
                 }
             }
         }
@@ -1745,25 +1730,25 @@ mod tests {
             let pieces = layout.rects(0, &(2..6), origin, all.clone());
             let cut: Vec<_> = pieces.iter().map(|p| (p.chars.clone(), p.start, p.end)).collect();
             assert_eq!(cut, [(2..4, true, false), (4..6, false, true)]);
-            let [(first_rect, first), (second_rect, second)] = [0, 1].map(|i| word_shape(pieces[i].rect, pieces[i].start, pieces[i].end, vertical, (1.0, 3)));
+            let [first, second] = [0, 1].map(|i| word_corners(pieces[i].start, pieces[i].end, vertical, r));
+            // The cells the pieces cover, along the line: whole cells, from the cut to the word's end
+            let along = |rect: Rect| if vertical { (rect.top() - origin.y, rect.bottom() - origin.y) } else { (rect.left() - origin.x, rect.right() - origin.x) };
+            assert_eq!([along(pieces[0].rect), along(pieces[1].rect)], [(20.0, 40.0), (0.0, 20.0)]);
             if vertical {
                 // Rounded at the word's top, square at the bottom of the column where it is cut, and the other way round
                 // at the top of the next column
                 assert_eq!(first, CornerRadius { nw: r, ne: r, sw: 0, se: 0 });
                 assert_eq!(second, CornerRadius { nw: 0, ne: 0, sw: r, se: r });
-                // Inset from the word before and the word after, not at the cut
-                assert_eq!((first_rect.top(), first_rect.bottom()), (pieces[0].rect.top() + 1.0, pieces[0].rect.bottom()));
-                assert_eq!((second_rect.top(), second_rect.bottom()), (pieces[1].rect.top(), pieces[1].rect.bottom() - 1.0));
             } else {
                 assert_eq!(first, CornerRadius { nw: r, sw: r, ne: 0, se: 0 });
                 assert_eq!(second, CornerRadius { nw: 0, sw: 0, ne: r, se: r });
-                assert_eq!((first_rect.left(), first_rect.right()), (pieces[0].rect.left() + 1.0, pieces[0].rect.right()));
-                assert_eq!((second_rect.left(), second_rect.right()), (pieces[1].rect.left(), pieces[1].rect.right() - 1.0));
             }
-            // A word on one line is rounded all around; one on a line not shown has no piece there
-            let whole = layout.rects(0, &(4..7), origin, all.clone());
+            // A word on one line is rounded all around, and meets the word before it with no gap
+            let whole = layout.rects(0, &(6..8), origin, all.clone());
             assert_eq!(whole.len(), 1);
-            assert_eq!(word_shape(whole[0].rect, whole[0].start, whole[0].end, vertical, (1.0, 3)).1, CornerRadius::same(r));
+            assert_eq!(word_corners(whole[0].start, whole[0].end, vertical, r), CornerRadius::same(r));
+            assert_eq!(along(whole[0].rect).0, along(pieces[1].rect).1);
+            // One on a line not shown has no piece there
             let first_line = layout.paragraph_lines[0].start;
             assert_eq!(layout.rects(0, &(2..6), origin, first_line..first_line + 1).len(), 1);
         }
@@ -1781,6 +1766,7 @@ mod tests {
             forms: Vec::new(),
             homograph: None,
             written_reading: None,
+            proper_noun: false,
         }
     }
 
@@ -1822,6 +1808,7 @@ mod tests {
         // Stems by part of speech
         let stem = |pos: &str| Part::of_stem(&parsed("語", pos, 0..3, W));
         assert_eq!(["名詞", "副詞", "代名詞", "接尾辞", "連体詞"].map(stem), [Noun, Adverb, Pronoun, Suffix, Other]);
+        assert_eq!(Part::of_stem(&ParsedWord { proper_noun: true, ..parsed("東京", "名詞", 0..6, W) }), ProperNoun);
     }
 
     /// One frame of the reader, paginated, in a 400 × 300 window.
