@@ -21,6 +21,34 @@ pub struct Palette {
     pub reading: Color32,
     pub grammar: Color32,
     pub marker: Color32,
+    /// Fills under the reader's words when it highlights them
+    pub words: WordFills,
+}
+
+/// Fills under the reader's words, by part of the word (see `reader::Part`): opaque tints of the reader's
+/// background, pale in light mode and dark in dark mode, so the text on them reads as well as on the background.
+#[derive(Clone, Copy)]
+pub struct WordFills {
+    pub noun: Color32,
+    pub verb: Color32,
+    /// い- and な-adjectives
+    pub adjective: Color32,
+    pub adverb: Color32,
+    /// A counter, with the number it counts (５冊, 三人)
+    pub counter: Color32,
+    pub pronoun: Color32,
+    /// Interjections, conjunctions, adnominals (この), expressions
+    pub other: Color32,
+    /// The prefix written before a word (お, ご, 第, 大)
+    pub prefix: Color32,
+    /// Conjugation endings and auxiliaries after a word (られる, た, て, ない)
+    pub ending: Color32,
+    /// Suffixes that make another word of the word (さ, ら, たち, っぽい), and suffixes standing alone (家)
+    pub suffix: Color32,
+    /// Particles and other grammar: quiet, so words stand out
+    pub grammar: Color32,
+    /// Numbers and fragments
+    pub faint: Color32,
 }
 
 const LIGHT: Palette = Palette {
@@ -38,6 +66,20 @@ const LIGHT: Palette = Palette {
     reading: Color32::from_rgb(0xB8, 0x4A, 0x00),
     grammar: Color32::from_rgb(0x8E, 0x3F, 0xC4),
     marker: Color32::from_rgb(0x0A, 0x7A, 0x8C),
+    words: WordFills {
+        noun: Color32::from_rgb(0xDC, 0xE8, 0xFA),
+        verb: Color32::from_rgb(0xF9, 0xDA, 0xDA),
+        adjective: Color32::from_rgb(0xD9, 0xF0, 0xD6),
+        adverb: Color32::from_rgb(0xEA, 0xDC, 0xF8),
+        counter: Color32::from_rgb(0xD0, 0xEE, 0xF0),
+        pronoun: Color32::from_rgb(0xE8, 0xEE, 0xC4),
+        other: Color32::from_rgb(0xEC, 0xE6, 0xDE),
+        prefix: Color32::from_rgb(0xFB, 0xE0, 0xC4),
+        ending: Color32::from_rgb(0xFA, 0xEF, 0xB4),
+        suffix: Color32::from_rgb(0xF6, 0xDA, 0xEC),
+        grammar: Color32::from_rgb(0xF1, 0xF1, 0xF3),
+        faint: Color32::from_rgb(0xE2, 0xE2, 0xE6),
+    },
 };
 
 const DARK: Palette = Palette {
@@ -55,6 +97,20 @@ const DARK: Palette = Palette {
     reading: Color32::from_rgb(0xFF, 0xB0, 0x5C),
     grammar: Color32::from_rgb(0xCB, 0x9C, 0xF5),
     marker: Color32::from_rgb(0x5C, 0xD0, 0xE3),
+    words: WordFills {
+        noun: Color32::from_rgb(0x25, 0x3A, 0x5C),
+        verb: Color32::from_rgb(0x56, 0x2A, 0x30),
+        adjective: Color32::from_rgb(0x22, 0x49, 0x2B),
+        adverb: Color32::from_rgb(0x43, 0x30, 0x5E),
+        counter: Color32::from_rgb(0x1B, 0x4A, 0x50),
+        pronoun: Color32::from_rgb(0x3A, 0x47, 0x20),
+        other: Color32::from_rgb(0x3D, 0x37, 0x30),
+        prefix: Color32::from_rgb(0x57, 0x3A, 0x1E),
+        ending: Color32::from_rgb(0x52, 0x45, 0x12),
+        suffix: Color32::from_rgb(0x53, 0x2B, 0x47),
+        grammar: Color32::from_rgb(0x2C, 0x2C, 0x2E),
+        faint: Color32::from_rgb(0x38, 0x38, 0x3B),
+    },
 };
 
 impl Palette {

@@ -10,13 +10,13 @@ use std::ops::{Range, RangeInclusive};
 
 use anyhow::{Context, Result};
 use egui::epaint::TextShape;
-use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, Ui, Vec2};
+use egui::{pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use jpfe::dictionary::{Definitions, Kanjidic, DEFINITIONS_FILE, KANJI_FILE};
 use jpfe::tokenizer::{is_cjk_kanji, JapaneseTokenizer, ParsedWord, WordKind};
 use serde::{Deserialize, Serialize};
 
 use crate::book::Book;
-use crate::theme::Palette;
+use crate::theme::{Palette, WordFills};
 
 pub const DEFAULT_FONT_SIZE: f32 = 20.0;
 pub const FONT_SIZES: RangeInclusive<f32> = 10.0..=48.0;
@@ -24,6 +24,15 @@ pub const FONT_SIZES: RangeInclusive<f32> = 10.0..=48.0;
 pub const DEFAULT_VERTICAL: bool = true;
 /// One page at a time, turned by dragging sideways or with the arrow keys, unless the reader picks scrolling.
 pub const DEFAULT_PAGINATE: bool = true;
+/// Words are not highlighted unless the reader asks for it.
+pub const DEFAULT_HIGHLIGHT: bool = false;
+/// Rounding of the rectangles under words (highlighted, hovered, selected), in font sizes (and in points, at
+/// least and at most).
+const WORD_RADIUS: f32 = 0.2;
+const WORD_RADIUS_POINTS: RangeInclusive<f32> = 3.0..=8.0;
+/// Room left between the rectangles of two words, on each side, in font sizes (and in points, at least and at most).
+const WORD_GAP: f32 = 0.06;
+const WORD_GAP_POINTS: RangeInclusive<f32> = 1.0..=2.5;
 /// Distance from one line (or column) to the next, in font sizes.
 const LINE_PITCH: f32 = 1.75;
 /// Longest horizontal line, in characters.
@@ -138,6 +147,144 @@ struct Word {
     paragraph: usize,
     /// Characters of the word in its paragraph
     chars: Range<usize>,
+    /// Its parts, in order, as characters of its paragraph covering `chars` (see [`word_parts`])
+    parts: Vec<(Range<usize>, Part)>,
+}
+
+/// What part of a word some of its characters are, which gives their color when the reader highlights words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    Noun,
+    Verb,
+    /// い- and な-adjectives
+    Adjective,
+    Adverb,
+    /// A counter, with its number (５冊)
+    Counter,
+    Pronoun,
+    /// Interjections, conjunctions, adnominals, expressions
+    Other,
+    /// The prefix before a word: polite (お, ご), ordinal (第), or a kanji prefix (大)
+    Prefix,
+    /// Conjugation endings and auxiliaries after a word (られる, た, て, ない)
+    Ending,
+    /// Suffixes after a word (さ, ら, たち), and a suffix that is a word of its own (家)
+    Suffix,
+    /// Particles and auxiliaries that are words of their own
+    Grammar,
+    /// Numbers and fragments
+    Faint,
+}
+
+impl Part {
+    /// The word itself (its affixes left out), from its kind and part of speech. UniDic's part of speech is only
+    /// its first level (名詞, not 名詞-固有名詞), so proper nouns are nouns.
+    fn of_stem(word: &ParsedWord) -> Self {
+        match word.kind {
+            WordKind::Grammar => Self::Grammar,
+            WordKind::Number | WordKind::Fragment => Self::Faint,
+            WordKind::Word if word.written_reading.is_some() => Self::Counter,
+            WordKind::Word => match word.pos.as_str() {
+                "名詞" => Self::Noun,
+                "動詞" => Self::Verb,
+                "形容詞" | "形状詞" => Self::Adjective,
+                "副詞" => Self::Adverb,
+                "代名詞" => Self::Pronoun,
+                "接尾辞" => Self::Suffix,
+                _ => Self::Other,
+            },
+        }
+    }
+
+    /// One of a word's affixes (see [`ParsedWord::affixes`]): prefixes are tagged 接頭辞 and suffixes 接尾辞;
+    /// the rest are conjugation endings (auxiliaries, the particles of conjugated forms such as て, the ない of
+    /// 美しくない, the stems of そうだ and ようだ), except the adjective づらい (辛い), a suffix like やすい.
+    fn of_affix(affix: &ParsedWord) -> Self {
+        match affix.pos.as_str() {
+            "接頭辞" => Self::Prefix,
+            "接尾辞" => Self::Suffix,
+            "形容詞" if !matches!(affix.base_word.as_str(), "無い" | "ない") => Self::Suffix,
+            _ => Self::Ending,
+        }
+    }
+
+    fn fill(self, fills: &WordFills) -> Color32 {
+        match self {
+            Self::Noun => fills.noun,
+            Self::Verb => fills.verb,
+            Self::Adjective => fills.adjective,
+            Self::Adverb => fills.adverb,
+            Self::Counter => fills.counter,
+            Self::Pronoun => fills.pronoun,
+            Self::Other => fills.other,
+            Self::Prefix => fills.prefix,
+            Self::Ending => fills.ending,
+            Self::Suffix => fills.suffix,
+            Self::Grammar => fills.grammar,
+            Self::Faint => fills.faint,
+        }
+    }
+}
+
+/// The parts of `word`, written `surface` in the text, in order, as characters of the surface that cover it: the
+/// word itself (its stem) and each affix. Grammar, numbers and fragments are one part, affixes included.
+fn word_parts(word: &ParsedWord, surface: &str) -> Vec<(Range<usize>, Part)> {
+    let stem = Part::of_stem(word);
+    let char_at = |byte: usize| surface.get(..byte).map_or_else(|| surface.chars().count(), |t| t.chars().count());
+    if word.kind != WordKind::Word || word.affixes.is_empty() {
+        return vec![(0..char_at(surface.len()), stem)];
+    }
+    let mut affixes: Vec<(Range<usize>, Part)> = word
+        .affixes
+        .iter()
+        .filter_map(|a| {
+            let span = a.span.start.checked_sub(word.span.start)?..a.span.end.checked_sub(word.span.start)?.min(surface.len());
+            (span.start < span.end).then(|| (span, Part::of_affix(a)))
+        })
+        .collect();
+    affixes.sort_by_key(|(span, _)| span.start);
+    // In bytes, then in characters
+    let mut parts = Vec::with_capacity(affixes.len() * 2 + 1);
+    let mut at = 0;
+    for (span, part) in affixes {
+        if at < span.start {
+            parts.push((at..span.start, stem));
+        }
+        if at.max(span.start) < span.end {
+            parts.push((at.max(span.start)..span.end, part));
+            at = span.end;
+        }
+    }
+    if at < surface.len() {
+        parts.push((at..surface.len(), stem));
+    }
+    parts.into_iter().map(|(span, part)| (char_at(span.start)..char_at(span.end), part)).collect()
+}
+
+/// Where the rectangle of some characters of a word is drawn, and its corners: rounded at the word's real start
+/// and end (`start`, `end`), and inset there a little so that two words' rectangles do not touch; square where
+/// the word goes on, on the next line or in its next part. The start is the left side in horizontal text and the
+/// top in vertical text.
+fn word_shape(rect: Rect, start: bool, end: bool, vertical: bool, (gap, radius): (f32, u8)) -> (Rect, CornerRadius) {
+    let mut rect = rect;
+    let (s, e) = (if start { radius } else { 0 }, if end { radius } else { 0 });
+    if vertical {
+        if start {
+            rect.min.y += gap;
+        }
+        if end {
+            rect.max.y -= gap;
+        }
+        (rect, CornerRadius { nw: s, ne: s, sw: e, se: e })
+    } else {
+        if start {
+            rect.min.x += gap;
+        }
+        if end {
+            rect.max.x -= gap;
+        }
+        (rect, CornerRadius { nw: s, sw: s, ne: e, se: e })
+    }
 }
 
 /// The word whose definitions are shown, in a window whose `pivot` corner is at `anchor`.
@@ -207,6 +354,18 @@ struct Colors {
     secondary: Color32,
     hover: Color32,
     selected: Color32,
+    /// Fills under every word, by part, when the reader highlights words
+    words: Option<WordFills>,
+}
+
+/// The characters of a run (a word, or some of it) on one line, and its rectangle there.
+#[derive(Clone, Debug, PartialEq)]
+struct Piece {
+    rect: Rect,
+    chars: Range<usize>,
+    /// Whether the run starts on this line, and ends on it (otherwise the line cuts it)
+    start: bool,
+    end: bool,
 }
 
 /// What the text was laid out for; it is laid out again when any of it changes.
@@ -290,26 +449,36 @@ impl Layout {
         start..self.lines.partition_point(|l| l.offset <= to).max(start)
     }
 
-    /// Rectangles covering the characters `chars` of a paragraph, one for each line they are on among `lines`.
-    fn rects(&self, paragraph: usize, chars: &Range<usize>, origin: Pos2, lines: Range<usize>) -> Vec<Rect> {
+    /// The rectangle covering characters `chars` of `line` (all on it), in the glyphs' band.
+    fn chars_rect(&self, line: &Line, chars: Range<usize>, origin: Pos2) -> Rect {
+        let cell = |i: usize| self.cell(line, line.first_cell + i - line.chars.start, origin);
+        let rect = cell(chars.start).union(cell(chars.end - 1));
+        // The glyphs' band, not the space between lines
+        let gap = (line.pitch - self.key.size * line.scale * 1.3) / 2.0;
+        if self.key.vertical { rect.shrink2(vec2(gap, 0.0)) } else { rect.shrink2(vec2(0.0, gap)) }
+    }
+
+    /// The characters `chars` of a paragraph that are on `line`, if any.
+    fn piece(&self, line: &Line, chars: &Range<usize>, origin: Pos2) -> Option<Piece> {
+        let (start, end) = (chars.start.max(line.chars.start), chars.end.min(line.chars.end));
+        (start < end).then(|| Piece { rect: self.chars_rect(line, start..end, origin), chars: start..end, start: start == chars.start, end: end == chars.end })
+    }
+
+    /// The characters `chars` of a paragraph, one piece for each line they are on among `lines`.
+    fn rects(&self, paragraph: usize, chars: &Range<usize>, origin: Pos2, lines: Range<usize>) -> Vec<Piece> {
         let own = self.paragraph_lines.get(paragraph).cloned().unwrap_or_default();
         let lines = own.start.max(lines.start)..own.end.min(lines.end);
         if lines.is_empty() {
             return Vec::new();
         }
-        self.lines[lines]
-            .iter()
-            .filter_map(|line| {
-                let (start, end) = (chars.start.max(line.chars.start), chars.end.min(line.chars.end));
-                (start < end).then(|| {
-                    let cell = |i: usize| self.cell(line, line.first_cell + i - line.chars.start, origin);
-                    let rect = cell(start).union(cell(end - 1));
-                    // The glyphs' band, not the space between lines
-                    let gap = (line.pitch - self.key.size * line.scale * 1.3) / 2.0;
-                    if self.key.vertical { rect.shrink2(vec2(gap, 0.0)) } else { rect.shrink2(vec2(0.0, gap)) }
-                })
-            })
-            .collect()
+        self.lines[lines].iter().filter_map(|line| self.piece(line, chars, origin)).collect()
+    }
+
+    /// Room left between the rectangles of two words, on each side, and the rounding of their corners.
+    fn word_gap(&self) -> (f32, u8) {
+        let size = self.key.size;
+        let gap = (size * WORD_GAP).clamp(*WORD_GAP_POINTS.start(), *WORD_GAP_POINTS.end());
+        (gap, (size * WORD_RADIUS).clamp(*WORD_RADIUS_POINTS.start(), *WORD_RADIUS_POINTS.end()).round() as u8)
     }
 
     /// Pages are made of items: the lines, then, when `end` is not zero, room of that thickness after the
@@ -609,7 +778,8 @@ impl Reader {
                 }
                 let (start, end) = (word.span.start - paragraph.span.start, word.span.end - paragraph.span.start);
                 let chars = char_at(start)..char_at(end);
-                self.words.push(Word { parsed: word, paragraph: index, chars });
+                let parts = word_parts(&word, &text[start..end]).into_iter().map(|(c, part)| (c.start + chars.start..c.end + chars.start, part)).collect();
+                self.words.push(Word { parsed: word, paragraph: index, chars, parts });
             }
             paragraph.words = start..self.words.len();
         }
@@ -679,7 +849,8 @@ impl Reader {
         paragraph.span.start + text.char_indices().nth(start).map_or(text.len(), |(i, _)| i)
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, lookup: Option<&Lookup>, font_size: &mut f32, vertical: bool, paginate: bool, palette: Palette) -> ReaderResponse {
+    #[allow(clippy::too_many_arguments)]
+    pub fn ui(&mut self, ui: &mut Ui, lookup: Option<&Lookup>, font_size: &mut f32, vertical: bool, paginate: bool, highlight: bool, palette: Palette) -> ReaderResponse {
         let mut response = ReaderResponse::default();
         zoom(ui, font_size);
         let size = *font_size;
@@ -704,6 +875,7 @@ impl Reader {
             secondary: palette.secondary_text,
             hover: palette.accent.gamma_multiply(0.12),
             selected: palette.accent.gamma_multiply(0.28),
+            words: highlight.then_some(palette.words),
         };
         let clicked = if paginate {
             self.paged_ui(ui, &layout, view, replace, colors, &mut response)
@@ -969,14 +1141,22 @@ impl Reader {
         self.kanji_popup = None;
     }
 
-    /// Draws lines `drawn`, with the words of `highlights` filled where they are on lines `lines`.
+    /// Draws lines `drawn`, with the words of `highlights` filled where they are on lines `lines` (over the
+    /// fills of every word, when words are highlighted).
     #[allow(clippy::too_many_arguments)]
     fn paint(&self, painter: &Painter, layout: &Layout, origin: Pos2, drawn: Range<usize>, lines: Range<usize>, highlights: [(Option<usize>, Color32); 2], colors: Colors) {
         let (size, vertical) = (layout.key.size, layout.key.vertical);
+        let gap = layout.word_gap();
+        if let Some(fills) = &colors.words {
+            for line in &layout.lines[drawn.clone()] {
+                self.paint_word_fills(painter, layout, line, origin, fills);
+            }
+        }
         for (word, fill) in highlights {
             if let Some(word) = word.and_then(|w| self.words.get(w)) {
-                for r in layout.rects(word.paragraph, &word.chars, origin, lines.clone()) {
-                    painter.rect_filled(r, 3.0, fill);
+                for piece in layout.rects(word.paragraph, &word.chars, origin, lines.clone()) {
+                    let (rect, corners) = word_shape(piece.rect, piece.start, piece.end, vertical, gap);
+                    painter.rect_filled(rect, corners, fill);
                 }
             }
         }
@@ -989,6 +1169,33 @@ impl Reader {
             for (i, &c) in chars[line.chars.clone()].iter().enumerate() {
                 if c != '　' {
                     draw_char(painter, c, layout.cell(line, line.first_cell + i, origin), &font, color, vertical);
+                }
+            }
+        }
+    }
+
+    /// The fills under the words of `line`, colored by part: the word's piece on the line in the color of its
+    /// stem, then the regions of its other parts over it, square where they meet so the word reads as one
+    /// rectangle. PDF page numbers are not words, and are left as they are.
+    fn paint_word_fills(&self, painter: &Painter, layout: &Layout, line: &Line, origin: Pos2, fills: &WordFills) {
+        let Some(paragraph) = line.paragraph.and_then(|p| self.paragraphs.get(p)) else { return };
+        if paragraph.page_number || line.chars.is_empty() {
+            return;
+        }
+        let (vertical, gap) = (layout.key.vertical, layout.word_gap());
+        let words = &self.words[paragraph.words.clone()];
+        let first = words.partition_point(|w| w.chars.end <= line.chars.start);
+        for word in words[first..].iter().take_while(|w| w.chars.start < line.chars.end) {
+            let Some(piece) = layout.piece(line, &word.chars, origin) else { continue };
+            let stem = Part::of_stem(&word.parsed);
+            let (rect, corners) = word_shape(piece.rect, piece.start, piece.end, vertical, gap);
+            painter.rect_filled(rect, corners, stem.fill(fills));
+            for (chars, part) in word.parts.iter().filter(|(_, part)| *part != stem) {
+                let (start, end) = (chars.start.max(piece.chars.start), chars.end.min(piece.chars.end));
+                if start < end {
+                    let rect = layout.chars_rect(line, start..end, origin);
+                    let (rect, corners) = word_shape(rect, start == word.chars.start, end == word.chars.end, vertical, gap);
+                    painter.rect_filled(rect, corners, part.fill(fills));
                 }
             }
         }
@@ -1018,7 +1225,7 @@ impl Reader {
     fn popup_for(&self, ctx: &egui::Context, layout: &Layout, origin: Pos2, lines: Range<usize>, pos: Pos2) -> Option<(usize, Pos2, Align2)> {
         let w = self.word_at_pos(layout, origin, lines.clone(), pos)?;
         let word = &self.words[w];
-        let first = *layout.rects(word.paragraph, &word.chars, origin, lines).first()?;
+        let first = layout.rects(word.paragraph, &word.chars, origin, lines).first()?.rect;
         let width = popup_width(ctx, layout.key.size, WORD_POPUP_WIDTH);
         Some(if layout.key.vertical && first.left() - 6.0 - width >= ctx.content_rect().left() {
             (w, first.left_top() - vec2(6.0, 0.0), Align2::RIGHT_TOP)
@@ -1526,6 +1733,97 @@ mod tests {
         assert_eq!(layout.page_end(last, room, 30.0), with_end);
     }
 
+    #[test]
+    fn a_word_cut_by_a_line_end_is_square_at_the_cut() {
+        let reader = Reader::from_text(0, "Book", "T", "あいうえおかきくけこ", false, 1);
+        let r = 3;
+        for vertical in [true, false] {
+            // Four characters per line
+            let layout = reader.lay_out(LayoutKey { size: 10.0, vertical, length: 40.0 });
+            let origin = pos2(500.0, 0.0);
+            let all = 0..layout.lines.len();
+            let pieces = layout.rects(0, &(2..6), origin, all.clone());
+            let cut: Vec<_> = pieces.iter().map(|p| (p.chars.clone(), p.start, p.end)).collect();
+            assert_eq!(cut, [(2..4, true, false), (4..6, false, true)]);
+            let [(first_rect, first), (second_rect, second)] = [0, 1].map(|i| word_shape(pieces[i].rect, pieces[i].start, pieces[i].end, vertical, (1.0, 3)));
+            if vertical {
+                // Rounded at the word's top, square at the bottom of the column where it is cut, and the other way round
+                // at the top of the next column
+                assert_eq!(first, CornerRadius { nw: r, ne: r, sw: 0, se: 0 });
+                assert_eq!(second, CornerRadius { nw: 0, ne: 0, sw: r, se: r });
+                // Inset from the word before and the word after, not at the cut
+                assert_eq!((first_rect.top(), first_rect.bottom()), (pieces[0].rect.top() + 1.0, pieces[0].rect.bottom()));
+                assert_eq!((second_rect.top(), second_rect.bottom()), (pieces[1].rect.top(), pieces[1].rect.bottom() - 1.0));
+            } else {
+                assert_eq!(first, CornerRadius { nw: r, sw: r, ne: 0, se: 0 });
+                assert_eq!(second, CornerRadius { nw: 0, sw: 0, ne: r, se: r });
+                assert_eq!((first_rect.left(), first_rect.right()), (pieces[0].rect.left() + 1.0, pieces[0].rect.right()));
+                assert_eq!((second_rect.left(), second_rect.right()), (pieces[1].rect.left(), pieces[1].rect.right() - 1.0));
+            }
+            // A word on one line is rounded all around; one on a line not shown has no piece there
+            let whole = layout.rects(0, &(4..7), origin, all.clone());
+            assert_eq!(whole.len(), 1);
+            assert_eq!(word_shape(whole[0].rect, whole[0].start, whole[0].end, vertical, (1.0, 3)).1, CornerRadius::same(r));
+            let first_line = layout.paragraph_lines[0].start;
+            assert_eq!(layout.rects(0, &(2..6), origin, first_line..first_line + 1).len(), 1);
+        }
+    }
+
+    fn parsed(base: &str, pos: &str, span: Range<usize>, kind: WordKind) -> ParsedWord {
+        ParsedWord {
+            base_word: base.to_string(),
+            spelling: base.to_string(),
+            pronunciation: String::new(),
+            pos: pos.to_string(),
+            span,
+            kind,
+            affixes: Vec::new(),
+            forms: Vec::new(),
+            homograph: None,
+            written_reading: None,
+        }
+    }
+
+    #[test]
+    fn words_are_colored_by_their_parts() {
+        use Part::*;
+        use WordKind::{Fragment, Grammar as G, Number, Word as W};
+        let parts = |word: &ParsedWord, text: &str| word_parts(word, &text[word.span.clone()]);
+
+        // 数えられた: the verb, then two endings
+        let mut word = parsed("数える", "動詞", 0..15, W);
+        word.affixes = vec![parsed("られる", "助動詞", 6..12, G), parsed("た", "助動詞", 12..15, G)];
+        assert_eq!(parts(&word, "数えられた"), [(0..2, Verb), (2..4, Ending), (4..5, Ending)]);
+
+        // お二人: the polite prefix, then the counter with its number
+        let mut word = parsed("人", "接尾辞", 0..9, W);
+        word.written_reading = Some("おふたり".to_string());
+        word.affixes = vec![parsed("御", "接頭辞", 0..3, G)];
+        assert_eq!(parts(&word, "お二人"), [(0..1, Prefix), (1..3, Counter)]);
+
+        // 静かさ, 使いづらい: suffixes; 美しくない: an ending
+        let mut word = parsed("静か", "形状詞", 0..9, W);
+        word.affixes = vec![parsed("さ", "接尾辞", 6..9, G)];
+        assert_eq!(parts(&word, "静かさ"), [(0..2, Adjective), (2..3, Suffix)]);
+        let mut word = parsed("使う", "動詞", 0..15, W);
+        word.affixes = vec![parsed("辛い", "形容詞", 6..15, G)];
+        assert_eq!(parts(&word, "使いづらい"), [(0..2, Verb), (2..5, Suffix)]);
+        let mut word = parsed("美しい", "形容詞", 0..15, W);
+        word.affixes = vec![parsed("無い", "形容詞", 9..15, G)];
+        assert_eq!(parts(&word, "美しくない"), [(0..3, Adjective), (3..5, Ending)]);
+
+        // Grammar is one quiet part, its endings included (だった); numbers and fragments are grey
+        let mut word = parsed("だ", "助動詞", 0..9, G);
+        word.affixes = vec![parsed("た", "助動詞", 6..9, G)];
+        assert_eq!(parts(&word, "だった"), [(0..3, Grammar)]);
+        assert_eq!(parts(&parsed("二十三", "名詞", 0..9, Number), "二十三"), [(0..3, Faint)]);
+        assert_eq!(parts(&parsed("あ", "感動詞", 0..3, Fragment), "あ"), [(0..1, Faint)]);
+
+        // Stems by part of speech
+        let stem = |pos: &str| Part::of_stem(&parsed("語", pos, 0..3, W));
+        assert_eq!(["名詞", "副詞", "代名詞", "接尾辞", "連体詞"].map(stem), [Noun, Adverb, Pronoun, Suffix, Other]);
+    }
+
     /// One frame of the reader, paginated, in a 400 × 300 window.
     fn frame(ctx: &egui::Context, reader: &mut Reader, vertical: bool, time: f64, events: Vec<Event>) -> ReaderResponse {
         let screen = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0));
@@ -1533,7 +1831,7 @@ mod tests {
         let mut response = ReaderResponse::default();
         let mut output = ctx.run_ui(input, |ui| {
             let mut size = 20.0;
-            response = reader.ui(ui, None, &mut size, vertical, true, Palette::of(ui.visuals()));
+            response = reader.ui(ui, None, &mut size, vertical, true, false, Palette::of(ui.visuals()));
         });
         output.textures_delta.clear();
         response
@@ -1723,7 +2021,7 @@ mod tests {
         let mut size = 20.0;
         let input = RawInput { time: Some(1.6), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), ..Default::default() };
         let mut output = ctx.run_ui(input, |ui| {
-            reader.ui(ui, None, &mut size, true, false, Palette::of(ui.visuals()));
+            reader.ui(ui, None, &mut size, true, false, false, Palette::of(ui.visuals()));
         });
         output.textures_delta.clear();
         assert_eq!(reader.anchor, anchor);

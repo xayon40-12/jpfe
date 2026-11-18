@@ -114,6 +114,8 @@ struct SavedState {
     reader_vertical: bool,
     /// One page at a time in the reader, rather than scrolling
     reader_paginate: bool,
+    /// Every word in the reader on a fill colored by its parts
+    reader_highlight: bool,
     /// What the reader remembers of each book (where it was left), by book id
     reader_books: BTreeMap<u64, BookReaderState>,
     /// The view showing, reopened when the app starts again
@@ -144,6 +146,7 @@ impl Default for SavedState {
             reader_font_size: reader::DEFAULT_FONT_SIZE,
             reader_vertical: reader::DEFAULT_VERTICAL,
             reader_paginate: reader::DEFAULT_PAGINATE,
+            reader_highlight: reader::DEFAULT_HIGHLIGHT,
             reader_books: BTreeMap::new(),
             view: ViewState::default(),
         }
@@ -184,6 +187,7 @@ pub struct ViewerApp {
     reader_font_size: f32,
     reader_vertical: bool,
     reader_paginate: bool,
+    reader_highlight: bool,
     /// Where the reader was left in each book, by book id
     reader_books: BTreeMap<u64, BookReaderState>,
     /// The view showing, as saved
@@ -276,6 +280,7 @@ impl ViewerApp {
             reader_font_size: reader::DEFAULT_FONT_SIZE,
             reader_vertical: reader::DEFAULT_VERTICAL,
             reader_paginate: reader::DEFAULT_PAGINATE,
+            reader_highlight: reader::DEFAULT_HIGHLIGHT,
             reader_books: BTreeMap::new(),
             view_state: ViewState::default(),
             wanted_reader: None,
@@ -413,6 +418,7 @@ impl ViewerApp {
                 self.reader_font_size = state.reader_font_size.clamp(*reader::FONT_SIZES.start(), *reader::FONT_SIZES.end());
                 self.reader_vertical = state.reader_vertical;
                 self.reader_paginate = state.reader_paginate;
+                self.reader_highlight = state.reader_highlight;
                 self.reader_books = state.reader_books.clone();
                 self.wanted_reader = state.view.reading;
                 self.view_state = state.view.clone();
@@ -724,6 +730,7 @@ impl ViewerApp {
             reader_font_size: self.reader_font_size,
             reader_vertical: self.reader_vertical,
             reader_paginate: self.reader_paginate,
+            reader_highlight: self.reader_highlight,
             reader_books: self.reader_books.clone(),
             view: self.view_state.clone(),
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
@@ -816,6 +823,7 @@ impl ViewerApp {
                         self.reader_font_size = reader::DEFAULT_FONT_SIZE;
                         self.reader_vertical = reader::DEFAULT_VERTICAL;
                         self.reader_paginate = reader::DEFAULT_PAGINATE;
+                        self.reader_highlight = reader::DEFAULT_HIGHLIGHT;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(theme::primary_button("Done", palette)).clicked() {
@@ -845,6 +853,8 @@ impl ViewerApp {
         note(ui, "Vertical text reads from top to bottom, in columns from right to left.");
         ui.checkbox(&mut self.reader_paginate, "Paginate");
         note(ui, "One page at a time: drag the page sideways, or press the arrow keys, to turn it. Off, the text scrolls.");
+        ui.checkbox(&mut self.reader_highlight, "Highlight words");
+        note(ui, "Every word on a color for its part of speech, with its prefix, endings and suffixes in their own colors.");
         ui.separator();
 
         ui.label("Coverage target");
@@ -1038,7 +1048,7 @@ impl ViewerApp {
                 timeline::note(format!("reader: chapter tokenized in {:.0} ms", timeline::since(started)));
             }
         }
-        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, self.reader_paginate, palette);
+        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, self.reader_paginate, self.reader_highlight, palette);
         let chapter = response.chapter.unwrap_or(chapter);
         let settled = reader.settled_place(ui.ctx()).map(|place| (reader.book, place));
         if let Some(book) = book.filter(|_| chapter != reader.chapter) {
@@ -1767,6 +1777,7 @@ mod tests {
         assert_eq!(state.books.len(), 1);
         assert_eq!(state.reader_font_size, 24.0);
         assert!(state.reader_paginate);
+        assert!(!state.reader_highlight);
         assert!(state.reader_books.is_empty());
         // The statistics, as before
         assert_eq!(state.view, ViewState::default());
