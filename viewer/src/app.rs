@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use egui::{Color32, RichText, Ui};
 use egui_plot::{GridInput, GridMark, HoverPosition, Line, Plot, Points, VLine};
@@ -9,7 +9,7 @@ use web_time::{Duration, Instant};
 
 use crate::book::{Book, BookStats, CacheKey, PendingBook, SavedBook, Settings};
 use crate::platform::{self, Inbox, Incoming, WEB_DICTIONARY_FILES};
-use crate::reader::{self, Lookup, Reader};
+use crate::reader::{self, BookReaderState, Lookup, Reader};
 use crate::storage::{self, Key};
 use crate::theme::{self, Palette};
 
@@ -111,6 +111,24 @@ struct SavedState {
     reader_font_size: f32,
     /// Vertical text (縦書き) in the reader
     reader_vertical: bool,
+    /// One page at a time in the reader, rather than scrolling
+    reader_paginate: bool,
+    /// What the reader remembers of each book (where it was left), by book id
+    reader_books: BTreeMap<u64, BookReaderState>,
+    /// The view showing, reopened when the app starts again
+    view: ViewState,
+}
+
+/// Which view was showing, so the app reopens it: the reader on the same book (at its saved place), or the
+/// statistics. Saved with the settings; two copies of it (from two devices) merge by keeping the one
+/// `modified` last.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct ViewState {
+    /// The book shown in the reader; `None` for the statistics
+    reading: Option<u64>,
+    /// When the view last changed, in milliseconds since 1970-01-01 UTC
+    modified: u64,
 }
 
 impl Default for SavedState {
@@ -124,6 +142,9 @@ impl Default for SavedState {
             debug: false,
             reader_font_size: reader::DEFAULT_FONT_SIZE,
             reader_vertical: reader::DEFAULT_VERTICAL,
+            reader_paginate: reader::DEFAULT_PAGINATE,
+            reader_books: BTreeMap::new(),
+            view: ViewState::default(),
         }
     }
 }
@@ -161,6 +182,15 @@ pub struct ViewerApp {
     reader: Option<Reader>,
     reader_font_size: f32,
     reader_vertical: bool,
+    reader_paginate: bool,
+    /// Where the reader was left in each book, by book id
+    reader_books: BTreeMap<u64, BookReaderState>,
+    /// The view showing, as saved
+    view_state: ViewState,
+    /// The book the reader showed when the app was last closed, reopened once it is ready
+    wanted_reader: Option<u64>,
+    /// The book selected last (being read, or else shown in the statistics), restored before the others
+    first_book: Option<u64>,
     /// Definitions and kanji for the reader (web: once the dictionary is loaded)
     lookup: Option<Lookup>,
 
@@ -192,6 +222,11 @@ pub struct ViewerApp {
     /// Chapter under the finger while inspecting, found while drawing the last frame
     inspected_chapter: Option<f64>,
     load_times: LoadTimes,
+    /// When this frame started: the dictionary is unpacked in what is left of the frame's time
+    frame_started: Instant,
+    /// Web: the dictionary file being unpacked, a little each frame
+    #[cfg(target_arch = "wasm32")]
+    unpacking: Option<(String, platform::Unpacker)>,
 }
 
 #[derive(PartialEq)]
@@ -236,6 +271,11 @@ impl ViewerApp {
             reader: None,
             reader_font_size: reader::DEFAULT_FONT_SIZE,
             reader_vertical: reader::DEFAULT_VERTICAL,
+            reader_paginate: reader::DEFAULT_PAGINATE,
+            reader_books: BTreeMap::new(),
+            view_state: ViewState::default(),
+            wanted_reader: None,
+            first_book: None,
             lookup: platform::embedded_lookup(),
             state_loaded: false,
             stored_books: None,
@@ -253,13 +293,20 @@ impl ViewerApp {
             plot_rects: Vec::new(),
             inspected_chapter: None,
             load_times: LoadTimes::new(),
+            frame_started: Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            unpacking: None,
         }
     }
 
     fn handle_incoming(&mut self, ctx: &egui::Context) {
         let mut deferred = Vec::new();
+        // One stored book per frame (its analysis decoded, or its file parsed: up to tens of milliseconds each), so
+        // the window keeps redrawing while books are restored
+        let mut book_read = false;
         for message in self.inbox.drain() {
             match message {
+                Incoming::Stored { key: Key::Analysis(_) | Key::Source(_), .. } if book_read => deferred.push(message),
                 // New books get ids after the saved and stored ones, so wait until both are known
                 Incoming::File { .. } if !self.state_loaded || self.stored_books.is_none() => deferred.push(message),
                 Incoming::File { name, bytes } => {
@@ -296,7 +343,10 @@ impl ViewerApp {
                         }
                     }
                 }
-                Incoming::Stored { key, bytes } => self.handle_stored(ctx, key, bytes),
+                Incoming::Stored { key, bytes } => {
+                    book_read |= matches!(key, Key::Analysis(_) | Key::Source(_));
+                    self.handle_stored(ctx, key, bytes);
+                }
                 Incoming::Written(Key::DictionaryFile(_)) => {
                     if let Some((version, written)) = &mut self.dictionary_writes {
                         *written += 1;
@@ -330,6 +380,9 @@ impl ViewerApp {
                 Incoming::Error(e) => self.errors.push(e),
             }
         }
+        if !deferred.is_empty() {
+            ctx.request_repaint();
+        }
         for message in deferred {
             self.inbox.push(message);
         }
@@ -349,7 +402,12 @@ impl ViewerApp {
                 self.debug = state.debug;
                 self.reader_font_size = state.reader_font_size.clamp(*reader::FONT_SIZES.start(), *reader::FONT_SIZES.end());
                 self.reader_vertical = state.reader_vertical;
+                self.reader_paginate = state.reader_paginate;
+                self.reader_books = state.reader_books.clone();
+                self.wanted_reader = state.view.reading;
+                self.view_state = state.view.clone();
                 self.wanted_shown = state.shown;
+                self.first_book = state.view.reading.or(state.shown);
                 self.saved_ids = state.books.iter().map(|b| b.id).collect();
                 self.next_id = state.next_id;
                 if !state.books.is_empty() {
@@ -409,12 +467,21 @@ impl ViewerApp {
                 let saved = self.restoring.remove(pos);
                 let parsed = self.load_times.timed("reading books", || bytes.map(|b| PendingBook::parse(saved.id, &saved.file_name, b, saved.learned)));
                 match parsed {
-                    Some(Ok(book)) => self.pending.push(book),
+                    Some(Ok(book)) => self.push_pending(book),
                     Some(Err(e)) => self.errors.push(format!("{e:#}")),
                     None => self.errors.push(format!("{}: the stored file is missing; open it again", saved.name)),
                 }
             }
         }
+    }
+
+    /// Queue a book to analyze: the last selected book first, then the others by id (their order on screen),
+    /// whatever order their files are read in.
+    fn push_pending(&mut self, book: PendingBook) {
+        let rank = |id: u64| (Some(id) != self.first_book, id);
+        let new = rank(book.saved.id);
+        let pos = self.pending.iter().position(|b| rank(b.saved.id) > new).unwrap_or(self.pending.len());
+        self.pending.insert(pos, book);
     }
 
     /// Once both the saved state and the stored books are known: the id of the next new book, which is after
@@ -473,7 +540,16 @@ impl ViewerApp {
     /// Get the dictionary ready, restore saved books, and tokenize pending ones, a little per frame.
     fn do_work(&mut self, ctx: &egui::Context) {
         if self.state_loaded && !self.to_restore.is_empty() && self.dictionary_version().is_some() {
-            for saved in std::mem::take(&mut self.to_restore) {
+            // The last selected book first, alone, so that it is ready (or analyzed) before the others; they are
+            // read once it is no longer being read
+            let first = self.first_book.and_then(|id| self.to_restore.iter().position(|b| b.id == id));
+            let reading_first = self.first_book.is_some_and(|id| self.restoring.iter().any(|b| b.id == id));
+            let batch = match first {
+                Some(pos) => vec![self.to_restore.remove(pos)],
+                None if reading_first => Vec::new(),
+                None => std::mem::take(&mut self.to_restore),
+            };
+            for saved in batch {
                 storage::read(&self.inbox, ctx, Key::Analysis(saved.id));
                 self.restoring.push(saved);
             }
@@ -534,12 +610,30 @@ impl ViewerApp {
             }
             DictionaryState::Checking { .. } => true,
             DictionaryState::Loading { version, from_storage, compressed, files, .. } => {
-                if let Some((name, bytes)) = compressed.pop() {
-                    match self.load_times.timed("unpacking", || platform::decompress(&bytes)) {
-                        Ok(data) => {
-                            files.insert(name, data);
+                // A file at a time, a little of it each frame, in what is left of the frame's time
+                if self.unpacking.is_none() {
+                    if let Some((name, bytes)) = compressed.pop() {
+                        match platform::Unpacker::new(bytes) {
+                            Ok(unpacker) => self.unpacking = Some((name, unpacker)),
+                            Err(e) => {
+                                self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}"));
+                                return true;
+                            }
                         }
-                        Err(e) => self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}")),
+                    }
+                }
+                if let Some((name, unpacker)) = &mut self.unpacking {
+                    let deadline = self.frame_started + WORK_PER_FRAME;
+                    match self.load_times.timed("unpacking", || unpacker.step(deadline)) {
+                        Ok(Some(data)) => {
+                            files.insert(name.clone(), data);
+                            self.unpacking = None;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.dictionary = DictionaryState::Failed(format!("Unpacking {name}: {e}"));
+                            self.unpacking = None;
+                        }
                     }
                 } else if files.len() == WEB_DICTIONARY_FILES.len() {
                     let (version, mut files) = (version.clone(), std::mem::take(files));
@@ -584,6 +678,9 @@ impl ViewerApp {
             debug: self.debug,
             reader_font_size: self.reader_font_size,
             reader_vertical: self.reader_vertical,
+            reader_paginate: self.reader_paginate,
+            reader_books: self.reader_books.clone(),
+            view: self.view_state.clone(),
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
             books,
@@ -667,6 +764,8 @@ impl ViewerApp {
                     ui.radio_value(&mut self.reader_vertical, false, "Horizontal (横書き)");
                 });
                 note(ui, "Vertical text reads from top to bottom, in columns from right to left.");
+                ui.checkbox(&mut self.reader_paginate, "Paginate");
+                note(ui, "One page at a time: drag the page sideways, or press the arrow keys, to turn it. Off, the text scrolls.");
                 ui.separator();
 
                 ui.label("Coverage target");
@@ -713,6 +812,7 @@ impl ViewerApp {
                         self.edited_settings = Settings::default();
                         self.reader_font_size = reader::DEFAULT_FONT_SIZE;
                         self.reader_vertical = reader::DEFAULT_VERTICAL;
+                        self.reader_paginate = reader::DEFAULT_PAGINATE;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(theme::primary_button("Done", palette)).clicked() {
@@ -727,7 +827,7 @@ impl ViewerApp {
     /// The small button at the top left that switches between the statistics and the reader.
     fn view_toggle(&mut self, ui: &mut Ui) {
         let (icon, hint) = match self.view {
-            View::Statistics => ("📖", "Read the selected book, from the chapter you learned up to"),
+            View::Statistics => ("📖", "Read the selected book, where you left it"),
             View::Reader => ("📊", "Back to the statistics"),
         };
         let button = egui::Button::new(RichText::new(icon).size(15.0)).min_size(egui::vec2(28.0, 24.0));
@@ -736,18 +836,91 @@ impl ViewerApp {
         }
     }
 
-    /// The reader opens the selected book at the chapter learned up to (the first one before any), or
-    /// where it was left if that has not changed since.
+    /// Switch between the statistics and the reader on the selected book.
     fn toggle_view(&mut self) {
         if self.view == View::Reader {
+            self.remember_place();
             self.view = View::Statistics;
             return;
         }
-        let Some(book) = self.books.get(self.shown) else { return };
-        if self.reader.as_ref().is_none_or(|r| r.book != book.id || r.opened_at != book.learned) {
-            self.reader = Some(Reader::new(book, book.learned.unwrap_or(0)));
+        self.wanted_reader = None;
+        self.open_reader(self.shown);
+    }
+
+    /// Show the reader on the book at `pos`, where it was left (in memory, or saved), or else at its first
+    /// chapter. The book's *Learned up to* does not move it: readers often learn words chapters ahead.
+    fn open_reader(&mut self, pos: usize) {
+        let Some(book) = self.books.get(pos) else { return };
+        if self.reader.as_ref().is_none_or(|r| r.book != book.id) {
+            let reader = match self.reader_books.get(&book.id) {
+                Some(saved) if saved.chapter < book.chapters.len() => {
+                    let mut reader = Reader::new(book, saved.chapter);
+                    reader.go_to(saved.offset, &saved.text);
+                    reader
+                }
+                _ => Reader::new(book, 0),
+            };
+            self.reader = Some(reader);
         }
         self.view = View::Reader;
+    }
+
+    /// Reopen the reader on the book it showed when the app was closed, once that book is ready; then keep
+    /// the saved view up to date.
+    fn restore_view(&mut self) {
+        if let Some(id) = self.wanted_reader {
+            if let Some(pos) = self.books.iter().position(|b| b.id == id) {
+                self.wanted_reader = None;
+                self.open_reader(pos);
+            } else if self.saved_book_name(id).is_none() || matches!(self.dictionary, DictionaryState::Failed(_)) {
+                // The book is gone, or could not be read or analyzed: the statistics instead
+                self.wanted_reader = None;
+            }
+            return;
+        }
+        let reading = self.reader.as_ref().filter(|_| self.view == View::Reader).map(|r| r.book);
+        if reading != self.view_state.reading {
+            self.view_state = ViewState { reading, modified: now_millis() };
+        }
+    }
+
+    /// Save where the reader is in its book (once it differs from the saved place).
+    fn remember_place(&mut self) {
+        if let Some(reader) = &self.reader {
+            self.store_place(reader.book, reader.place());
+        }
+    }
+
+    fn store_place(&mut self, book: u64, place: BookReaderState) {
+        if self.reader_books.get(&book).is_none_or(|saved| !saved.same_place(&place)) {
+            self.reader_books.insert(book, BookReaderState { modified: now_millis(), ..place });
+        }
+    }
+
+    /// The name of a book still being restored or analyzed.
+    fn saved_book_name(&self, id: u64) -> Option<&str> {
+        let saved = self.restoring.iter().chain(&self.to_restore).find(|b| b.id == id);
+        saved.or_else(|| self.pending.iter().map(|b| &b.saved).find(|b| b.id == id)).map(|b| b.name.as_str())
+    }
+
+    /// The reader, while the book it showed when the app was closed is not ready yet: its bar, and a note in
+    /// place of the text (rather than the statistics for a moment).
+    fn opening_reader_view(&mut self, ui: &mut Ui, palette: Palette) {
+        let name = self.wanted_reader.and_then(|id| self.saved_book_name(id)).unwrap_or_default().to_string();
+        ui.horizontal(|ui| {
+            let button = egui::Button::new(RichText::new("📊").size(15.0)).min_size(egui::vec2(28.0, 24.0));
+            if ui.add(button).on_hover_text("Back to the statistics").clicked() {
+                self.wanted_reader = None;
+            }
+            ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new("⚙").selected(self.show_settings)).on_hover_text("Settings, with the font size and text direction").clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+            });
+        });
+        ui.add_space(8.0);
+        ui.label(RichText::new("Opening the book…").color(palette.secondary_text));
     }
 
     /// The reader, full screen, under a bar to switch views and chapters.
@@ -799,13 +972,24 @@ impl ViewerApp {
                 log::info!("Reader: chapter tokenized in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
             }
         }
-        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, palette);
+        let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, self.reader_paginate, palette);
         let chapter = response.chapter.unwrap_or(chapter);
+        let settled = reader.settled_place(ui.ctx()).map(|place| (reader.book, place));
         if let Some(book) = book.filter(|_| chapter != reader.chapter) {
-            let opened_at = reader.opened_at;
             let mut next = Reader::new(book, chapter);
-            next.opened_at = opened_at;
+            if response.chapter == Some(chapter) {
+                if response.at_end {
+                    next.go_to_end();
+                }
+                // A drag turning pages goes on in that chapter, and can come back
+                if let Some(drag) = response.drag {
+                    next.continue_drag(drag);
+                }
+            }
             self.reader = Some(next);
+        }
+        if let Some((book, place)) = settled {
+            self.store_place(book, place);
         }
         if toggle {
             self.toggle_view();
@@ -1008,6 +1192,13 @@ impl ViewerApp {
         self.to_restore.retain(|b| b.id != id);
         if self.wanted_shown == Some(id) {
             self.wanted_shown = None;
+        }
+        self.reader_books.remove(&id);
+        if self.reader.as_ref().is_some_and(|r| r.book == id) {
+            self.reader = None;
+        }
+        if self.wanted_reader == Some(id) {
+            self.wanted_reader = None;
         }
         storage::remove_book(&self.inbox, ctx, id);
         // Save the book list now, before any further work that could make the page reload
@@ -1379,9 +1570,13 @@ fn log_grid(input: GridInput) -> Vec<GridMark> {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.frame_started = Instant::now();
         let ctx = ui.ctx().clone();
         self.handle_incoming(&ctx);
         self.apply_settings(&ctx);
+        if self.state_loaded {
+            self.restore_view();
+        }
         if let Some(wait) = ctx.input(|i| self.inspecting.update(i, &self.plot_rects)) {
             // Nothing else happens while the finger stays still: wake up when the press is long enough
             ctx.request_repaint_after(Duration::from_secs_f64(wait));
@@ -1395,10 +1590,17 @@ impl eframe::App for ViewerApp {
         };
 
         let content = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::same(18));
-        if self.view == View::Reader && self.reader.is_some() {
+        let reader_frame = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::symmetric(16, 8));
+        if !self.state_loaded {
+            // Nothing until the saved state is read (on the web, from storage, a few frames later): it says
+            // whether to show the reader or the statistics
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(palette.content)).show(ui, |_| {});
+        } else if self.view == View::Reader && self.reader.is_some() {
             self.plot_rects.clear();
-            let frame = egui::Frame::new().fill(palette.content).inner_margin(egui::Margin::symmetric(16, 8));
-            egui::CentralPanel::default().frame(frame).show(ui, |ui| self.reader_view(ui, palette));
+            egui::CentralPanel::default().frame(reader_frame).show(ui, |ui| self.reader_view(ui, palette));
+        } else if self.wanted_reader.is_some() {
+            self.plot_rects.clear();
+            egui::CentralPanel::default().frame(reader_frame).show(ui, |ui| self.opening_reader_view(ui, palette));
         } else if ui.available_width() < STACK_BELOW_WIDTH {
             // Phones and narrow windows: the books, then the charts, in one scrolling column
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
@@ -1436,6 +1638,11 @@ impl eframe::App for ViewerApp {
     }
 }
 
+/// Now, in milliseconds since 1970-01-01 UTC.
+fn now_millis() -> u64 {
+    web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
 /// The id of the next new book: after every id the saved state used (`saved_next`, `saved`) and every book
 /// something is stored for (`stored`), so a new book never takes the files of another.
 fn next_book_id(saved_next: u64, saved: &[u64], stored: &[u64]) -> u64 {
@@ -1446,6 +1653,32 @@ fn next_book_id(saved_next: u64, saved: &[u64], stored: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use egui::{pos2, Event, Modifiers, PointerButton, RawInput, TouchDeviceId, TouchId, TouchPhase};
+
+    #[test]
+    fn states_saved_before_the_reader_remembered_places_load() {
+        let old = r#"{"settings":{},"shown":0,"next_id":1,"books":[{"id":0,"name":"本","file_name":"本.epub","learned":2}],"reader_font_size":24.0,"reader_vertical":false}"#;
+        let state: SavedState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.books.len(), 1);
+        assert_eq!(state.reader_font_size, 24.0);
+        assert!(state.reader_paginate);
+        assert!(state.reader_books.is_empty());
+        // The statistics, as before
+        assert_eq!(state.view, ViewState::default());
+
+        // Places saved with the book's progress, before the reader stopped using it
+        let with_learned = r#"{"reader_books":{"7":{"chapter":3,"offset":120,"text":"探す文","learned":2,"modified":5}}}"#;
+        let state: SavedState = serde_json::from_str(with_learned).unwrap();
+        assert_eq!(state.reader_books.get(&7).map(|p| (p.chapter, p.offset)), Some((3, 120)));
+
+        let mut state = SavedState::default();
+        let place = BookReaderState { chapter: 3, offset: 120, text: "探す文".into(), modified: 1_800_000_000_000 };
+        state.reader_books.insert(7, place.clone());
+        state.view = ViewState { reading: Some(7), modified: 1_800_000_000_001 };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reader_books.get(&7), Some(&place));
+        assert_eq!(back.view, state.view);
+    }
 
     #[test]
     fn new_books_never_take_the_id_of_stored_ones() {

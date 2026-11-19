@@ -13,6 +13,7 @@ use egui::epaint::TextShape;
 use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, RichText, Sense, Ui, Vec2};
 use jpfe::dictionary::{Definitions, Kanjidic, DEFINITIONS_FILE, KANJI_FILE};
 use jpfe::tokenizer::{is_cjk_kanji, JapaneseTokenizer, ParsedWord, WordKind};
+use serde::{Deserialize, Serialize};
 
 use crate::book::Book;
 use crate::theme::Palette;
@@ -21,6 +22,8 @@ pub const DEFAULT_FONT_SIZE: f32 = 20.0;
 pub const FONT_SIZES: RangeInclusive<f32> = 10.0..=48.0;
 /// Vertical text (縦書き) unless the reader picks horizontal text.
 pub const DEFAULT_VERTICAL: bool = true;
+/// One page at a time, turned by dragging sideways or with the arrow keys, unless the reader picks scrolling.
+pub const DEFAULT_PAGINATE: bool = true;
 /// Distance from one line (or column) to the next, in font sizes.
 const LINE_PITCH: f32 = 1.75;
 /// Longest horizontal line, in characters.
@@ -38,6 +41,62 @@ const PAGE_NUMBER_SCALE: f32 = 0.5;
 const WHEEL_ZOOM: f32 = 1.06;
 /// Entries shown at most for a word.
 const MAX_ENTRIES: usize = 5;
+/// Characters saved with a place, to find its sentence again if the chapter's text changes.
+const PLACE_TEXT: usize = 16;
+/// Seconds after scrolling stops before the place is saved.
+const SCROLL_SETTLE: f64 = 0.6;
+/// A drag turns the page once it went this share of the view's width sideways (in points, at least and at most).
+const TURN_DRAG: f32 = 0.06;
+const TURN_DRAG_POINTS: RangeInclusive<f32> = 24.0..=64.0;
+/// A page a drag shows stays until the drag comes back within this share of the threshold.
+const DRAG_HYSTERESIS: f32 = 0.7;
+
+/// What the reader remembers of a book: where it was left. The app saves it by book id in its state, so
+/// it is kept when the app restarts; two copies of it (from two devices) merge by keeping the one
+/// `modified` last.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BookReaderState {
+    /// Chapter, as a position in the book's chapter list
+    pub chapter: usize,
+    /// Where the sentence the page (or the view, when scrolling) starts in begins, in bytes of the chapter text
+    pub offset: usize,
+    /// The first characters of the chapter text from `offset`, to find the sentence again if the text
+    /// changes (the book analyzed again by a new build)
+    pub text: String,
+    /// When the place last changed, in milliseconds since 1970-01-01 UTC
+    pub modified: u64,
+}
+
+impl BookReaderState {
+    /// The same place, whenever it was saved.
+    pub fn same_place(&self, other: &Self) -> bool {
+        (self.chapter, self.offset, &self.text) == (other.chapter, other.offset, &other.text)
+    }
+}
+
+/// Where a saved place is in `text`: at `offset` if the text there still starts with `start`, or else where
+/// `start` is found nearest to it (the chapter changed); at `offset` if it is not found at all.
+fn find_place(text: &str, offset: usize, start: &str) -> usize {
+    let offset = text.floor_char_boundary(offset.min(text.len()));
+    if start.is_empty() || text[offset..].starts_with(start) {
+        return offset;
+    }
+    text.match_indices(start).map(|(i, _)| i).min_by_key(|i| i.abs_diff(offset)).unwrap_or(offset)
+}
+
+/// Whether a sentence ends just before character `i`: after 。！？ and the closing brackets that follow
+/// (half-width ! and ? are shown, and stored here, full width).
+fn sentence_ends_before(chars: &[char], i: usize) -> bool {
+    if chars.get(i).is_some_and(|&c| "。！？」』）】〕〉》］｝".contains(c)) {
+        return false;
+    }
+    let mut j = i;
+    while j > 0 && "」』）】〕〉》］｝".contains(chars[j - 1]) {
+        j -= 1;
+    }
+    j > 0 && "。！？".contains(chars[j - 1])
+}
 
 /// Definitions and kanji the reader shows.
 pub struct Lookup {
@@ -102,6 +161,52 @@ struct KanjiPopup {
 pub struct ReaderResponse {
     /// Open this chapter
     pub chapter: Option<usize>,
+    /// At its last page (turning back from the first page of the next chapter)
+    pub at_end: bool,
+    /// A drag in progress, to go on with in that chapter ([`Reader::continue_drag`])
+    pub drag: Option<PageDrag>,
+}
+
+/// A drag turning pages: the page it started on, the one other page it can show, and which of them it shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageDrag {
+    /// The chapter, first line and anchor of the page the drag started on
+    chapter: usize,
+    page: usize,
+    anchor: usize,
+    /// The other page: 1 for the page after that one, -1 for the page before, 0 until the drag first goes past
+    /// the threshold, which fixes it for the rest of the drag
+    other: i8,
+    /// The page shown: 0 for the one the drag started on, or `other`
+    shown: i8,
+}
+
+/// Which page a drag shows (see [`PageDrag`]), from how far it went toward the next page (negative toward the
+/// previous one): the other page past the threshold in its direction, the page it started on anywhere else. Until
+/// the other page is fixed (`other` 0), either direction can fix it. A page shown stays until the drag comes back a
+/// little within the threshold, so that it does not flicker there.
+fn drag_page(shown: i8, other: i8, forward: f32, threshold: f32) -> i8 {
+    let back = threshold * DRAG_HYSTERESIS;
+    let toward = |direction: i8| {
+        let along = forward * f32::from(direction);
+        along >= threshold || (shown == direction && along > back)
+    };
+    match other {
+        0 if toward(1) => 1,
+        0 if toward(-1) => -1,
+        0 => 0,
+        other if toward(other) => other,
+        _ => 0,
+    }
+}
+
+/// Colors of the text and of the highlighted words.
+#[derive(Clone, Copy)]
+struct Colors {
+    text: Color32,
+    secondary: Color32,
+    hover: Color32,
+    selected: Color32,
 }
 
 /// What the text was laid out for; it is laid out again when any of it changes.
@@ -165,11 +270,12 @@ impl Layout {
         }
     }
 
-    /// The paragraph and character at `pos`.
-    fn char_at(&self, pos: Pos2, origin: Pos2) -> Option<(usize, usize)> {
+    /// The paragraph and character at `pos`, if it is on one of `lines`.
+    fn char_at(&self, pos: Pos2, origin: Pos2, lines: Range<usize>) -> Option<(usize, usize)> {
         let (across, along) = if self.key.vertical { (origin.x - pos.x, pos.y - origin.y) } else { (pos.y - origin.y, pos.x - origin.x) };
-        let line = &self.lines[self.lines.partition_point(|l| l.offset + l.pitch <= across).min(self.lines.len().checked_sub(1)?)];
-        if across < line.offset || along < 0.0 {
+        let index = self.lines.partition_point(|l| l.offset + l.pitch <= across).min(self.lines.len().checked_sub(1)?);
+        let line = &self.lines[index];
+        if !lines.contains(&index) || across < line.offset || along < 0.0 {
             return None;
         }
         let cell = (along / (self.key.size * line.scale)) as usize;
@@ -184,9 +290,13 @@ impl Layout {
         start..self.lines.partition_point(|l| l.offset <= to).max(start)
     }
 
-    /// Rectangles covering the characters `chars` of a paragraph, one for each line they are on.
-    fn rects(&self, paragraph: usize, chars: &Range<usize>, origin: Pos2) -> Vec<Rect> {
-        let lines = self.paragraph_lines.get(paragraph).cloned().unwrap_or_default();
+    /// Rectangles covering the characters `chars` of a paragraph, one for each line they are on among `lines`.
+    fn rects(&self, paragraph: usize, chars: &Range<usize>, origin: Pos2, lines: Range<usize>) -> Vec<Rect> {
+        let own = self.paragraph_lines.get(paragraph).cloned().unwrap_or_default();
+        let lines = own.start.max(lines.start)..own.end.min(lines.end);
+        if lines.is_empty() {
+            return Vec::new();
+        }
         self.lines[lines]
             .iter()
             .filter_map(|line| {
@@ -200,6 +310,54 @@ impl Layout {
                 })
             })
             .collect()
+    }
+
+    /// Pages are made of items: the lines, then, when `end` is not zero, room of that thickness after the
+    /// text for the next chapter button.
+    fn items(&self, end: f32) -> usize {
+        self.lines.len() + usize::from(end > 0.0)
+    }
+
+    /// Where an item starts (its distance from the first line), and its thickness.
+    fn item(&self, item: usize, end: f32) -> (f32, f32) {
+        self.lines.get(item).map_or((self.extent, end), |l| (l.offset, l.pitch))
+    }
+
+    /// End of the page starting at item `start`: as many whole items as fit in `room` (at least one).
+    fn page_end(&self, start: usize, room: f32, end: f32) -> usize {
+        let items = self.items(end);
+        let from = self.item(start, end).0;
+        let mut stop = (start + 1).min(items);
+        while stop < items {
+            let (offset, pitch) = self.item(stop, end);
+            if offset + pitch - from > room {
+                break;
+            }
+            stop += 1;
+        }
+        stop
+    }
+
+    /// Start of the page after the one starting at `start` (`None` after the last one), not starting with
+    /// the empty lines between paragraphs.
+    fn next_page(&self, start: usize, room: f32, end: f32) -> Option<usize> {
+        let mut next = self.page_end(start, room, end);
+        while next + 1 < self.lines.len() && self.lines[next].paragraph.is_some() && self.lines[next].chars.is_empty() {
+            next += 1;
+        }
+        (next < self.items(end)).then_some(next)
+    }
+
+    /// Start of the page before item `start`. Pages follow each other from the chapter's start, so turning
+    /// back shows the pages turning forward showed, the first one with the chapter title: the last of them
+    /// that starts before `start` (it shows lines of the current page too when `start` is not one of them,
+    /// after the text was laid out again).
+    fn page_before(&self, start: usize, room: f32, end: f32) -> usize {
+        let mut page = 0;
+        while let Some(next) = self.next_page(page, room, end).filter(|&next| next < start) {
+            page = next;
+        }
+        page
     }
 }
 
@@ -299,8 +457,6 @@ fn draw_char(painter: &Painter, c: char, cell: Rect, font: &FontId, color: Color
 pub struct Reader {
     pub book: u64,
     pub chapter: usize,
-    /// The book's progress when the reader was opened: the reader opens there again once it changes
-    pub opened_at: Option<usize>,
     book_name: String,
     title: Vec<char>,
     chapters: usize,
@@ -310,10 +466,24 @@ pub struct Reader {
     /// Words are found once the dictionary is ready
     tokenized: bool,
     layout: Option<Layout>,
-    /// How far into the chapter the reader is (0 to 1), kept when the text is laid out again
-    position: f32,
-    /// Layout and visible size the scroll position was last set for
-    placed_for: Option<(LayoutKey, Vec2)>,
+    /// Where the reader is: the start of the sentence the page (or the view, when scrolling) starts in, in
+    /// bytes of the chapter text. It moves when the reader turns a page or scrolls, not when the text is laid
+    /// out again, which shows it at the start of the page (zoom, window size, direction, pagination).
+    anchor: usize,
+    /// Show the chapter's end once it is laid out (turning back from the next chapter)
+    to_end: bool,
+    /// When the anchor last moved, until its place is saved (`-∞` to save it right away)
+    anchor_moved: Option<f64>,
+    /// First line of the page shown (paginated)
+    page: usize,
+    /// The drag in progress (paginated)
+    drag: Option<PageDrag>,
+    /// Show this line's page once laid out, when a drag comes back to the chapter it started in
+    start_line: Option<usize>,
+    /// Scroll offset set or seen in the last frame (scrolling)
+    scroll_offset: Option<f32>,
+    /// Layout, visible size and pagination the anchor was last shown for
+    placed_for: Option<(LayoutKey, Vec2, bool)>,
     word_popup: Option<WordPopup>,
     kanji_popup: Option<KanjiPopup>,
     /// Where the word window was in the last frame, to open the kanji window next to it
@@ -323,8 +493,13 @@ pub struct Reader {
 
 impl Reader {
     pub fn new(book: &Book, chapter: usize) -> Self {
-        let text = book.chapter_text(chapter).to_string();
         let pdf = book.file_name.to_lowercase().ends_with(".pdf");
+        let mut reader = Self::from_text(book.id, &book.name, &book.chapter_label(chapter), book.chapter_text(chapter), pdf, book.chapters.len());
+        reader.chapter = chapter;
+        reader
+    }
+
+    fn from_text(book: u64, book_name: &str, title: &str, text: &str, pdf: bool, chapters: usize) -> Self {
         let mut at = 0;
         let paragraphs = text
             .split('\n')
@@ -336,24 +511,70 @@ impl Reader {
             })
             .collect();
         Self {
-            book: book.id,
-            chapter,
-            opened_at: book.learned,
-            book_name: book.name.clone(),
-            title: book.chapter_label(chapter).chars().map(full_width).collect(),
-            chapters: book.chapters.len(),
-            text,
+            book,
+            chapter: 0,
+            book_name: book_name.to_string(),
+            title: title.chars().map(full_width).collect(),
+            chapters,
+            text: text.to_string(),
             paragraphs,
             words: Vec::new(),
             tokenized: false,
             layout: None,
-            position: 0.0,
+            anchor: 0,
+            to_end: false,
+            // A chapter opened at its start is a place to save
+            anchor_moved: Some(f64::NEG_INFINITY),
+            page: 0,
+            drag: None,
+            start_line: None,
+            scroll_offset: None,
             placed_for: None,
             word_popup: None,
             kanji_popup: None,
             word_popup_rect: None,
             popups: 0,
         }
+    }
+
+    /// Open at a saved place (see [`BookReaderState`]).
+    pub fn go_to(&mut self, offset: usize, start: &str) {
+        self.anchor = find_place(&self.text, offset, start);
+        self.anchor_moved = None;
+    }
+
+    /// Open at the chapter's last page (or its end, when scrolling).
+    pub fn go_to_end(&mut self) {
+        self.to_end = true;
+        self.anchor_moved = None;
+    }
+
+    /// Where the reader is, to save (with `modified` left for the app to set).
+    pub fn place(&self) -> BookReaderState {
+        let text = self.text.get(self.anchor..).unwrap_or_default().chars().take(PLACE_TEXT).collect();
+        BookReaderState { chapter: self.chapter, offset: self.anchor, text, modified: 0 }
+    }
+
+    /// The place, once it has moved and settled: right after a page turn, or a moment after scrolling stops.
+    pub fn settled_place(&mut self, ctx: &egui::Context) -> Option<BookReaderState> {
+        let moved = self.anchor_moved?;
+        let (now, down) = ctx.input(|i| (i.time, i.pointer.any_down()));
+        let wait = SCROLL_SETTLE - (now - moved);
+        if down {
+            return None;
+        }
+        if wait > 0.0 {
+            ctx.request_repaint_after_secs(wait as f32);
+            return None;
+        }
+        self.anchor_moved = None;
+        Some(self.place())
+    }
+
+    /// Move the anchor at `now`; a page turn (`settled`) is saved right away, scrolling once it stops.
+    fn move_anchor(&mut self, anchor: usize, now: f64, settled: bool) {
+        self.anchor = anchor;
+        self.anchor_moved = Some(if settled { f64::NEG_INFINITY } else { now });
     }
 
     pub fn needs_words(&self) -> bool {
@@ -434,7 +655,31 @@ impl Reader {
         Layout { key, lines, paragraph_lines, extent: offset, line_length: cells(1.0) as f32 * key.size }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, lookup: Option<&Lookup>, font_size: &mut f32, vertical: bool, palette: Palette) -> ReaderResponse {
+    /// The line showing byte `offset` of the chapter text (the title for the chapter's start).
+    fn line_at_offset(&self, layout: &Layout, offset: usize) -> usize {
+        if offset == 0 {
+            return 0;
+        }
+        let p = self.paragraphs.partition_point(|p| p.span.start <= offset).saturating_sub(1);
+        let (Some(paragraph), Some(lines)) = (self.paragraphs.get(p), layout.paragraph_lines.get(p)) else { return 0 };
+        let char = self.text.get(paragraph.span.start..offset.min(paragraph.span.end)).map_or(0, |t| t.chars().count());
+        lines.clone().find(|&l| char < layout.lines[l].chars.end).unwrap_or(lines.end.saturating_sub(1))
+    }
+
+    /// Where the sentence that line `line` starts in begins, in bytes of the chapter text (the chapter's start
+    /// for its title).
+    fn sentence_start(&self, layout: &Layout, line: usize) -> usize {
+        let Some(line) = layout.lines.get(line.min(layout.lines.len().saturating_sub(1))) else { return 0 };
+        let Some(paragraph) = line.paragraph.and_then(|p| self.paragraphs.get(p)) else { return 0 };
+        let mut start = line.chars.start.min(paragraph.chars.len());
+        while start > 0 && !sentence_ends_before(&paragraph.chars, start) {
+            start -= 1;
+        }
+        let text = &self.text[paragraph.span.clone()];
+        paragraph.span.start + text.char_indices().nth(start).map_or(text.len(), |(i, _)| i)
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui, lookup: Option<&Lookup>, font_size: &mut f32, vertical: bool, paginate: bool, palette: Palette) -> ReaderResponse {
         let mut response = ReaderResponse::default();
         zoom(ui, font_size);
         let size = *font_size;
@@ -450,100 +695,25 @@ impl Reader {
         // A cell of room for punctuation hanging past the end of a line
         let length = if vertical { view.y - 2.0 * margin - size } else { (view.x - 2.0 * margin - size).min(size * MAX_LINE) };
         let key = LayoutKey { size, vertical, length: length.max(size * 4.0) };
-        let mut layout = match self.layout.take() {
+        let layout = match self.layout.take() {
             Some(layout) if layout.key == key => layout,
             _ => self.lay_out(key),
         };
-        let content = layout.content_size(view);
-        let scrollable = if vertical { content.x - view.x } else { content.y - view.y }.max(0.0);
-        let mut area = if vertical { egui::ScrollArea::horizontal() } else { egui::ScrollArea::vertical() }
-            .id_salt(("reader", self.book, self.chapter, vertical))
-            .auto_shrink(false);
-        // Keep the place in the chapter when the text is laid out again (vertical text starts on the right)
-        if self.placed_for != Some((key, view)) {
-            self.placed_for = Some((key, view));
-            area = if vertical {
-                area.horizontal_scroll_offset(scrollable * (1.0 - self.position))
-            } else {
-                area.vertical_scroll_offset(scrollable * self.position)
-            };
-        }
-        // The mouse wheel moves through vertical text: down goes on to the next columns, on the left
-        let view_rect = Rect::from_min_size(ui.cursor().min, view);
-        if vertical && ui.rect_contains_pointer(view_rect) {
-            ui.ctx().input_mut(|i| {
-                let delta = i.smooth_scroll_delta;
-                i.smooth_scroll_delta = vec2(delta.x - delta.y, 0.0);
-            });
-        }
-
-        let colors = (ui.visuals().text_color(), palette.secondary_text, palette.accent.gamma_multiply(0.12), palette.accent.gamma_multiply(0.28));
-        let selected = self.word_popup.as_ref().map(|p| p.word);
-        let mut clicked: Option<Option<(usize, Pos2, Align2)>> = None;
-        let shown = area.show(ui, |ui| {
-            let (rect, background) = ui.allocate_exact_size(content, Sense::click());
-            let origin = layout.origin(rect);
-            let word_at = |pos: Pos2| layout.char_at(pos, origin).and_then(|(p, c)| self.word_at(p, c));
-            let hovered = background.hover_pos().and_then(word_at);
-            if hovered.is_some() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            let painter = ui.painter();
-            let (text, secondary, hover_fill, selected_fill) = colors;
-            for (word, fill) in [(hovered, hover_fill), (selected, selected_fill)] {
-                if let Some(word) = word.and_then(|w| self.words.get(w)) {
-                    for r in layout.rects(word.paragraph, &word.chars, origin) {
-                        painter.rect_filled(r, 3.0, fill);
-                    }
-                }
-            }
-            for line in &layout.lines[layout.visible(ui.clip_rect(), origin)] {
-                let (chars, color) = match line.paragraph {
-                    None => (&self.title, text),
-                    Some(p) => (&self.paragraphs[p].chars, if self.paragraphs[p].page_number { secondary } else { text }),
-                };
-                let font = FontId::proportional(size * line.scale);
-                for (i, &c) in chars[line.chars.clone()].iter().enumerate() {
-                    if c != '　' {
-                        draw_char(painter, c, layout.cell(line, line.first_cell + i, origin), &font, color, vertical);
-                    }
-                }
-            }
-            if self.chapter + 1 < self.chapters {
-                // After the text: below it, or on its left for vertical text
-                let (area, align) = if vertical {
-                    let right = origin.x - layout.extent - size * 0.5;
-                    (Rect::from_min_max(pos2(right - size * (END_SPACE_VERTICAL - 1.0), origin.y), pos2(right, origin.y + size * 2.0)), egui::Align::Max)
-                } else {
-                    let top = origin.y + layout.extent + size;
-                    (Rect::from_min_size(pos2(origin.x, top), vec2(layout.line_length, size * 2.0)), egui::Align::Center)
-                };
-                let builder = egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(align));
-                ui.scope_builder(builder, |ui| {
-                    if ui.add(egui::Button::new(RichText::new("Next chapter ›").size(size * 0.8))).clicked() {
-                        response.chapter = Some(self.chapter + 1);
-                    }
-                });
-            }
-            if background.clicked() {
-                // The window opens beside the word: below it, or on its left for vertical text
-                clicked = Some(background.interact_pointer_pos().and_then(word_at).and_then(|w| {
-                    let word = &self.words[w];
-                    let first = *layout.rects(word.paragraph, &word.chars, origin).first()?;
-                    let width = popup_width(ui.ctx(), size, WORD_POPUP_WIDTH);
-                    Some(if vertical && first.left() - 6.0 - width >= ui.ctx().content_rect().left() {
-                        (w, first.left_top() - vec2(6.0, 0.0), Align2::RIGHT_TOP)
-                    } else {
-                        (w, first.left_bottom() + vec2(0.0, 4.0), Align2::LEFT_TOP)
-                    })
-                }));
-            }
-        });
-        let offset = shown.state.clamped_offset();
-        if scrollable > 0.0 {
-            self.position = if vertical { 1.0 - offset.x / scrollable } else { offset.y / scrollable }.clamp(0.0, 1.0);
-        }
-        layout.key = key;
+        // Show the anchor again when the text is laid out again, or the view changes
+        let replace = self.placed_for != Some((key, view, paginate));
+        self.placed_for = Some((key, view, paginate));
+        let colors = Colors {
+            text: ui.visuals().text_color(),
+            secondary: palette.secondary_text,
+            hover: palette.accent.gamma_multiply(0.12),
+            selected: palette.accent.gamma_multiply(0.28),
+        };
+        let clicked = if paginate {
+            self.paged_ui(ui, &layout, view, replace, colors, &mut response)
+        } else {
+            self.drag = None;
+            self.scrolled_ui(ui, &layout, view, replace, colors, &mut response)
+        };
         self.layout = Some(layout);
 
         match clicked {
@@ -561,6 +731,303 @@ impl Reader {
         }
         self.popups_ui(ui.ctx(), lookup, size, palette);
         response
+    }
+
+    /// The whole chapter, scrolling (sideways for vertical text); returns a click on the text, with the word
+    /// clicked if any.
+    fn scrolled_ui(&mut self, ui: &mut Ui, layout: &Layout, view: Vec2, replace: bool, colors: Colors, response: &mut ReaderResponse) -> Option<Option<(usize, Pos2, Align2)>> {
+        let (size, vertical) = (layout.key.size, layout.key.vertical);
+        let content = layout.content_size(view);
+        let scrollable = if vertical { content.x - view.x } else { content.y - view.y }.max(0.0);
+        let mut area = if vertical { egui::ScrollArea::horizontal() } else { egui::ScrollArea::vertical() }
+            .id_salt(("reader", self.book, self.chapter, vertical))
+            .auto_shrink(false);
+        if replace {
+            // The anchor's line at the start of the view (vertical text starts on the right), or the chapter's end
+            let target = if self.to_end {
+                if vertical { 0.0 } else { scrollable }
+            } else {
+                let line = &layout.lines[self.line_at_offset(layout, self.anchor)];
+                if vertical { content.x - line.offset - view.x } else { line.offset }.clamp(0.0, scrollable)
+            };
+            // Coming to the end moves the anchor, found below from where the view lands
+            self.scroll_offset = (!std::mem::take(&mut self.to_end)).then_some(target);
+            area = if vertical { area.horizontal_scroll_offset(target) } else { area.vertical_scroll_offset(target) };
+        }
+        // The mouse wheel moves through vertical text: down goes on to the next columns, on the left
+        let view_rect = Rect::from_min_size(ui.cursor().min, view);
+        if vertical && ui.rect_contains_pointer(view_rect) {
+            ui.ctx().input_mut(|i| {
+                let delta = i.smooth_scroll_delta;
+                i.smooth_scroll_delta = vec2(delta.x - delta.y, 0.0);
+            });
+        }
+
+        let selected = self.word_popup.as_ref().map(|p| p.word);
+        let mut clicked = None;
+        let shown = area.show(ui, |ui| {
+            let (rect, background) = ui.allocate_exact_size(content, Sense::click());
+            let origin = layout.origin(rect);
+            let all = 0..layout.lines.len();
+            let hovered = background.hover_pos().and_then(|pos| self.word_at_pos(layout, origin, all.clone(), pos));
+            if hovered.is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            let drawn = layout.visible(ui.clip_rect(), origin);
+            self.paint(ui.painter(), layout, origin, drawn, all.clone(), [(hovered, colors.hover), (selected, colors.selected)], colors);
+            if self.chapter + 1 < self.chapters && self.next_chapter_button(ui, layout, origin) {
+                response.chapter = Some(self.chapter + 1);
+            }
+            if background.clicked() {
+                clicked = Some(background.interact_pointer_pos().and_then(|pos| self.popup_for(ui.ctx(), layout, origin, all.clone(), pos)));
+            }
+        });
+        let offset = shown.state.clamped_offset();
+        let along = if vertical { offset.x } else { offset.y };
+        if self.scroll_offset.is_none_or(|o| (o - along).abs() > 0.5) {
+            self.scroll_offset = Some(along);
+            // Scrolled: the anchor is the sentence of the first line whose start is in view
+            let margin = size * MARGIN;
+            let edge = if vertical { content.x - margin - along - view.x } else { along - margin };
+            let first = layout.lines.partition_point(|l| l.offset < edge - 0.5);
+            let now = ui.input(|i| i.time);
+            self.move_anchor(self.sentence_start(layout, first), now, false);
+        }
+        clicked
+    }
+
+    /// One page of the chapter: whole columns (or lines) from `self.page`, turned by dragging sideways or
+    /// with the arrow keys, in the reading direction. Returns a click on the text, with the word clicked if any.
+    fn paged_ui(&mut self, ui: &mut Ui, layout: &Layout, view: Vec2, replace: bool, colors: Colors, response: &mut ReaderResponse) -> Option<Option<(usize, Pos2, Align2)>> {
+        let (size, vertical) = (layout.key.size, layout.key.vertical);
+        let next_chapter = self.chapter + 1 < self.chapters;
+        // Room for the next chapter button after the text, as for scrolling
+        let end = if next_chapter { size * if vertical { END_SPACE_VERTICAL } else { END_SPACE } } else { 0.0 };
+        let room = (if vertical { view.x } else { view.y } - 2.0 * size * MARGIN).max(size);
+        let items = layout.items(end);
+        let now = ui.input(|i| i.time);
+        if replace {
+            if std::mem::take(&mut self.to_end) {
+                // A full last page
+                self.page = layout.page_before(items, room, end);
+                self.move_anchor(self.sentence_start(layout, self.page), now, true);
+            } else if let Some(line) = self.start_line.take() {
+                // Back to the page a drag started on, in this chapter
+                self.page = line;
+            } else {
+                // The page starts with the anchor's line
+                self.page = self.line_at_offset(layout, self.anchor);
+            }
+        }
+        self.page = self.page.min(items.saturating_sub(1));
+
+        let (rect, background) = ui.allocate_exact_size(view, Sense::click_and_drag());
+        // Dragging: while the pointer is down, the page shown follows how far it went from where it was pressed,
+        // in the reading direction (a short drag is a click: egui tells them apart). Vertical text reads to the
+        // left, so its next page is pulled in from the left, toward the right; horizontal text reads to the
+        // right, so its next page comes from the right, toward the left. Whole pages switch at once.
+        // A drag starts on the page, and lasts until the button (or finger) is up, measured from where it was
+        // pressed: even if egui stops calling it a drag of the page for a frame, it never starts again from the
+        // page it shows, which would reach a third page
+        let (down, moved) = ui.input(|i| (i.pointer.primary_down(), i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(from, to)| to - from)));
+        if self.drag.is_none() && background.dragged() {
+            self.drag = Some(PageDrag { chapter: self.chapter, page: self.page, anchor: self.anchor, other: 0, shown: 0 });
+        }
+        if let Some(drag) = self.drag.filter(|_| down) {
+            let threshold = (rect.width() * TURN_DRAG).clamp(*TURN_DRAG_POINTS.start(), *TURN_DRAG_POINTS.end());
+            let forward = moved.map_or(0.0, |d| if vertical { d.x } else { -d.x });
+            let wanted = drag_page(drag.shown, drag.other, forward, threshold);
+            if wanted != drag.shown {
+                self.show_drag_page(layout, room, end, wanted, response);
+                ui.ctx().request_repaint();
+            }
+        } else if let Some(drag) = self.drag.take() {
+            // Released: the page shown stays, and its place is saved
+            if drag.shown != 0 {
+                self.move_anchor(self.anchor, now, true);
+            }
+        }
+        // An arrow key turns the page in the reading direction, though not while a widget has the keyboard (a
+        // text field, or keyboard navigation)
+        let mut turn = None;
+        if self.drag.is_none() && !ui.ctx().egui_wants_keyboard_input() {
+            let (left, right) = ui.input(|i| (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
+            if left != right {
+                turn = Some(left == vertical);
+            }
+        }
+        // Past the last page, the next chapter; before the first one, the previous chapter's last page
+        let turned = match turn {
+            Some(true) => match layout.next_page(self.page, room, end) {
+                Some(next) => {
+                    self.page = next;
+                    true
+                }
+                None => {
+                    response.chapter = next_chapter.then_some(self.chapter + 1);
+                    false
+                }
+            },
+            Some(false) if self.page > 0 => {
+                self.page = layout.page_before(self.page, room, end);
+                true
+            }
+            Some(false) if self.chapter > 0 => {
+                response.chapter = Some(self.chapter - 1);
+                response.at_end = true;
+                false
+            }
+            _ => false,
+        };
+        if turned {
+            self.move_anchor(self.sentence_start(layout, self.page), now, true);
+            self.close_popups();
+        }
+
+        let page = self.page..layout.page_end(self.page, room, end);
+        let lines = page.start.min(layout.lines.len())..page.end.min(layout.lines.len());
+        // The page's first line at the start of the view
+        let mut origin = layout.origin(rect);
+        let first = layout.item(page.start, end).0;
+        if vertical {
+            origin.x += first;
+        } else {
+            origin.y -= first;
+        }
+        let hovered = background.hover_pos().filter(|_| self.drag.is_none() && !background.dragged()).and_then(|pos| self.word_at_pos(layout, origin, lines.clone(), pos));
+        if hovered.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let selected = self.word_popup.as_ref().map(|p| p.word);
+        let highlights = [(hovered, colors.hover), (selected, colors.selected)];
+        self.paint(&ui.painter_at(rect), layout, origin, lines.clone(), lines.clone(), highlights, colors);
+        if next_chapter && page.end == items && self.next_chapter_button(ui, layout, origin) {
+            response.chapter = Some(self.chapter + 1);
+        }
+        background
+            .clicked()
+            .then(|| background.interact_pointer_pos().and_then(|pos| self.popup_for(ui.ctx(), layout, origin, lines.clone(), pos)))
+    }
+
+    /// While a drag is in progress, show the page it started on (`wanted` 0), the next one (1) or the previous
+    /// one (-1). The next or previous page may be in another chapter: the app then opens it, and the drag goes
+    /// on there (see [`ReaderResponse::drag`]).
+    fn show_drag_page(&mut self, layout: &Layout, room: f32, end: f32, wanted: i8, response: &mut ReaderResponse) {
+        let Some(mut drag) = self.drag else { return };
+        // The first page past the threshold is the only other page this drag shows
+        if wanted != 0 {
+            drag.other = wanted;
+        }
+        if drag.chapter != self.chapter {
+            // Shown from the next or previous chapter: back to the chapter the drag started in, which shows
+            // the page wanted from there
+            drag.shown = 0;
+            response.chapter = Some(drag.chapter);
+            response.drag = Some(drag);
+            return;
+        }
+        let target = match wanted {
+            0 => Some(drag.page),
+            1 => layout.next_page(drag.page, room, end),
+            _ => (drag.page > 0).then(|| layout.page_before(drag.page, room, end)),
+        };
+        match target {
+            Some(page) => {
+                self.page = page;
+                // The page the drag started on keeps its place as it was
+                self.anchor = if wanted == 0 { drag.anchor } else { self.sentence_start(layout, page) };
+            }
+            None => {
+                let chapter = if wanted > 0 { (self.chapter + 1 < self.chapters).then_some(self.chapter + 1) } else { self.chapter.checked_sub(1) };
+                // Nothing before the first page of the book, or after its last one: the page stays
+                let Some(chapter) = chapter else {
+                    self.drag = Some(drag);
+                    return;
+                };
+                response.chapter = Some(chapter);
+                response.at_end = wanted < 0;
+                response.drag = Some(PageDrag { shown: wanted, ..drag });
+            }
+        }
+        drag.shown = wanted;
+        self.drag = Some(drag);
+        if wanted != 0 {
+            self.close_popups();
+        }
+    }
+
+    /// Go on with a drag that started in another chapter, or come back to the page it started on.
+    pub fn continue_drag(&mut self, drag: PageDrag) {
+        if drag.chapter == self.chapter {
+            self.anchor = drag.anchor;
+            self.start_line = Some(drag.page);
+            self.anchor_moved = None;
+        }
+        self.drag = Some(drag);
+    }
+
+    /// The word is no longer in view.
+    fn close_popups(&mut self) {
+        self.word_popup = None;
+        self.kanji_popup = None;
+    }
+
+    /// Draws lines `drawn`, with the words of `highlights` filled where they are on lines `lines`.
+    #[allow(clippy::too_many_arguments)]
+    fn paint(&self, painter: &Painter, layout: &Layout, origin: Pos2, drawn: Range<usize>, lines: Range<usize>, highlights: [(Option<usize>, Color32); 2], colors: Colors) {
+        let (size, vertical) = (layout.key.size, layout.key.vertical);
+        for (word, fill) in highlights {
+            if let Some(word) = word.and_then(|w| self.words.get(w)) {
+                for r in layout.rects(word.paragraph, &word.chars, origin, lines.clone()) {
+                    painter.rect_filled(r, 3.0, fill);
+                }
+            }
+        }
+        for line in &layout.lines[drawn] {
+            let (chars, color) = match line.paragraph {
+                None => (&self.title, colors.text),
+                Some(p) => (&self.paragraphs[p].chars, if self.paragraphs[p].page_number { colors.secondary } else { colors.text }),
+            };
+            let font = FontId::proportional(size * line.scale);
+            for (i, &c) in chars[line.chars.clone()].iter().enumerate() {
+                if c != '　' {
+                    draw_char(painter, c, layout.cell(line, line.first_cell + i, origin), &font, color, vertical);
+                }
+            }
+        }
+    }
+
+    /// The next chapter button, after the text: below it, or on its left for vertical text. True when clicked.
+    fn next_chapter_button(&self, ui: &mut Ui, layout: &Layout, origin: Pos2) -> bool {
+        let size = layout.key.size;
+        let (area, align) = if layout.key.vertical {
+            let right = origin.x - layout.extent - size * 0.5;
+            (Rect::from_min_max(pos2(right - size * (END_SPACE_VERTICAL - 1.0), origin.y), pos2(right, origin.y + size * 2.0)), egui::Align::Max)
+        } else {
+            let top = origin.y + layout.extent + size;
+            (Rect::from_min_size(pos2(origin.x, top), vec2(layout.line_length, size * 2.0)), egui::Align::Center)
+        };
+        let builder = egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(align));
+        ui.scope_builder(builder, |ui| ui.add(egui::Button::new(RichText::new("Next chapter ›").size(size * 0.8))).clicked()).inner
+    }
+
+    /// The word at `pos`, if it is on one of `lines`.
+    fn word_at_pos(&self, layout: &Layout, origin: Pos2, lines: Range<usize>, pos: Pos2) -> Option<usize> {
+        layout.char_at(pos, origin, lines).and_then(|(p, c)| self.word_at(p, c))
+    }
+
+    /// The word at `pos` (on one of `lines`), and where its window opens: beside it, below it or on its left
+    /// for vertical text.
+    fn popup_for(&self, ctx: &egui::Context, layout: &Layout, origin: Pos2, lines: Range<usize>, pos: Pos2) -> Option<(usize, Pos2, Align2)> {
+        let w = self.word_at_pos(layout, origin, lines.clone(), pos)?;
+        let word = &self.words[w];
+        let first = *layout.rects(word.paragraph, &word.chars, origin, lines).first()?;
+        let width = popup_width(ctx, layout.key.size, WORD_POPUP_WIDTH);
+        Some(if layout.key.vertical && first.left() - 6.0 - width >= ctx.content_rect().left() {
+            (w, first.left_top() - vec2(6.0, 0.0), Align2::RIGHT_TOP)
+        } else {
+            (w, first.left_bottom() + vec2(0.0, 4.0), Align2::LEFT_TOP)
+        })
     }
 
     fn popups_ui(&mut self, ctx: &egui::Context, lookup: Option<&Lookup>, size: f32, palette: Palette) {
@@ -968,7 +1435,7 @@ fn kanji_ui(ui: &mut Ui, kanji: char, kanjidic: &Kanjidic, body: f32, palette: P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::{vec2, Event, Modifiers, MouseWheelUnit, RawInput, TouchPhase};
+    use egui::{Event, Modifiers, MouseWheelUnit, RawInput, TouchPhase};
 
     /// The font size after one frame with `events`, from 20.
     fn zoomed(events: Vec<Event>) -> f32 {
@@ -998,6 +1465,273 @@ mod tests {
     fn shows_half_width_characters_full_width() {
         assert_eq!("40 ab!".chars().map(full_width).collect::<String>(), "４０　ａｂ！");
         assert_eq!(full_width('魔'), '魔');
+    }
+
+    #[test]
+    fn finds_a_saved_place_again_when_the_text_moved() {
+        let text = "前の文。探す文はここ。後の文。";
+        let at = text.find("探す").unwrap();
+        assert_eq!(find_place(text, at, "探す文"), at);
+        // Text added before it: found again by its first characters
+        let moved = format!("新しい段落。\n{text}");
+        assert_eq!(find_place(&moved, at, "探す文"), moved.find("探す").unwrap());
+        // Not found: the offset, on a character boundary
+        assert_eq!(find_place(text, at + 1, "ない"), at);
+        assert_eq!(find_place(text, 1000, "ない"), text.len());
+    }
+
+    #[test]
+    fn a_page_starts_in_the_sentence_its_first_line_is_in() {
+        let chars: Vec<char> = "あ。「い！」う".chars().collect();
+        assert!(sentence_ends_before(&chars, 2));
+        // Not between a period and the bracket closing after it
+        assert!(!sentence_ends_before(&chars, 5));
+        assert!(sentence_ends_before(&chars, 6));
+        assert!(!sentence_ends_before(&chars, 4));
+
+        let reader = Reader::from_text(0, "Book", "T", "一二三四五六七。八九十一二三四五\n次", false, 2);
+        let layout = reader.lay_out(LayoutKey { size: 10.0, vertical: true, length: 40.0 });
+        // Title, a half line, then four characters per column
+        let line = |text: &str| reader.line_at_offset(&layout, reader.text.find(text).unwrap());
+        assert_eq!(line("五六"), 3);
+        assert_eq!(reader.sentence_start(&layout, line("五六")), 0);
+        assert_eq!(reader.sentence_start(&layout, line("九十")), reader.text.find("八").unwrap());
+        assert_eq!(reader.sentence_start(&layout, line("次")), reader.text.find("次").unwrap());
+        assert_eq!(reader.sentence_start(&layout, 0), 0);
+        assert_eq!(reader.line_at_offset(&layout, 0), 0);
+    }
+
+    #[test]
+    fn pages_hold_whole_lines() {
+        let reader = Reader::from_text(0, "Book", "T", &"あいうえおかきくけこ\n".repeat(5), false, 1);
+        let layout = reader.lay_out(LayoutKey { size: 10.0, vertical: true, length: 40.0 });
+        // Every line but the half one after the title is 17.5 thick
+        let room = 60.0;
+        assert_eq!(layout.page_end(2, room, 0.0), 5);
+        // Turning back shows the pages turning forward showed, from the chapter's start
+        let mut pages = vec![0];
+        while let Some(next) = layout.next_page(*pages.last().unwrap(), room, 0.0) {
+            pages.push(next);
+        }
+        assert!(pages.len() > 2);
+        for pair in pages.windows(2) {
+            assert_eq!(layout.page_before(pair[1], room, 0.0), pair[0]);
+        }
+        // From a line that is not a page's start: the page it is in
+        let inside = pages[2] - 1;
+        assert!(inside > pages[1]);
+        assert_eq!(layout.page_before(inside, room, 0.0), pages[1]);
+        // The room for the next chapter button is the last item, so the last page ends with it
+        let with_end = layout.items(30.0);
+        assert_eq!(with_end, layout.lines.len() + 1);
+        assert_eq!(layout.page_end(with_end - 1, room, 30.0), with_end);
+        let last = layout.page_before(with_end, room, 30.0);
+        assert_eq!(layout.page_end(last, room, 30.0), with_end);
+    }
+
+    /// One frame of the reader, paginated, in a 400 × 300 window.
+    fn frame(ctx: &egui::Context, reader: &mut Reader, vertical: bool, time: f64, events: Vec<Event>) -> ReaderResponse {
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0));
+        let input = RawInput { time: Some(time), screen_rect: Some(screen), events, ..Default::default() };
+        let mut response = ReaderResponse::default();
+        let mut output = ctx.run_ui(input, |ui| {
+            let mut size = 20.0;
+            response = reader.ui(ui, None, &mut size, vertical, true, Palette::of(ui.visuals()));
+        });
+        output.textures_delta.clear();
+        response
+    }
+
+    /// Press at `from`, move by `dx` in steps, release; returns the time after it, and the chapter asked for.
+    /// The page must have turned, if it does, before the pointer is released.
+    fn drag(ctx: &egui::Context, reader: &mut Reader, vertical: bool, mut time: f64, from: Pos2, dx: f32) -> (f64, ReaderResponse) {
+        let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(ctx, reader, vertical, time, vec![Event::PointerMoved(from), button(from, true)]);
+        let mut asked = ReaderResponse::default();
+        for step in 1..=5 {
+            time += 0.02;
+            let response = frame(ctx, reader, vertical, time, vec![Event::PointerMoved(from + vec2(dx * step as f32 / 5.0, 0.0))]);
+            if response.chapter.is_some() {
+                asked = response;
+            }
+        }
+        let before_release = reader.page;
+        time += 0.02;
+        let response = frame(ctx, reader, vertical, time, vec![button(from + vec2(dx, 0.0), false)]);
+        assert_eq!(reader.page, before_release);
+        assert!(response.chapter.is_none() || asked.chapter.is_none(), "turned twice");
+        (time + 0.02, if response.chapter.is_some() { response } else { asked })
+    }
+
+    fn key(key: egui::Key) -> Vec<Event> {
+        vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]
+    }
+
+    #[test]
+    fn dragging_and_arrow_keys_turn_pages_in_the_reading_direction() {
+        let text = "これは長い文の一つです。".repeat(3) + "\n";
+        for vertical in [true, false] {
+            let ctx = egui::Context::default();
+            let mut reader = Reader::from_text(0, "Book", "Title", &text.repeat(40), false, 2);
+            reader.chapter = 1;
+            let mut time = 1.0;
+            frame(&ctx, &mut reader, vertical, time, vec![]);
+            assert_eq!(reader.page, 0);
+            let next = if vertical { 120.0 } else { -120.0 };
+            // A drag in the reading direction turns to the next page, and saves the place
+            let (t, _) = drag(&ctx, &mut reader, vertical, time, pos2(200.0, 150.0), next);
+            time = t;
+            let second = reader.page;
+            assert!(second > 0, "vertical {vertical}");
+            assert!(reader.settled_place(&ctx).is_some_and(|p| p.offset > 0 && p.chapter == 1));
+            // A short drag, or a click, does not
+            let (t, _) = drag(&ctx, &mut reader, vertical, time, pos2(200.0, 150.0), next / 10.0);
+            time = t;
+            assert_eq!(reader.page, second);
+            // Back
+            let (t, _) = drag(&ctx, &mut reader, vertical, time, pos2(200.0, 150.0), -next);
+            time = t;
+            assert_eq!(reader.page, 0);
+            // Before the first page: the previous chapter's last page
+            let (t, response) = drag(&ctx, &mut reader, vertical, time, pos2(200.0, 150.0), -next);
+            time = t;
+            assert_eq!((response.chapter, response.at_end), (Some(0), true));
+            // Arrow keys: ← is the next page in vertical text, → in horizontal text
+            let forward = if vertical { egui::Key::ArrowLeft } else { egui::Key::ArrowRight };
+            let backward = if vertical { egui::Key::ArrowRight } else { egui::Key::ArrowLeft };
+            frame(&ctx, &mut reader, vertical, time, key(forward));
+            frame(&ctx, &mut reader, vertical, time + 0.02, vec![]);
+            assert_eq!(reader.page, second);
+            frame(&ctx, &mut reader, vertical, time + 0.04, key(backward));
+            assert_eq!(reader.page, 0);
+            // The wheel does nothing
+            let wheel = Event::MouseWheel { unit: MouseWheelUnit::Line, delta: vec2(0.0, -5.0), phase: TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: Modifiers::NONE };
+            frame(&ctx, &mut reader, vertical, time + 0.06, vec![Event::PointerMoved(pos2(200.0, 150.0)), wheel]);
+            frame(&ctx, &mut reader, vertical, time + 0.2, vec![]);
+            assert_eq!(reader.page, 0);
+        }
+    }
+
+    #[test]
+    fn a_drag_shows_the_page_its_net_movement_points_to() {
+        let threshold = 30.0;
+        // Past the threshold either way while no other page is fixed, and back a little within it before the page
+        // shown changes back
+        assert_eq!(drag_page(0, 0, 29.0, threshold), 0);
+        assert_eq!(drag_page(0, 0, 30.0, threshold), 1);
+        assert_eq!(drag_page(0, 0, -30.0, threshold), -1);
+        assert_eq!(drag_page(1, 1, 25.0, threshold), 1);
+        assert_eq!(drag_page(1, 1, 20.0, threshold), 0);
+        assert_eq!(drag_page(-1, -1, -25.0, threshold), -1);
+        // Once the other page is fixed, the opposite way shows the page the drag started on
+        assert_eq!(drag_page(1, 1, -40.0, threshold), 0);
+        assert_eq!(drag_page(0, 1, -400.0, threshold), 0);
+        assert_eq!(drag_page(0, -1, 400.0, threshold), 0);
+        assert_eq!(drag_page(0, -1, -30.0, threshold), -1);
+
+        let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let text = ("これは長い文の一つです。".repeat(3) + "\n").repeat(40);
+        for vertical in [true, false] {
+            let ctx = egui::Context::default();
+            let mut reader = Reader::from_text(0, "Book", "Title", &text, false, 2);
+            reader.chapter = 1;
+            let mut time = 1.0;
+            let mut step = |reader: &mut Reader, events| {
+                time += 0.02;
+                frame(&ctx, reader, vertical, time, events)
+            };
+            step(&mut reader, vec![]);
+            step(&mut reader, key(if vertical { egui::Key::ArrowLeft } else { egui::Key::ArrowRight }));
+            let (start, anchor) = (reader.page, reader.anchor);
+            assert!(start > 0);
+            reader.settled_place(&ctx);
+            // Held down: forward shows the next page, back the page it started on; that next page is the only other
+            // page of this drag, so far back stays on the page it started on, and far forward never goes further
+            let next = if vertical { 1.0 } else { -1.0 };
+            let at = |x: f32| pos2(200.0 + next * x, 150.0);
+            step(&mut reader, vec![Event::PointerMoved(at(0.0)), button(at(0.0), true)]);
+            let mut shown = Vec::new();
+            for x in [10.0, 40.0, 80.0, 40.0, 10.0, -40.0, -80.0, -150.0, 0.0, 80.0, 190.0] {
+                let response = step(&mut reader, vec![Event::PointerMoved(at(x))]);
+                assert!(response.chapter.is_none());
+                shown.push(reader.page);
+            }
+            let forward = shown[2];
+            assert!(forward > start, "vertical {vertical}: {shown:?}");
+            assert_eq!(shown, [start, forward, forward, forward, start, start, start, start, start, forward, forward]);
+            // Nothing saved while held, and the page it started on kept its place
+            assert!(reader.settled_place(&ctx).is_none());
+            step(&mut reader, vec![Event::PointerMoved(at(10.0))]);
+            assert_eq!((reader.page, reader.anchor), (start, anchor));
+            // Released: the page shown stays, and is saved
+            step(&mut reader, vec![Event::PointerMoved(at(80.0))]);
+            step(&mut reader, vec![button(at(80.0), false)]);
+            assert_eq!(reader.page, forward);
+            assert!(reader.settled_place(&ctx).is_some_and(|p| p.offset > anchor));
+
+            // From the chapter's first page, back into the previous chapter, and back again
+            for _ in 0..2 {
+                step(&mut reader, key(if vertical { egui::Key::ArrowRight } else { egui::Key::ArrowLeft }));
+            }
+            assert_eq!(reader.page, 0);
+            step(&mut reader, vec![Event::PointerMoved(at(0.0)), button(at(0.0), true)]);
+            step(&mut reader, vec![Event::PointerMoved(at(10.0))]);
+            let response = step(&mut reader, vec![Event::PointerMoved(at(-80.0))]);
+            assert_eq!((response.chapter, response.at_end), (Some(0), true));
+            // The app opens the previous chapter at its end, and the drag goes on there
+            let mut previous = Reader::from_text(0, "Book", "Previous", &text, false, 2);
+            previous.go_to_end();
+            previous.continue_drag(response.drag.unwrap());
+            step(&mut previous, vec![Event::PointerMoved(at(-85.0))]);
+            assert!(previous.page > 0);
+            let response = step(&mut previous, vec![Event::PointerMoved(at(0.0))]);
+            assert_eq!((response.chapter, response.at_end), (Some(1), false));
+            // Back in the chapter it started in, on its first page, which a release keeps: far forward too, since
+            // the previous page is this drag's other page
+            let mut back = Reader::from_text(0, "Book", "Title", &text, false, 2);
+            back.chapter = 1;
+            back.continue_drag(response.drag.unwrap());
+            for x in [5.0, 80.0, 150.0, 5.0] {
+                let response = step(&mut back, vec![Event::PointerMoved(at(x))]);
+                assert!(response.chapter.is_none());
+                assert_eq!(back.page, 0);
+            }
+            step(&mut back, vec![button(at(5.0), false)]);
+            assert_eq!(back.page, 0);
+            assert!(back.drag.is_none());
+        }
+    }
+
+    #[test]
+    fn the_page_keeps_its_place_when_laid_out_again() {
+        let text = ("これは長い文の一つです。".repeat(3) + "\n").repeat(40);
+        let ctx = egui::Context::default();
+        let mut reader = Reader::from_text(0, "Book", "Title", &text, false, 1);
+        frame(&ctx, &mut reader, true, 1.0, vec![]);
+        for (i, t) in (0..3).zip([1.1, 1.2, 1.3]) {
+            frame(&ctx, &mut reader, true, t, key(egui::Key::ArrowLeft));
+            assert!(reader.page > i);
+        }
+        let anchor = reader.anchor;
+        let layout = reader.layout.as_ref().unwrap();
+        let line = reader.line_at_offset(layout, anchor);
+        assert!(line <= reader.page);
+        // Horizontal text now: the page starts with the anchor's line, and the anchor stays
+        frame(&ctx, &mut reader, false, 1.4, vec![]);
+        assert_eq!(reader.anchor, anchor);
+        assert_eq!(reader.page, reader.line_at_offset(reader.layout.as_ref().unwrap(), anchor));
+        // Scrolling, and back
+        frame(&ctx, &mut reader, true, 1.5, vec![]);
+        assert_eq!(reader.anchor, anchor);
+        let mut size = 20.0;
+        let input = RawInput { time: Some(1.6), screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            reader.ui(ui, None, &mut size, true, false, Palette::of(ui.visuals()));
+        });
+        output.textures_delta.clear();
+        assert_eq!(reader.anchor, anchor);
+        frame(&ctx, &mut reader, true, 1.7, vec![]);
+        assert_eq!(reader.anchor, anchor);
     }
 
     #[test]

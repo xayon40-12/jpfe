@@ -207,13 +207,36 @@ mod web {
         }
     }
 
-    pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-        let mut decoder = ruzstd::decoding::StreamingDecoder::new(bytes).map_err(|e| anyhow!("{e}"))?;
-        // The frame header gives the size: allocate it once instead of growing (and copying) the buffer
-        let size = decoder.decoder.content_size().min(1 << 30) as usize;
-        let mut out = Vec::with_capacity(size);
-        decoder.read_to_end(&mut out)?;
-        Ok(out)
+    /// A zstd-compressed dictionary file unpacked a little at a time, so that no frame unpacks a whole large
+    /// file (the largest, `matrix.mtx`, takes about 300 ms) and the window keeps redrawing while it loads.
+    pub struct Unpacker {
+        decoder: ruzstd::decoding::StreamingDecoder<std::io::Cursor<Vec<u8>>, ruzstd::decoding::FrameDecoder>,
+        out: Vec<u8>,
+    }
+
+    impl Unpacker {
+        pub fn new(bytes: Vec<u8>) -> Result<Self> {
+            let decoder = ruzstd::decoding::StreamingDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| anyhow!("{e}"))?;
+            // The frame header gives the size: allocate it once instead of growing (and copying) the buffer
+            let size = decoder.decoder.content_size().min(1 << 30) as usize;
+            Ok(Self { decoder, out: Vec::with_capacity(size) })
+        }
+
+        /// Unpack until `deadline` (nothing if it is past: a frame that already did other work leaves it for the
+        /// next one); the whole file once it is unpacked.
+        pub fn step(&mut self, deadline: web_time::Instant) -> Result<Option<Vec<u8>>> {
+            const PART: usize = 256 << 10;
+            while web_time::Instant::now() < deadline {
+                let len = self.out.len();
+                self.out.resize(len + PART, 0);
+                let read = self.decoder.read(&mut self.out[len..])?;
+                self.out.truncate(len + read);
+                if read == 0 {
+                    return Ok(Some(std::mem::take(&mut self.out)));
+                }
+            }
+            Ok(None)
+        }
     }
 
     pub fn pick_files(inbox: &Inbox, ctx: &egui::Context) {
