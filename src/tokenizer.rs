@@ -15,7 +15,9 @@ use lindera::segmenter::Segmenter;
 pub struct JapaneseTokenizer {
     segmenter: Segmenter,
     headwords: Option<Headwords>,
-    reading_cache: HashMap<String, String>,
+    /// The readings of dictionary forms UniDic gave no reading for in the text, found by tokenizing the form
+    /// alone (see [`resolve_reading`]): they do not depend on the text, so they are kept from one text to the next
+    base_readings: HashMap<String, String>,
     reading_in_hiragana: bool,
 }
 
@@ -536,7 +538,7 @@ impl JapaneseTokenizer {
         Self {
             segmenter: Segmenter::new(Mode::Normal, dictionary, None),
             headwords,
-            reading_cache: HashMap::new(),
+            base_readings: HashMap::new(),
             reading_in_hiragana,
         }
     }
@@ -545,12 +547,12 @@ impl JapaneseTokenizer {
     /// tokens that are not words (runs of punctuation) are left out. Prefixes, conjugation endings and suffixes
     /// are part of their word (see [`ParsedWord::affixes`]), and numbers of their counter.
     pub fn tokenize(&mut self, text: &str) -> Result<Vec<ParsedWord>> {
-        let Self { segmenter, headwords, reading_cache, reading_in_hiragana } = self;
+        let Self { segmenter, headwords, base_readings, reading_in_hiragana } = self;
         let mut words = Vec::new();
         // The tokens each word is made of
         let mut sources: Vec<Range<usize>> = Vec::new();
         let tokens: Vec<Token> = segmenter
-            .segment(Cow::Borrowed(text))?
+            .segment(ascii_spaces(text))?
             .into_iter()
             .map(|mut t| {
                 let (surface, span) = (t.surface.to_string(), t.byte_start..t.byte_end);
@@ -660,7 +662,7 @@ impl JapaneseTokenizer {
             let found = headwords
                 .as_ref()
                 .filter(|h| missing && h.get(&base_word).is_none())
-                .and_then(|h| dictionary_word(h, &base_word, token, tokens.get(index + 1)));
+                .and_then(|h| dictionary_word(h, &base_word, token, tokens.get(index + 1).filter(|t| t.span.start == token.span.end)));
             let (base_word, reading_seed, spelling) = match found {
                 Some(DictionaryWord::Word { word, reading, with_next }) => {
                     if with_next {
@@ -726,14 +728,15 @@ impl JapaneseTokenizer {
                 _ => WordKind::Word,
             };
 
-            // The reading of the spelling: a kana spelling is its own reading (いい, not よい for 良い)
-            // A homograph's reading is the one that tells it apart (readings are cached by dictionary form)
+            // The reading of the spelling: a kana spelling is its own reading (いい, not よい for 良い), a homograph's
+            // reading is the one that tells it apart, and any other word is read as UniDic reads it here (心 is こころ
+            // in 心は, しん in 反骨心: see `resolve_reading`)
             let reading = if spelling != base_word {
                 hiragana_to_katakana(&spelling)
             } else if let Some(reading) = &homograph {
                 hiragana_to_katakana(reading)
             } else {
-                resolve_reading(segmenter, reading_cache, &base_word, &surface, &reading_seed)
+                resolve_reading(segmenter, base_readings, &base_word, &surface, &reading_seed)
             };
             words.push(ParsedWord {
                 pronunciation: if *reading_in_hiragana { katakana_to_hiragana(&reading) } else { reading },
@@ -1381,7 +1384,12 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
     }
     let last = tokens.len().min(start + MAX_RUN);
     let mut end = start + 1;
-    while end < last && !matches!(field(end, 0), "補助記号" | "記号" | "空白" | "助詞") && field(end, 7) != "為る" {
+    // Next to each other in the text: not across a space or a line break, which have no token
+    while end < last
+        && tokens[end - 1].span.end == tokens[end].span.start
+        && !matches!(field(end, 0), "補助記号" | "記号" | "空白" | "助詞")
+        && field(end, 7) != "為る"
+    {
         end += 1;
     }
     // Every candidate starts with the first token and the first character of the next one: most starts end here
@@ -1433,6 +1441,26 @@ fn longest_headword<'h>(headwords: &'h Headwords, tokens: &[Token], start: usize
     None
 }
 
+/// `text` with its spaces other than ASCII (the full-width space that indents a paragraph or follows ！ and ？,
+/// and the others) written as ASCII spaces, as many as their bytes, so that spans stay those of `text`. UniDic
+/// reads them as a noun, and the word after them then as a suffix with another reading (　心は: 心【しん】, not
+/// こころ; 　家で: 家【か】), while it skips ASCII spaces and line breaks.
+fn ascii_spaces(text: &str) -> Cow<'_, str> {
+    let space = |c: char| c.is_whitespace() && !c.is_ascii();
+    if !text.chars().any(space) {
+        return Cow::Borrowed(text);
+    }
+    let mut spaced = String::with_capacity(text.len());
+    for c in text.chars() {
+        if space(c) {
+            spaced.extend(std::iter::repeat(' ').take(c.len_utf8()));
+        } else {
+            spaced.push(c);
+        }
+    }
+    Cow::Owned(spaced)
+}
+
 /// If the surface used a different kanji than the representative lemma (e.g. 治せる vs 直す), keep the surface kanji.
 fn adapt_kanji(surface: &str, lemma: &str) -> String {
     let (mut s, mut l) = (surface.chars(), lemma.chars());
@@ -1456,32 +1484,39 @@ fn kanji_of(s: &str) -> Vec<char> {
     s.chars().filter(|&c| is_cjk_kanji(c)).collect()
 }
 
+/// The reading (katakana) of the dictionary form `base`, written `surface` in the text, where UniDic reads it
+/// `raw_reading`: that reading, so that each occurrence is read as in its sentence (心 is こころ in 心は, しん where
+/// UniDic takes it for the suffix), or the word itself when it is in katakana, or, when UniDic gave no reading,
+/// the reading of `base` tokenized alone, kept in `base_readings`.
+///
+/// Readings used to be cached by dictionary form, from one text to the next, so the first reading of a word
+/// stuck to every later one (心 read しん after a paragraph indent, then しん everywhere).
 fn resolve_reading(
     segmenter: &Segmenter,
-    cache: &mut HashMap<String, String>,
+    base_readings: &mut HashMap<String, String>,
     base: &str,
     surface: &str,
     raw_reading: &str,
 ) -> String {
-    cache
-        .entry(base.to_string())
-        .or_insert_with(|| {
-            let katakana = base.chars().all(is_katakana);
-            if is_set(raw_reading) && (base == surface || !katakana) {
-                raw_reading.to_string()
-            } else if katakana {
-                base.to_string()
-            } else {
-                // Segment the base word on its own to find its reading
-                segmenter
-                    .segment(Cow::Borrowed(base))
-                    .ok()
-                    .filter(|t| t.len() == 1)
-                    .and_then(|mut t| t[0].details().get(6).copied().filter(|r| is_set(r)).map(str::to_string))
-                    .unwrap_or_else(|| base.to_string())
-            }
-        })
-        .clone()
+    let katakana = base.chars().all(is_katakana);
+    if is_set(raw_reading) && (base == surface || !katakana) {
+        return raw_reading.to_string();
+    }
+    if katakana {
+        return base.to_string();
+    }
+    if let Some(reading) = base_readings.get(base) {
+        return reading.clone();
+    }
+    // Segment the base word on its own to find its reading
+    let reading = segmenter
+        .segment(Cow::Borrowed(base))
+        .ok()
+        .filter(|t| t.len() == 1)
+        .and_then(|mut t| t[0].details().get(6).copied().filter(|r| is_set(r)).map(str::to_string))
+        .unwrap_or_else(|| base.to_string());
+    base_readings.insert(base.to_string(), reading.clone());
+    reading
 }
 
 pub fn is_cjk_kanji(c: char) -> bool {
@@ -1911,6 +1946,46 @@ mod dictionary_tests {
         assert_eq!(words("先んじて"), ["先んじる"]);
         assert_eq!(words("信ずる"), ["信ずる"]);
         assert_eq!(words("信ぜよ"), ["信ずる"]);
+    }
+
+    /// Each listed word as the text writes it (from its span), with its key, reading and part of speech.
+    fn read(tokenizer: &mut JapaneseTokenizer, text: &str) -> Vec<(String, String, String, String)> {
+        let words = tokenizer.tokenize(text).unwrap().into_iter().filter(|w| w.is_listed(false));
+        words.map(|w| (text[w.span.clone()].to_string(), w.key().into_owned(), w.pronunciation, w.pos)).collect()
+    }
+
+    fn quads(list: &[(&str, &str, &str, &str)]) -> Vec<(String, String, String, String)> {
+        list.iter().map(|&(a, b, c, d)| (a.into(), b.into(), c.into(), d.into())).collect()
+    }
+
+    #[test]
+    fn reads_the_word_after_a_paragraph_indent() {
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        // UniDic reads a full-width space as a noun, and the word after it as a suffix (心【しん】, 家【か】)
+        assert_eq!(
+            read(&mut tokenizer, "　心は完璧に折れていた"),
+            quads(&[("心", "心", "こころ", "名詞"), ("完璧", "完璧", "かんぺき", "名詞"), ("折れて", "折れる", "おれる", "動詞"), ("いた", "居る", "いる", "動詞")])
+        );
+        assert_eq!(read(&mut tokenizer, "前。\n　家で"), quads(&[("前", "前", "まえ", "名詞"), ("家", "家", "いえ", "名詞")]));
+        // Also after a full-width space inside a paragraph, and the spans are those of the text
+        assert_eq!(
+            read(&mut tokenizer, "　人を見た？　目が\n 外に"),
+            quads(&[("人", "人", "ひと", "名詞"), ("見た", "見る", "みる", "動詞"), ("目", "目", "め", "名詞"), ("外", "外【そと】", "そと", "名詞")])
+        );
+        // A space is not part of a word, nor merged across
+        assert_eq!(counted("大\u{3000}学"), counted("大 学"));
+    }
+
+    #[test]
+    fn reads_each_occurrence_in_its_context() {
+        let mut tokenizer = JapaneseTokenizer::new(None, true).unwrap();
+        // 心 is こころ alone and しん as a suffix, in either order and from one text to the next: readings were
+        // cached by dictionary form, so the first one stuck
+        let mut hearts = |text: &str| read(&mut tokenizer, text).into_iter().filter(|w| w.0 == "心").collect::<Vec<_>>();
+        let (heart, suffix) = (("心", "心", "こころ", "名詞"), ("心", "心", "しん", "接尾辞"));
+        assert_eq!(hearts("心が痛い。反骨心に火がつく"), quads(&[heart, suffix]));
+        assert_eq!(hearts("反骨心に火がつく。心が痛い"), quads(&[suffix, heart]));
+        assert_eq!(hearts("心が"), quads(&[heart]));
     }
 
     #[test]

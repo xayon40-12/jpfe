@@ -55,7 +55,7 @@ Approaches tried:
 
 The rule splits 様 (さま, よう, ざま), 中 (なか, ちゅう), 止める (とめる, やめる), 人 (ひと, にん), and kana words that were counted under the wrong kanji: どれ and いずれ (both 何れ), どう and いかが (both 如何), まとも (正面). It is conservative where meanings overlap: 方 (かた, ほう) stays one word. The key is internal: word lists and exports show the spelling and reading as before.
 
-Bug found on the way: readings are cached by dictionary form, so a homograph takes its own reading rather than the cached one.
+Bug found on the way: readings are cached by dictionary form, so a homograph takes its own reading rather than the cached one. (Since decision 19, every word takes its reading in context.)
 
 ### 4. The dictionary window (commits `7ce872e`, `332188a`)
 
@@ -214,9 +214,33 @@ UniDic takes the modern verbs in じる for the classical verbs in ずる, whose
 
 On the six books, the only changes are these verbs moving from ずる to じる, and 馳せ参じる found whole: UniDic's 馳せ参ずる, which JMdict lacks, was split into 馳せる + 参ずる. A few classical forms remain where the text has them (信ずる 3, 通ずる 15 in Re:ゼロ).
 
+### 18. A full-width space is not a word (commit "Read the word after a full-width space, and each word in its sentence")
+
+Found by the survey of the reader's colors ([plans-sync-and-highlighting.md](plans-sync-and-highlighting.md)). UniDic reads the full-width space (U+3000) as a noun with no reading, and the word after it then as a suffix, with the suffix's reading: 　心は was 心【しん】, 　家で 家【か】 (a homograph of 家), 　人を 人【にん】, 　目が the suffix 目. Paragraphs start with one (about 420,000 in the six books), and dialogue has them after ！ and ？ (about 35,000, 26,000 of them in Re:ゼロ). ASCII spaces and line breaks are skipped by UniDic, and do not do this.
+
+**Decided:** every space other than ASCII (U+3000, and the other Unicode spaces: UniDic reads U+2002 and U+2003 as nouns too) is given to UniDic as as many ASCII spaces as its bytes, so every `span` stays the bytes of the original text. Inside a paragraph too: after ！ and ？ a space starts a sentence just as an indent does (「ルーデウス！　お前は見学しろ！). Since a space no longer has a token, JMdict merging (`longest_headword`) now stops where the tokens are not next to each other in the text, as `longest_expression` and the attach steps already did: 大　学 is not 大学. It merged across a line break once in the six books (香\n元 in 蜘蛛ですが).
+
+**Rejected:** tokenizing each paragraph from after its indent: as many calls to UniDic as paragraphs, for the same tokens, and spaces inside a paragraph would need the same anyway.
+
+On the six books, the words after a space that UniDic takes for suffixes go from 11,022 to 3,144 after an indent and from 668 to 133 inside a paragraph. What remains is meant: counters with their number at the start of a paragraph (一つ, 三人, 数日, 十歳), and 一人 and 二人, which decision 10 counts under the counter 人. In the word lists, a few dozen chapter entries change per book (Re:ゼロ: 89 gained and 111 lost of 16,565; 無職転生: 67 and 77 of 9,545), and listed words get their reading and part of speech back: 心 こころ (was しん), 夜 よる (や), 酒 さけ (しゅ), 傷 きず (しょう), 拳 こぶし (けん), 外 そと (がい), 今 いま (こん), 湖 みずうみ (こ). The counts that move, in 無職転生: 人【にん】 to 人 (203), the filler あの to the determiner 彼の at the start of a paragraph (365: あの時), な of the copula to 何 in なんだ (401), 婦 + と to ふと (134), 成る + ほど to なるほど (129), も + し to もし (118), 有る to 或る in ある日 (88), 梃子 to って + こと (80).
+
+**Katakana names** at the start of a paragraph are now split as UniDic splits them elsewhere (see below): some are found whole (in 無職転生, ロキシー 111 more times and ノルン 160; ラインハルト 153 in Re:ゼロ, ユキ 83 in 陰の実力者), some are split that were whole after the space (in 無職転生, オルステッド into オル + ステッド 204 times and ヒトガミ into 人 + 神 166; シャウラ 79 in Re:ゼロ). In the middle of a sentence, オルステッド was already split 1,009 times out of 1,213.
+
+### 19. Each word is read as in its sentence (same commit)
+
+`resolve_reading` cached readings by dictionary form, from the first version of the tokenizer on, and the cache lasted as long as the tokenizer: the first reading of a word stuck to every later one, in that book and the next. With the indents of decision 18, 心 was often first read しん, and then しん everywhere. The survey found 1.81% of the words read otherwise than UniDic reads them in their sentence.
+
+**What the cache was for:** nothing documented relied on it. It was a memo from the first version, where the reading also came from tokenizing the dictionary form alone when UniDic gave none. The intended differences from UniDic's reading do not go through it and are kept: a word written in kana is read as written (いい, not よい for 良い), a homograph by the reading that tells it apart (decision 3), a verb in じる in じる (decision 17).
+
+**Decided:** every occurrence takes the reading UniDic gives it in its sentence (心 is こころ in 心は, しん in 反骨心). Only the readings found by tokenizing a dictionary form alone, which do not depend on the text, are still kept from one text to the next.
+
+**Word keys do not change:** a homograph is told apart by UniDic's reading in context, which never went through the cache. Word lists show the reading of the first occurrence of each spelling, as before, so on the six books only 3 to 11 listed readings per book change (何 なに rather than なん in Re:ゼロ, 方 ほう rather than かた in 陰の実力者). What changes is the reading the reader looks words up by: 92,628 of the 9.4 million words of the six books (0.98%, grammar included) are now read otherwise, among them 何 なに for なん 8,329 times, 方 かた for ほう 1,843 (and ほう for かた 542), 風 かぜ for ふう 1,203, 下 した for もと 1,099, 国 こく for くに 916 (the suffix, as in アスラ王国 and ミリス神聖国), 心 こころ for しん 582, 酒 さけ 320, 土 つち 284, 傷 きず 252, 鬼 おに 222, 雨 あめ 172. The survey counted more (心 3,886) because it ran the six books through one tokenizer, whose cache carried readings from one book to the next.
+
+Tokenizing is about 3% faster (Re:ゼロ: 9.28 s to 9.04 s for the CLI's tokenizing, 無職転生 2.73 s to 2.60 s, three runs each), since looking up the cache made a string for every word.
+
 ## What remains
 
-Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16), and so are the two found while doing that work (decision 17, and decision 6 of [the reader](decisions-reader.md)).
+Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decisions 10 to 16), and so are the two found while doing that work (decision 17, and decision 6 of [the reader](decisions-reader.md)), and the two tokenizer errors found by the survey of the reader's colors (decisions 18 and 19).
 
 ### Kept as they are, on purpose
 
@@ -227,6 +251,6 @@ Every problem of the scan of 2026-11-15 (commit `abd6fcb`) is resolved (decision
 ### UniDic limits a rule cannot fix
 
 - **Sound words and laughs** are cut into pieces (ふよふよ, ふはは). They have no dictionary entries to look up.
-- **Katakana names** are split into known words (ミリス → ミ + リス, グレイ + ラット).
+- **Katakana names** are split into known words (ミリス → ミ + リス, グレイ + ラット, オル + ステッド), also at the start of a paragraph since decision 18.
 - **Context changes the split:** 何もかもが is 何 + も + か + もが, so 何もかも is not found there; before 。, なり is the classical copula (それなり。 is それ + なり); the sentence-final さ is sometimes tagged as the suffix (大丈夫さ。).
 - **Readings chosen out of context:** 三本 alone is read as the surname みもと, 千 alone as a person's name, the 七 of the name 七陰 as a prefix, 第一 as the adverb "first of all" (第一話 is then 第一 + 話 read はなし), and あの方 as ほう.
