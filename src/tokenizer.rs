@@ -1453,7 +1453,7 @@ fn ascii_spaces(text: &str) -> Cow<'_, str> {
     let mut spaced = String::with_capacity(text.len());
     for c in text.chars() {
         if space(c) {
-            spaced.extend(std::iter::repeat(' ').take(c.len_utf8()));
+            spaced.extend(std::iter::repeat_n(' ', c.len_utf8()));
         } else {
             spaced.push(c);
         }
