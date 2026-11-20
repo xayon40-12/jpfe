@@ -102,10 +102,10 @@ The first version colored a word's stem by UniDic's tag (first level, plus `prop
 
 The survey ran the six books (8,139,899 words) through the tokenizer and the viewer's JMdict definitions. Scratch code and full tables: the session scratchpad's `survey/` folder (not kept).
 
-**Tokenizer errors, found on the way (they affect word lists too):**
+**Tokenizer errors, found on the way (they affect word lists too), both fixed** (commit "Read the word after a full-width space, and each word in its sentence": decisions 18 and 19 of [word-grouping.md](word-grouping.md)):
 
-- **Paragraph indents.** UniDic reads the full-width space starting a paragraph (418,384 of them) as a noun, and the word after it then becomes a suffix with a wrong reading: 　心は → 心【しん】, 　家で → 家【か】, 　目が → 目 接尾辞, 　人を → 人【にん】. 8,046 words are affected (目 1,127, 人 705, 手 434, 家 210…). Fix: keep the indent away from UniDic, keeping byte offsets.
-- **Readings cached by dictionary form** (`resolve_reading`), across chapters: one misreading sticks to later occurrences. 1.81% of single-token words get another reading than UniDic gives in context: 心 しん for こころ 3,886 times, 傷 しょう for きず 1,600, 鬼 き for おに 776. Some differences are intended (いい for よい). The window picks its entry by this reading, so it shows the wrong entry too.
+- **Paragraph indents** (fixed: every non-ASCII space reaches UniDic as ASCII spaces, also inside a paragraph, after ！ and ？). UniDic reads the full-width space starting a paragraph (418,384 of them) as a noun, and the word after it then becomes a suffix with a wrong reading: 　心は → 心【しん】, 　家で → 家【か】, 　目が → 目 接尾辞, 　人を → 人【にん】. 8,046 words are affected (目 1,127, 人 705, 手 434, 家 210…). Fix: keep the indent away from UniDic, keeping byte offsets.
+- **Readings cached by dictionary form** (fixed: each occurrence takes UniDic's reading in its sentence; the kana spelling, homograph and じる rules are kept). `resolve_reading`, across chapters: one misreading sticks to later occurrences. 1.81% of single-token words get another reading than UniDic gives in context: 心 しん for こころ 3,886 times, 傷 しょう for きず 1,600, 鬼 き for おに 776. Some differences are intended (いい for よい). The window picks its entry by this reading, so it shows the wrong entry too.
 
 **Agreement today:** 92.4% of words get the color of the window's first entry's first sense; 3.2% have no JMdict entry (names, numbers); 4.4% disagree. Largest disagreements:
 
