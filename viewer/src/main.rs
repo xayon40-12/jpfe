@@ -7,6 +7,7 @@ mod platform;
 mod reader;
 mod storage;
 mod theme;
+mod timeline;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {

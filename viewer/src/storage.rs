@@ -83,6 +83,7 @@ fn done(inbox: &Inbox, ctx: &egui::Context, message: Incoming) {
 mod imp {
     use super::{done, Key};
     use crate::platform::{Inbox, Incoming};
+    use crate::timeline;
     use std::path::PathBuf;
 
     fn root() -> Option<PathBuf> {
@@ -90,16 +91,21 @@ mod imp {
     }
 
     pub fn read(inbox: Inbox, ctx: egui::Context, key: Key) {
+        let start = web_time::Instant::now();
         let bytes = root().and_then(|r| std::fs::read(r.join(key.path())).ok());
+        let size = bytes.as_ref().map_or("missing".to_string(), |b| timeline::size(b.len()));
+        timeline::note(format!("read {}: {size} in {:.0} ms", key.path(), timeline::since(start)));
         done(&inbox, &ctx, Incoming::Stored { key, bytes });
     }
 
     pub fn write(inbox: Inbox, ctx: egui::Context, key: Key, bytes: &[u8]) {
+        let start = web_time::Instant::now();
         let result = root().ok_or_else(|| "no data directory".to_string()).and_then(|r| {
             let path = r.join(key.path());
             std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(&path, bytes).map_err(|e| e.to_string())
         });
+        timeline::note(format!("write {}: {} in {:.0} ms", key.path(), timeline::size(bytes.len()), timeline::since(start)));
         let message = match result {
             Ok(()) => Incoming::Written(key),
             Err(e) => Incoming::StorageError(e),
@@ -133,7 +139,9 @@ mod imp {
 mod imp {
     use super::{done, Key};
     use crate::platform::{Inbox, Incoming};
+    use crate::timeline;
     use wasm_bindgen::{JsCast, JsValue};
+    use web_time::Instant;
     use wasm_bindgen_futures::{spawn_local, JsFuture};
     use web_sys::{
         FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions, FileSystemGetFileOptions,
@@ -154,12 +162,15 @@ mod imp {
         Ok((dir, name))
     }
 
-    async fn read_file(path: &str) -> Result<Vec<u8>, JsValue> {
+    /// The file's contents, and the time spent copying them into the app's memory (ms).
+    async fn read_file(path: &str) -> Result<(Vec<u8>, f64), JsValue> {
         let (dir, name) = parent(path, false).await?;
         let handle: FileSystemFileHandle = JsFuture::from(dir.get_file_handle(&name)).await?.unchecked_into();
         let file: web_sys::File = JsFuture::from(handle.get_file()).await?.unchecked_into();
         let buffer = JsFuture::from(file.array_buffer()).await?;
-        Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+        let copy = Instant::now();
+        let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+        Ok((bytes, timeline::since(copy)))
     }
 
     /// Large single writes fail in Safari ("UnknownError ... e.g. out of memory"), so files are written in parts.
@@ -183,7 +194,8 @@ mod imp {
         result
     }
 
-    async fn write_file(path: &str, bytes: js_sys::Uint8Array) -> Result<(), JsValue> {
+    /// Write `bytes`; says how: through a writable stream, or the worker (Safari).
+    async fn write_file(path: &str, bytes: js_sys::Uint8Array) -> Result<&'static str, JsValue> {
         let (dir, name) = parent(path, true).await?;
         let options = FileSystemGetFileOptions::new();
         options.set_create(true);
@@ -203,10 +215,10 @@ mod imp {
                 JsFuture::from(stream.close()).await
             };
             if written.await.is_ok() {
-                return Ok(());
+                return Ok("stream");
             }
         }
-        worker::write(path, bytes).await
+        worker::write(path, bytes).await.map(|()| "worker")
     }
 
     /// Writes through a dedicated worker with a sync access handle, which every browser with OPFS supports.
@@ -323,9 +335,16 @@ mod imp {
     pub fn read(inbox: Inbox, ctx: egui::Context, key: Key) {
         spawn_local(async move {
             let path = key.path();
+            let start = Instant::now();
             let bytes = match read_file(&path).await {
-                Ok(bytes) => Some(bytes),
-                Err(e) if is_not_found(&e) => None,
+                Ok((bytes, copy)) => {
+                    timeline::note(format!("read {path}: {} in {:.0} ms (copy {copy:.0} ms)", timeline::size(bytes.len()), timeline::since(start)));
+                    Some(bytes)
+                }
+                Err(e) if is_not_found(&e) => {
+                    timeline::note(format!("read {path}: missing"));
+                    None
+                }
                 Err(e) => {
                     done(&inbox, &ctx, failure("reading", &path, &e));
                     None
@@ -337,10 +356,15 @@ mod imp {
 
     pub fn write(inbox: Inbox, ctx: egui::Context, key: Key, bytes: &[u8]) {
         // Copied now, so the app does not keep a second copy of large files in its own memory
+        let start = Instant::now();
         let array = js_sys::Uint8Array::from(bytes);
+        let (size, copy) = (timeline::size(bytes.len()), timeline::since(start));
         spawn_local(async move {
             let message = match queued(write_file(&key.path(), array)).await {
-                Ok(()) => Incoming::Written(key),
+                Ok(how) => {
+                    timeline::note(format!("write {}: {size} in {:.0} ms through the {how} (copy {copy:.0} ms)", key.path(), timeline::since(start)));
+                    Incoming::Written(key)
+                }
                 Err(e) => failure("writing", &key.path(), &e),
             };
             done(&inbox, &ctx, message);

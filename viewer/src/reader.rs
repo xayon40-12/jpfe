@@ -686,9 +686,6 @@ impl Reader {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.kanji_popup.take().is_none() {
             self.word_popup = None;
         }
-        if !self.tokenized {
-            ui.label(RichText::new("Words can be looked up once the dictionary is ready.").small().color(palette.secondary_text));
-        }
 
         let view = ui.available_size();
         let margin = size * MARGIN;

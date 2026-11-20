@@ -1,18 +1,20 @@
 //! Loaded books, their reading progress, and the statistics shown for them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use jpfe::epub::extract_epub_chapters_from_bytes;
-use jpfe::frequency::{ChapterCounts, FrequencyAnalyzer, ListOptions};
+use jpfe::frequency::{BookWord, ChapterCounts, FrequencyAnalyzer, ListOptions, Spelling};
 use jpfe::models::{chapter_file_stem, Chapter, ChapterStat};
 use jpfe::pdf::extract_pdf_chapters_from_bytes;
 use jpfe::tokenizer::{is_katakana_word, JapaneseTokenizer, ParsedWord};
 #[cfg(test)]
 use jpfe::tokenizer::WordKind;
 use web_time::Instant;
+
+use crate::timeline;
 
 /// Word-list settings, with the same meaning and defaults as the CLI options.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -56,6 +58,12 @@ pub struct ChapterInfo {
     pub characters: usize,
 }
 
+impl ChapterInfo {
+    fn of(chapter: &Chapter) -> Self {
+        Self { index: chapter.index, characters: chapter.text.chars().count(), title: chapter.title.clone() }
+    }
+}
+
 /// What a cached analysis was computed with; it is only reused when all of these match.
 pub struct CacheKey<'a> {
     /// Hash of the viewer's and the library's code
@@ -73,26 +81,44 @@ pub struct SavedBook {
     pub learned: Option<usize>,
 }
 
-/// Stored analysis. Field order matters: `CachedAnalysisRef` encodes the same fields with postcard.
+/// A stored analysis is a sequence of postcard-encoded parts, so that it can be decoded a few parts per frame:
+/// decoding a 56 MB analysis in one call froze Safari for 2.4 s. First a [`StoredHeader`], then the book's
+/// words in parts of [`WORDS_PER_PART`] (`Vec<StoredWord>`), then a [`StoredChapter`] for each chapter. The
+/// encoder writes the same fields as tuples of references, in this order.
 #[derive(Deserialize)]
-struct CachedAnalysis {
+struct StoredHeader {
     build: String,
     dictionary: String,
     include_particles: bool,
-    chapters: Vec<Chapter>,
-    analyzer: FrequencyAnalyzer,
-    counts: Vec<ChapterCounts>,
+    total_words: usize,
+    /// Number of words, to reserve their table at once
+    words: usize,
+    /// Chapter titles, also each word's first chapter title (not stored with every word)
+    titles: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct CachedAnalysisRef<'a> {
-    build: &'a str,
-    dictionary: &'a str,
-    include_particles: bool,
-    chapters: &'a [Chapter],
-    analyzer: &'a FrequencyAnalyzer,
-    counts: &'a [ChapterCounts],
+#[derive(Deserialize)]
+struct StoredWord {
+    key: String,
+    count: usize,
+    spellings: Vec<Spelling>,
+    pronunciation: String,
+    pos: String,
+    chapters: usize,
+    first_chapter: usize,
 }
+
+#[derive(Deserialize)]
+struct StoredChapter {
+    index: usize,
+    text: String,
+    total: usize,
+    /// Occurrences of each word, by its position among the stored words (rather than its text)
+    counts: Vec<(u32, u32)>,
+}
+
+/// Words in each part of a stored analysis.
+const WORDS_PER_PART: usize = 2000;
 
 pub struct Book {
     /// Key of the book in storage; also its position, as ids grow in import order
@@ -114,10 +140,18 @@ pub struct Book {
 impl Book {
     fn new(saved: SavedBook, texts: Vec<Chapter>, analyzer: FrequencyAnalyzer, counts: Vec<ChapterCounts>, settings: &Settings) -> Self {
         let words = word_lists(&analyzer, &counts, settings);
-        let chapters = texts
-            .iter()
-            .map(|c| ChapterInfo { index: c.index, characters: c.text.chars().count(), title: c.title.clone() })
-            .collect();
+        let chapters = texts.iter().map(ChapterInfo::of).collect();
+        Self::with_words(saved, chapters, texts, analyzer, counts, words)
+    }
+
+    fn with_words(
+        saved: SavedBook,
+        chapters: Vec<ChapterInfo>,
+        texts: Vec<Chapter>,
+        analyzer: FrequencyAnalyzer,
+        counts: Vec<ChapterCounts>,
+        words: Vec<Vec<String>>,
+    ) -> Self {
         let SavedBook { id, name, file_name, learned } = saved;
         // A new build may find fewer chapters than when the progress was saved
         let learned = learned.map(|pos| pos.min(texts.len().saturating_sub(1)));
@@ -130,26 +164,53 @@ impl Book {
 
     /// The analysis, to store and reuse with the same `key`.
     pub fn analysis_bytes(&self, key: &CacheKey) -> Vec<u8> {
-        let cached = CachedAnalysisRef {
-            build: key.build,
-            dictionary: key.dictionary,
-            include_particles: key.include_particles,
-            chapters: &self.texts,
-            analyzer: &self.analyzer,
-            counts: &self.counts,
-        };
-        postcard::to_allocvec(&cached).unwrap_or_default()
+        let mut out = Vec::new();
+        let mut part = |bytes: postcard::Result<Vec<u8>>| out.extend(bytes.unwrap_or_default());
+        let titles: Vec<&str> = self.texts.iter().map(|c| c.title.as_str()).collect();
+        let words: Vec<(&String, &BookWord)> = self.analyzer.words.iter().collect();
+        part(postcard::to_allocvec(&(key.build, key.dictionary, key.include_particles, self.analyzer.total_words, words.len(), &titles)));
+        for chunk in words.chunks(WORDS_PER_PART) {
+            let chunk: Vec<_> =
+                chunk.iter().map(|(k, w)| (k.as_str(), w.count, &w.spellings, w.pronunciation.as_str(), w.pos.as_str(), w.chapters, w.first_chapter)).collect();
+            part(postcard::to_allocvec(&chunk));
+        }
+        let ids: HashMap<&str, u32> = words.iter().enumerate().map(|(i, (k, _))| (k.as_str(), i as u32)).collect();
+        for (chapter, counts) in self.texts.iter().zip(&self.counts) {
+            let by_id: Vec<(u32, u32)> = counts.counts.iter().filter_map(|(k, &n)| Some((*ids.get(k.as_str())?, n as u32))).collect();
+            part(postcard::to_allocvec(&(chapter.index, chapter.text.as_str(), counts.total, &by_id)));
+        }
+        out
     }
 
-    /// The book from a stored analysis, if it was made with the same `key`.
-    pub fn from_analysis(saved: SavedBook, bytes: &[u8], key: &CacheKey, settings: &Settings) -> Option<Self> {
-        let cached: CachedAnalysis = postcard::from_bytes(bytes).ok()?;
-        let matches = cached.build == key.build
-            && cached.dictionary == key.dictionary
-            && cached.include_particles == key.include_particles
-            && cached.chapters.len() == cached.counts.len()
-            && !cached.chapters.is_empty();
-        matches.then(|| Self::new(saved, cached.chapters, cached.analyzer, cached.counts, settings))
+    /// The book from a stored analysis, if it was made with the same `key`: decoded and given its word lists a
+    /// few parts at a time ([`RestoringBook::step`]).
+    pub fn from_analysis(saved: SavedBook, bytes: Vec<u8>, key: &CacheKey, settings: &Settings) -> Option<RestoringBook> {
+        let (header, rest) = postcard::take_from_bytes::<StoredHeader>(&bytes).ok()?;
+        if header.build != key.build || header.dictionary != key.dictionary || header.include_particles != key.include_particles || header.titles.is_empty() {
+            return None;
+        }
+        let at = bytes.len() - rest.len();
+        let chapters = header.titles.len();
+        let analyzer = FrequencyAnalyzer { words: HashMap::with_capacity(header.words), total_words: header.total_words, chapters };
+        Some(RestoringBook {
+            saved,
+            settings: *settings,
+            size: bytes.len(),
+            bytes,
+            at,
+            words_left: header.words,
+            keys: Vec::with_capacity(header.words),
+            titles: header.titles,
+            analyzer,
+            texts: Vec::with_capacity(chapters),
+            infos: Vec::with_capacity(chapters),
+            counts: Vec::with_capacity(chapters),
+            words: Vec::with_capacity(chapters),
+            started: Instant::now(),
+            work_ms: 0.0,
+            longest_ms: 0.0,
+            frames: 0,
+        })
     }
 
     /// Words of every chapter up to and including the learned one.
@@ -327,20 +388,139 @@ impl PendingBook {
     }
 }
 
+/// A book being restored from its stored analysis: its parts decoded, then its word lists built, a few at a
+/// time, so that the window keeps redrawing (decoding a large analysis in one call froze Safari for seconds).
+pub struct RestoringBook {
+    saved: SavedBook,
+    /// The settings the lists are built with
+    settings: Settings,
+    /// The stored analysis, and where its next part starts
+    bytes: Vec<u8>,
+    at: usize,
+    size: usize,
+    /// Words still to decode, and the decoded words' keys by their position
+    words_left: usize,
+    keys: Vec<String>,
+    titles: Vec<String>,
+    analyzer: FrequencyAnalyzer,
+    texts: Vec<Chapter>,
+    /// Titles and lengths of the decoded chapters (counting the characters of a long book's text takes long too)
+    infos: Vec<ChapterInfo>,
+    counts: Vec<ChapterCounts>,
+    words: Vec<Vec<String>>,
+    /// For the timeline: when it started, the time spent on it (ms), in how many frames, at most in one
+    started: Instant,
+    work_ms: f64,
+    longest_ms: f64,
+    frames: u32,
+}
+
+impl RestoringBook {
+    pub fn id(&self) -> u64 {
+        self.saved.id
+    }
+
+    /// Decode parts, then build word lists, until `deadline` (one part or list at least): `Some(true)` once the
+    /// book is complete, `None` if the stored analysis is damaged.
+    pub fn step(&mut self, deadline: Instant) -> Option<bool> {
+        let start = Instant::now();
+        let done = loop {
+            let done = self.next()?;
+            if done || Instant::now() >= deadline {
+                break done;
+            }
+        };
+        let took = timeline::since(start);
+        self.work_ms += took;
+        self.longest_ms = self.longest_ms.max(took);
+        self.frames += 1;
+        Some(done)
+    }
+
+    /// One part decoded, or one word list built; true once there is nothing left.
+    fn next(&mut self) -> Option<bool> {
+        let options = self.settings.list_options();
+        if self.words_left > 0 {
+            let (part, rest) = postcard::take_from_bytes::<Vec<StoredWord>>(&self.bytes[self.at..]).ok()?;
+            self.at = self.bytes.len() - rest.len();
+            if part.is_empty() || part.len() > self.words_left {
+                return None;
+            }
+            self.words_left -= part.len();
+            for w in part {
+                let first_chapter_title = self.titles.get(w.first_chapter).cloned().unwrap_or_default();
+                self.keys.push(w.key.clone());
+                let word = BookWord {
+                    count: w.count,
+                    spellings: w.spellings,
+                    pronunciation: w.pronunciation,
+                    pos: w.pos,
+                    chapters: w.chapters,
+                    first_chapter: w.first_chapter,
+                    first_chapter_title,
+                };
+                self.analyzer.words.insert(w.key, word);
+            }
+        } else if self.texts.len() < self.titles.len() {
+            let (stored, rest) = postcard::take_from_bytes::<StoredChapter>(&self.bytes[self.at..]).ok()?;
+            self.at = self.bytes.len() - rest.len();
+            let mut counts = HashMap::with_capacity(stored.counts.len());
+            for (id, n) in stored.counts {
+                counts.insert(self.keys.get(id as usize)?.clone(), n as usize);
+            }
+            let title = self.titles[self.texts.len()].clone();
+            let chapter = Chapter { index: stored.index, title, text: stored.text };
+            self.infos.push(ChapterInfo::of(&chapter));
+            self.texts.push(chapter);
+            self.counts.push(ChapterCounts { total: stored.total, counts });
+            if self.texts.len() == self.titles.len() {
+                // Every part is decoded: the stored analysis is no longer needed
+                self.bytes = Vec::new();
+            }
+        } else if let Some(counts) = self.counts.get(self.words.len()) {
+            self.words.push(word_list(&self.analyzer, self.words.len(), counts, &self.settings, &options));
+        }
+        Some(self.words_left == 0 && self.words.len() == self.titles.len())
+    }
+
+    /// Start over from the chapter texts (the tokenizer setting changed while it was restored), if they are
+    /// decoded; `None` otherwise, to analyze it from its file.
+    pub fn retokenize(self) -> Option<PendingBook> {
+        (self.texts.len() == self.titles.len()).then(|| PendingBook::new(self.saved, self.texts))
+    }
+
+    /// The book, with its lists for `settings` (built again if they changed meanwhile).
+    pub fn finish(self, settings: &Settings) -> Book {
+        timeline::note(format!(
+            "{}: restored from {} in {:.0} ms of work over {:.1} s ({} frames, at most {:.0} ms in one)",
+            self.saved.name,
+            timeline::size(self.size),
+            self.work_ms,
+            self.started.elapsed().as_secs_f64(),
+            self.frames,
+            self.longest_ms
+        ));
+        let mut book = Book::with_words(self.saved, self.infos, self.texts, self.analyzer, self.counts, self.words);
+        if self.settings != *settings {
+            book.apply(settings);
+        }
+        book
+    }
+}
+
 fn word_lists(analyzer: &FrequencyAnalyzer, counts: &[ChapterCounts], s: &Settings) -> Vec<Vec<String>> {
     let options = s.list_options();
-    counts
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            analyzer
-                .analyze_counts(i, c, &options)
-                .into_iter()
-                // Like the CLI's other filters, this leaves the coverage cut-off unchanged
-                .filter(|e| !(s.hide_katakana_words && is_katakana_word(&e.word)))
-                .map(|e| e.key)
-                .collect()
-        })
+    counts.iter().enumerate().map(|(i, c)| word_list(analyzer, i, c, s, &options)).collect()
+}
+
+/// The words to learn in chapter `i`.
+fn word_list(analyzer: &FrequencyAnalyzer, i: usize, counts: &ChapterCounts, s: &Settings, options: &ListOptions) -> Vec<String> {
+    analyzer
+        .analyze_counts(i, counts, options)
+        .into_iter()
+        // Like the CLI's other filters, this leaves the coverage cut-off unchanged
+        .filter(|e| !(s.hide_katakana_words && is_katakana_word(&e.word)))
+        .map(|e| e.key)
         .collect()
 }
 
@@ -425,19 +605,39 @@ mod tests {
         let key = CacheKey { build: "b1", dictionary: "d1", include_particles: false };
         let bytes = book.analysis_bytes(&key);
 
-        let restored = Book::from_analysis(book.saved(), &bytes, &key, &settings).unwrap();
+        // Decoded a part at a time, then given its word lists a chapter at a time, here with a deadline already
+        // past: the words, the two chapters, then the two lists
+        let mut restoring = Book::from_analysis(book.saved(), bytes.clone(), &key, &settings).unwrap();
+        let mut steps = 1;
+        while !restoring.step(Instant::now()).unwrap() {
+            steps += 1;
+        }
+        assert_eq!(steps, 5);
+        let restored = restoring.finish(&settings);
         assert_eq!(restored.words, book.words);
         assert_eq!(restored.saved(), book.saved());
         assert_eq!(restored.chapters.len(), 2);
+        // Settings changed while it was restored: the lists follow them
+        let stricter = Settings { min_book_count: 2, ..settings };
+        let mut restoring = Book::from_analysis(book.saved(), bytes.clone(), &key, &settings).unwrap();
+        while !restoring.step(Instant::now()).unwrap() {}
+        let mut expected = book;
+        let restored = restoring.finish(&stricter);
+        expected.apply(&stricter);
+        assert_eq!(restored.words, expected.words);
+        let book = expected;
 
         for other in [
             CacheKey { build: "b2", ..key },
             CacheKey { dictionary: "d2", ..key },
             CacheKey { include_particles: true, ..key },
         ] {
-            assert!(Book::from_analysis(book.saved(), &bytes, &other, &settings).is_none());
+            assert!(Book::from_analysis(book.saved(), bytes.clone(), &other, &settings).is_none());
         }
-        assert!(Book::from_analysis(book.saved(), b"not an analysis", &key, &settings).is_none());
+        assert!(Book::from_analysis(book.saved(), b"not an analysis".to_vec(), &key, &settings).is_none());
+        // Cut short: the header is fine, a later part is not
+        let mut cut = Book::from_analysis(book.saved(), bytes[..bytes.len() - 3].to_vec(), &key, &settings).unwrap();
+        assert_eq!((0..10).find_map(|_| match cut.step(Instant::now()) { Some(false) => None, other => Some(other) }), Some(None));
     }
 
     #[test]

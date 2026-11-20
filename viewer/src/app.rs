@@ -7,11 +7,12 @@ use jpfe::tokenizer::JapaneseTokenizer;
 use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
 
-use crate::book::{Book, BookStats, CacheKey, PendingBook, SavedBook, Settings};
+use crate::book::{Book, BookStats, CacheKey, PendingBook, RestoringBook, SavedBook, Settings};
 use crate::platform::{self, Inbox, Incoming, WEB_DICTIONARY_FILES};
 use crate::reader::{self, BookReaderState, Lookup, Reader};
 use crate::storage::{self, Key};
 use crate::theme::{self, Palette};
+use crate::timeline;
 
 /// Below this window width the books and the charts are stacked in one column (phones).
 const STACK_BELOW_WIDTH: f32 = 760.0;
@@ -206,9 +207,12 @@ pub struct ViewerApp {
     /// Last state written to storage
     saved: Option<SavedState>,
     next_id: u64,
-    /// Saved books waiting for the dictionary, then the ones whose analysis or file is being read
+    /// Saved books waiting for the dictionary, then the ones whose analysis or file is being read (or whose
+    /// word lists are being built)
     to_restore: Vec<SavedBook>,
     restoring: Vec<SavedBook>,
+    /// Books of `restoring` whose analysis is decoded, while their word lists are built
+    decoded: Vec<RestoringBook>,
     /// Saved shown book, selected once it is restored
     wanted_shown: Option<u64>,
     /// Version of the dictionary being written to storage, and how many of its files are written
@@ -286,6 +290,7 @@ impl ViewerApp {
             next_id: 0,
             to_restore: Vec::new(),
             restoring: Vec::new(),
+            decoded: Vec::new(),
             wanted_shown: None,
             dictionary_writes: None,
             storage_error: None,
@@ -314,7 +319,10 @@ impl ViewerApp {
                     self.next_id += 1;
                     self.ask_persistence(ctx);
                     storage::write(&self.inbox, ctx, Key::Source(id), &bytes);
-                    match self.load_times.timed("reading books", || PendingBook::parse(id, &name, bytes, None)) {
+                    let start = Instant::now();
+                    let parsed = self.load_times.timed("reading books", || PendingBook::parse(id, &name, bytes, None));
+                    timeline::note(format!("{name}: file parsed in {:.0} ms", timeline::since(start)));
+                    match parsed {
                         Ok(book) => self.pending.push(book),
                         Err(e) => {
                             storage::remove_book(&self.inbox, ctx, id);
@@ -375,7 +383,9 @@ impl ViewerApp {
                     let families = [egui::FontFamily::Proportional, egui::FontFamily::Monospace]
                         .map(|family| egui::epaint::text::InsertFontFamily { family, priority })
                         .to_vec();
+                    let start = Instant::now();
                     ctx.add_font(egui::epaint::text::FontInsert::new(&name, egui::FontData::from_owned(bytes), families));
+                    timeline::note(format!("font {name} added in {:.0} ms", timeline::since(start)));
                 }
                 Incoming::Error(e) => self.errors.push(e),
             }
@@ -452,12 +462,14 @@ impl ViewerApp {
                 let key = CacheKey { build: BUILD_ID, dictionary: &dictionary, include_particles: self.settings.include_particles };
                 let saved = self.restoring[pos].clone();
                 let settings = self.settings;
-                let book = self.load_times.timed("restoring books", || bytes.and_then(|b| Book::from_analysis(saved, &b, &key, &settings)));
+                let start = Instant::now();
+                let book = self.load_times.timed("restoring books", || bytes.and_then(|b| Book::from_analysis(saved, b, &key, &settings)));
+                if book.is_none() {
+                    timeline::note(format!("{}: to analyze again ({:.0} ms)", self.restoring[pos].name, timeline::since(start)));
+                }
                 match book {
-                    Some(book) => {
-                        self.restoring.remove(pos);
-                        self.insert_book(book);
-                    }
+                    // Its word lists are built next, in `do_work`; it stays in `restoring` until they are
+                    Some(book) => self.decoded.push(book),
                     // Missing, or made by another build or dictionary: analyze the book again
                     None => storage::read(&self.inbox, ctx, Key::Source(id)),
                 }
@@ -465,7 +477,9 @@ impl ViewerApp {
             Key::Source(id) => {
                 let Some(pos) = self.restoring.iter().position(|b| b.id == id) else { return };
                 let saved = self.restoring.remove(pos);
+                let start = Instant::now();
                 let parsed = self.load_times.timed("reading books", || bytes.map(|b| PendingBook::parse(saved.id, &saved.file_name, b, saved.learned)));
+                timeline::note(format!("{}: file parsed in {:.0} ms", saved.name, timeline::since(start)));
                 match parsed {
                     Some(Ok(book)) => self.push_pending(book),
                     Some(Err(e)) => self.errors.push(format!("{e:#}")),
@@ -554,12 +568,31 @@ impl ViewerApp {
                 self.restoring.push(saved);
             }
         }
+        // Word lists of a restored book, in the frame's time
+        if let Some(book) = self.decoded.first_mut() {
+            let deadline = self.frame_started + WORK_PER_FRAME;
+            match timeline::step("restoring a book", || book.step(deadline)) {
+                Some(false) => {}
+                Some(true) => timeline::step("finishing a restored book", || {
+                    let book = self.decoded.remove(0).finish(&self.settings);
+                    self.restoring.retain(|b| b.id != book.id);
+                    self.insert_book(book);
+                }),
+                // Damaged: analyze the book again from its file (it stays in `restoring` until it is read)
+                None => {
+                    let id = self.decoded.remove(0).id();
+                    timeline::note(format!("book {id}: stored analysis damaged, analyzed again"));
+                    storage::read(&self.inbox, ctx, Key::Source(id));
+                }
+            }
+            ctx.request_repaint();
+        }
         if self.state_loaded && self.to_restore.is_empty() && self.restoring.is_empty() && self.load_times.books.is_none() {
             self.load_times.books = Some(self.load_times.started.elapsed().as_secs_f64());
         }
 
         #[cfg(target_arch = "wasm32")]
-        if self.prepare_dictionary(ctx) {
+        if timeline::step("dictionary", || self.prepare_dictionary(ctx)) {
             ctx.request_repaint();
             return;
         }
@@ -576,16 +609,19 @@ impl ViewerApp {
         let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary else { return };
         let Some(book) = self.pending.first_mut() else { return };
         let started = Instant::now();
-        let stepped = book.step(tokenizer, self.settings.include_particles, started + WORK_PER_FRAME);
+        let stepped = timeline::step("analyzing a book", || book.step(tokenizer, self.settings.include_particles, started + WORK_PER_FRAME));
         self.load_times.add("analyzing books", started.elapsed().as_secs_f64());
         match stepped {
             Ok(false) => {}
-            Ok(true) => {
+            Ok(true) => timeline::step("finishing an analysis", || {
+                let start = Instant::now();
                 let book = self.pending.remove(0).finish(&self.settings);
                 let key = CacheKey { build: BUILD_ID, dictionary: &dictionary, include_particles: self.settings.include_particles };
-                storage::write(&self.inbox, ctx, Key::Analysis(book.id), &book.analysis_bytes(&key));
+                let bytes = book.analysis_bytes(&key);
+                timeline::note(format!("{}: analyzed; word lists and encoding {:.0} ms", book.name, timeline::since(start)));
+                storage::write(&self.inbox, ctx, Key::Analysis(book.id), &bytes);
                 self.insert_book(book);
-            }
+            }),
             Err(e) => {
                 let book = self.pending.remove(0);
                 self.errors.push(format!("{}: {e:#}", book.saved.name));
@@ -626,6 +662,13 @@ impl ViewerApp {
                     let deadline = self.frame_started + WORK_PER_FRAME;
                     match self.load_times.timed("unpacking", || unpacker.step(deadline)) {
                         Ok(Some(data)) => {
+                            timeline::note(format!(
+                                "{name} unpacked: {} in {:.0} ms over {} frames (at most {:.0} ms in one)",
+                                timeline::size(data.len()),
+                                unpacker.total_ms,
+                                unpacker.frames,
+                                unpacker.longest_ms
+                            ));
                             files.insert(name.clone(), data);
                             self.unpacking = None;
                         }
@@ -637,6 +680,7 @@ impl ViewerApp {
                     }
                 } else if files.len() == WEB_DICTIONARY_FILES.len() {
                     let (version, mut files) = (version.clone(), std::mem::take(files));
+                    let start = Instant::now();
                     log::info!("Dictionary {version} {}", if *from_storage { "from storage" } else { "downloaded" });
                     let tokenizer = self.load_times.timed("loading the dictionary", || jpfe::tokenizer::tokenizer_from_files(|name| files.remove(name), true));
                     match self.load_times.timed("loading the definitions", || Lookup::from_files(|name| files.remove(name))) {
@@ -647,6 +691,7 @@ impl ViewerApp {
                         Ok(tokenizer) => DictionaryState::Ready { tokenizer: Box::new(tokenizer), version },
                         Err(e) => DictionaryState::Failed(format!("{e:#}")),
                     };
+                    timeline::note(format!("dictionary and definitions loaded in {:.0} ms", timeline::since(start)));
                 }
                 true
             }
@@ -713,6 +758,18 @@ impl ViewerApp {
             }
             let books: Vec<PendingBook> = self.books.drain(..).map(Book::retokenize).collect();
             self.pending.splice(0..0, books);
+            // Books being restored were analyzed with the old setting too
+            for book in std::mem::take(&mut self.decoded) {
+                let id = book.id();
+                match book.retokenize() {
+                    Some(book) => {
+                        self.restoring.retain(|b| b.id != id);
+                        self.pending.push(book);
+                    }
+                    // Its chapters are not decoded yet: from its file
+                    None => storage::read(&self.inbox, ctx, Key::Source(id)),
+                }
+            }
         } else {
             for book in &mut self.books {
                 book.apply(&self.settings);
@@ -742,71 +799,17 @@ impl ViewerApp {
             .resizable(false)
             .default_width(380.0)
             .max_width(ctx.content_rect().width() - 24.0)
-            // Scrolls when the screen is too short for it (phones)
-            .max_height(ctx.content_rect().height() - 96.0)
-            .vscroll(true)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
             .show(ctx, |ui| {
                 // Slider tracks use the control fill, which is white on the white window
                 ui.visuals_mut().widgets.inactive.bg_fill = palette.separator;
                 ui.spacing_mut().slider_width = (ui.available_width() - 90.0).clamp(120.0, 240.0);
-                let s = &mut self.edited_settings;
-                let note = |ui: &mut Ui, text: &str| {
-                    ui.label(RichText::new(text).small().color(palette.secondary_text));
-                    ui.add_space(4.0);
-                };
-                ui.label("Reader font size");
-                ui.add(egui::Slider::new(&mut self.reader_font_size, reader::FONT_SIZES).suffix(" pt").fixed_decimals(0));
-                note(ui, "In the reader, you can also pinch, or scroll with Shift held down.");
-                ui.label("Reader text direction");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.reader_vertical, true, "Vertical (縦書き)");
-                    ui.radio_value(&mut self.reader_vertical, false, "Horizontal (横書き)");
-                });
-                note(ui, "Vertical text reads from top to bottom, in columns from right to left.");
-                ui.checkbox(&mut self.reader_paginate, "Paginate");
-                note(ui, "One page at a time: drag the page sideways, or press the arrow keys, to turn it. Off, the text scrolls.");
+                // The settings scroll when the screen is too short for them (phones), under the title and above the
+                // buttons, which stay in view. egui's own window scrolling left the end of the settings out of reach
+                // on phones.
+                let max_height = (ctx.content_rect().height() - 170.0).max(120.0);
+                egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| self.settings_ui(ui, palette));
                 ui.separator();
-
-                ui.label("Coverage target");
-                ui.add(egui::Slider::new(&mut s.target_percentage, 50.0..=100.0).suffix(" %").fixed_decimals(1));
-                note(ui, "Each chapter's list stops once its words cover this share of the chapter's words.");
-
-                ui.label("Minimum occurrences in the book");
-                ui.add(egui::Slider::new(&mut s.min_book_count, 1..=20));
-                note(ui, "Words that appear fewer times in the whole book are left out.");
-
-                ui.label("Minimum chapters in the book");
-                ui.add(egui::Slider::new(&mut s.min_chapters, 1..=20));
-                note(ui, "Words found in fewer chapters are left out, so that a word repeated in a single scene is not listed.");
-
-                ui.checkbox(&mut s.hide_previous_words, "Only words new to the book");
-                note(ui, "Leave out words already listed in an earlier chapter of the same book.");
-
-                ui.checkbox(&mut s.hide_katakana_words, "Leave out katakana-only words");
-                note(ui, "Mostly loanwords such as パソコン or エルフ, which are often easy to guess.");
-
-                ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
-                note(ui, "Changing this analyzes the books again.");
-
-
-                ui.separator();
-                ui.checkbox(&mut self.debug, "Show debug information");
-                note(ui, "Load times, memory and storage errors, under the Open button.");
-
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let small = |text: &str| egui::RichText::new(text).small().color(palette.secondary_text);
-                    ui.label(small("Words are found with "));
-                    ui.hyperlink_to(small("UniDic").color(palette.accent), "https://clrd.ninjal.ac.jp/unidic/");
-                    ui.label(small(" (BSD) and "));
-                    ui.hyperlink_to(small("JMdict").color(palette.accent), "https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project");
-                    ui.label(small(", the property of the EDRDG, used under "));
-                    ui.hyperlink_to(small("CC BY-SA 4.0").color(palette.accent), "https://www.edrdg.org/edrdg/licence.html");
-                    ui.label(small("."));
-                });
-
                 ui.horizontal(|ui| {
                     if ui.button("Restore defaults").clicked() {
                         self.edited_settings = Settings::default();
@@ -822,6 +825,69 @@ impl ViewerApp {
                 });
             });
         self.show_settings &= open;
+    }
+
+    /// The settings, in the settings window.
+    fn settings_ui(&mut self, ui: &mut Ui, palette: Palette) {
+        let s = &mut self.edited_settings;
+        let note = |ui: &mut Ui, text: &str| {
+            ui.label(RichText::new(text).small().color(palette.secondary_text));
+            ui.add_space(4.0);
+        };
+        ui.label("Reader font size");
+        ui.add(egui::Slider::new(&mut self.reader_font_size, reader::FONT_SIZES).suffix(" pt").fixed_decimals(0));
+        note(ui, "In the reader, you can also pinch, or scroll with Shift held down.");
+        ui.label("Reader text direction");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.reader_vertical, true, "Vertical (縦書き)");
+            ui.radio_value(&mut self.reader_vertical, false, "Horizontal (横書き)");
+        });
+        note(ui, "Vertical text reads from top to bottom, in columns from right to left.");
+        ui.checkbox(&mut self.reader_paginate, "Paginate");
+        note(ui, "One page at a time: drag the page sideways, or press the arrow keys, to turn it. Off, the text scrolls.");
+        ui.separator();
+
+        ui.label("Coverage target");
+        ui.add(egui::Slider::new(&mut s.target_percentage, 50.0..=100.0).suffix(" %").fixed_decimals(1));
+        note(ui, "Each chapter's list stops once its words cover this share of the chapter's words.");
+
+        ui.label("Minimum occurrences in the book");
+        ui.add(egui::Slider::new(&mut s.min_book_count, 1..=20));
+        note(ui, "Words that appear fewer times in the whole book are left out.");
+
+        ui.label("Minimum chapters in the book");
+        ui.add(egui::Slider::new(&mut s.min_chapters, 1..=20));
+        note(ui, "Words found in fewer chapters are left out, so that a word repeated in a single scene is not listed.");
+
+        ui.checkbox(&mut s.hide_previous_words, "Only words new to the book");
+        note(ui, "Leave out words already listed in an earlier chapter of the same book.");
+
+        ui.checkbox(&mut s.hide_katakana_words, "Leave out katakana-only words");
+        note(ui, "Mostly loanwords such as パソコン or エルフ, which are often easy to guess.");
+
+        ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
+        note(ui, "Changing this analyzes the books again.");
+
+
+        ui.separator();
+        ui.checkbox(&mut self.debug, "Show debug information");
+        note(ui, "Load times, memory and storage errors, under the Open button.");
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let small = |text: &str| egui::RichText::new(text).small().color(palette.secondary_text);
+            ui.label(small("Words are found with "));
+            ui.hyperlink_to(small("UniDic").color(palette.accent), "https://clrd.ninjal.ac.jp/unidic/");
+            ui.label(small(" (BSD) and "));
+            ui.hyperlink_to(small("JMdict").color(palette.accent), "https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project");
+            ui.label(small(", the property of the EDRDG, used under "));
+            ui.hyperlink_to(small("CC BY-SA 4.0").color(palette.accent), "https://www.edrdg.org/edrdg/licence.html");
+            ui.label(small("."));
+        });
+
+        ui.separator();
+        reader_help(ui, self.reader_vertical, self.reader_paginate, palette);
     }
 
     /// The small button at the top left that switches between the statistics and the reader.
@@ -968,8 +1034,8 @@ impl ViewerApp {
             if let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary {
                 // Every word the tokenizer finds can be looked up, whether word lists count it or not
                 let started = Instant::now();
-                reader.tokenize(tokenizer);
-                log::info!("Reader: chapter tokenized in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+                timeline::step("tokenizing the chapter", || reader.tokenize(tokenizer));
+                timeline::note(format!("reader: chapter tokenized in {:.0} ms", timeline::since(started)));
             }
         }
         let response = reader.ui(ui, self.lookup.as_ref(), &mut self.reader_font_size, self.reader_vertical, self.reader_paginate, palette);
@@ -1055,6 +1121,13 @@ impl ViewerApp {
         if let Some(bytes) = platform::memory_bytes().filter(|_| self.debug) {
             let text = format!("Memory used at most: {} MB", bytes / 1_000_000);
             ui.label(RichText::new(text).small().color(palette.secondary_text));
+        }
+        if self.debug {
+            egui::CollapsingHeader::new(RichText::new("Startup timeline").small().color(palette.secondary_text)).id_salt("startup-timeline").show(ui, |ui| {
+                for line in timeline::lines() {
+                    ui.label(RichText::new(line).small().monospace().color(palette.secondary_text));
+                }
+            });
         }
         if self.debug && self.persistent == Some(false) {
             let text = "This browser did not grant persistent storage: it may clear the saved books when it needs room.";
@@ -1189,6 +1262,7 @@ impl ViewerApp {
         // Answers still to come for a restored book are ignored once it is no longer listed
         self.pending.retain(|b| b.saved.id != id);
         self.restoring.retain(|b| b.id != id);
+        self.decoded.retain(|b| b.id() != id);
         self.to_restore.retain(|b| b.id != id);
         if self.wanted_shown == Some(id) {
             self.wanted_shown = None;
@@ -1352,6 +1426,31 @@ impl ViewerApp {
         if let Some(i) = toggled {
             self.log_scales[i] = !self.log_scales[i];
         }
+    }
+}
+
+/// How to use the reader, for its current text direction and pagination: a short list at the bottom of the
+/// settings window, until the reader's actions have a place of their own.
+fn reader_help(ui: &mut Ui, vertical: bool, paginate: bool, palette: Palette) {
+    ui.label(RichText::new("How to use the reader").strong());
+    let (next, previous, next_key, previous_key) = if vertical { ("right", "left", "←", "→") } else { ("left", "right", "→", "←") };
+    let mut items = vec![
+        "Click or tap a word to see its dictionary entry, then a kanji in that window to see the kanji.".to_string(),
+        "Escape, or a click beside the words, closes them.".to_string(),
+    ];
+    if paginate {
+        items.push(format!("Drag or swipe toward the {next} for the next page, toward the {previous} for the previous one; keep holding and move back to stay on the page."));
+        items.push(format!("The {next_key} key shows the next page, {previous_key} the previous one."));
+    } else {
+        items.push(if vertical { "The mouse wheel scrolls through the columns.".to_string() } else { "The mouse wheel scrolls through the text.".to_string() });
+    }
+    items.push("Shift or Cmd/Ctrl + the mouse wheel, or a pinch, changes the font size.".to_string());
+    for item in items {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(RichText::new("•").small().color(palette.secondary_text));
+            ui.add(egui::Label::new(RichText::new(item).small().color(palette.secondary_text)).wrap());
+        });
     }
 }
 
@@ -1571,9 +1670,10 @@ fn log_grid(input: GridInput) -> Vec<GridMark> {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.frame_started = Instant::now();
+        timeline::frame_started();
         let ctx = ui.ctx().clone();
-        self.handle_incoming(&ctx);
-        self.apply_settings(&ctx);
+        timeline::step("storage replies", || self.handle_incoming(&ctx));
+        timeline::step("settings", || self.apply_settings(&ctx));
         if self.state_loaded {
             self.restore_view();
         }
@@ -1634,7 +1734,13 @@ impl eframe::App for ViewerApp {
         self.settings_window(&ctx, palette);
         // After drawing, so the window shows this frame while the slow work runs
         self.do_work(&ctx);
-        self.save_state(&ctx);
+        timeline::step("saving the state", || self.save_state(&ctx));
+        let loading = !self.state_loaded
+            || !self.to_restore.is_empty()
+            || !self.restoring.is_empty()
+            || !self.pending.is_empty()
+            || matches!(self.dictionary, DictionaryState::Checking { .. } | DictionaryState::Loading { .. });
+        timeline::frame_ended(loading);
     }
 }
 
