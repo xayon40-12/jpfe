@@ -30,4 +30,6 @@ fn main() {
         std::fs::read(file).unwrap_or_default().hash(&mut hasher);
     }
     println!("cargo:rustc-env=JPFE_BUILD_ID={:016x}", hasher.finish());
+    // The Dropbox app key, read with `option_env!` (see docs/dropbox-setup.md)
+    println!("cargo:rerun-if-env-changed=JPFE_DROPBOX_APP_KEY");
 }

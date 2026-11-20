@@ -53,6 +53,9 @@ jobs:
           ./viewer/build-web-assets.sh
       - name: Build the web app
         working-directory: viewer
+        # The Dropbox app key for sync, a public value (see docs/dropbox-setup.md); without it, sync is not offered
+        env:
+          JPFE_DROPBOX_APP_KEY: ${{ vars.DROPBOX_APP_KEY }}
         run: trunk build --release
       - uses: actions/upload-pages-artifact@v5
         with:

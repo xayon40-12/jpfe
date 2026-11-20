@@ -5,7 +5,7 @@ edition = "2021"
 description = "Interactive vocabulary statistics for several Japanese books"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "links"] }
 egui_plot = "0.38"
 egui = "0.37"
 zip = { version = "9", default-features = false, features = ["deflate"] }
@@ -15,6 +15,10 @@ web-time = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Books are named by the SHA-256 of their file for sync, and PKCE needs it too
+sha2 = "0.10"
+# Dropbox sync, on the web and the desktop
+ehttp = "0.7"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 jpfe = { path = "..", default-features = false, features = ["embed-dict", "parallel", "serde"] }
@@ -24,7 +28,6 @@ dirs = "7"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 jpfe = { path = "..", default-features = false, features = ["serde"] }
-ehttp = "0.7"
 ruzstd = "0.9"
 rfd = "0.18"
 wasm-bindgen-futures = "0.4"
@@ -36,6 +39,8 @@ web-sys = { version = "0.3", features = [
     "FileSystemWritableFileStream", "WritableStream",
     # Writes through a worker where `createWritable` is missing (Safari)
     "Worker", "MessageEvent", "console",
+    # Dropbox sign-in: the PKCE verifier across the trip to Dropbox, the refresh token, the page's address
+    "Storage", "Location", "History", "Crypto",
 ] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"

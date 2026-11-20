@@ -43,6 +43,8 @@ pub enum Incoming {
     /// A font to add; the primary one draws Latin text too, the others only fill in missing glyphs
     Font { name: String, bytes: Vec<u8>, primary: bool },
     Error(String),
+    /// The answer of signing in to Dropbox
+    SyncSignIn(Result<crate::sync::dropbox::Grant, String>),
 }
 
 #[derive(Clone, Default)]
@@ -139,6 +141,9 @@ mod native {
     pub fn read_dropped(inbox: &Inbox, file: egui::DroppedFileHandle, _ctx: &egui::Context) {
         read_path(inbox, file.path());
     }
+
+    /// Nothing to do: the desktop app is not suspended like a page.
+    pub fn watch_page_hidden(_on_hidden: fn()) {}
 
     pub fn save_file(file_name: &str, bytes: Vec<u8>) -> Result<()> {
         if let Some(path) = rfd::FileDialog::new().set_file_name(file_name).add_filter("Zip", &["zip"]).save_file() {
@@ -270,6 +275,23 @@ mod web {
             }
             ctx.request_repaint();
         });
+    }
+
+    /// Call `on_hidden` when the page is hidden (another tab or app) or closed: the last moment to sync. It runs
+    /// in the event handler itself, since a hidden page draws no more frames.
+    pub fn watch_page_hidden(on_hidden: fn()) {
+        use wasm_bindgen::closure::Closure;
+        let Some(window) = web_sys::window() else { return };
+        let Some(document) = window.document() else { return };
+        let hidden = document.clone();
+        let on_change = Closure::<dyn FnMut()>::new(move || {
+            if hidden.hidden() {
+                on_hidden();
+            }
+        });
+        let _ = document.add_event_listener_with_callback("visibilitychange", on_change.as_ref().unchecked_ref());
+        let _ = window.add_event_listener_with_callback("pagehide", on_change.as_ref().unchecked_ref());
+        on_change.forget();
     }
 
     /// Hand the file to the browser as a download.

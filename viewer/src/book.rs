@@ -73,12 +73,20 @@ pub struct CacheKey<'a> {
 }
 
 /// A book as remembered between sessions (its file and analysis are stored separately).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SavedBook {
+    /// Key of the book in this device's storage (a counter: another device gives the same book another id)
     pub id: u64,
     pub name: String,
     pub file_name: String,
     pub learned: Option<usize>,
+    /// SHA-256 of the original file (hex), which names the book on every device; `None` in states saved before
+    /// sync until the stored file is read again
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// When the name or *Learned up to* last changed, in milliseconds since 1970-01-01 UTC (0 before sync)
+    #[serde(default)]
+    pub modified: u64,
 }
 
 /// A stored analysis is a sequence of postcard-encoded parts, so that it can be decoded a few parts per frame:
@@ -135,6 +143,9 @@ pub struct Book {
     pub words: Vec<Vec<String>>,
     /// Position of the last chapter whose words the reader has learned; `None` before the first one.
     pub learned: Option<usize>,
+    /// See [`SavedBook`]
+    pub hash: Option<String>,
+    pub modified: u64,
 }
 
 impl Book {
@@ -152,14 +163,21 @@ impl Book {
         counts: Vec<ChapterCounts>,
         words: Vec<Vec<String>>,
     ) -> Self {
-        let SavedBook { id, name, file_name, learned } = saved;
+        let SavedBook { id, name, file_name, learned, hash, modified } = saved;
         // A new build may find fewer chapters than when the progress was saved
         let learned = learned.map(|pos| pos.min(texts.len().saturating_sub(1)));
-        Book { id, file_name, name, chapters, texts, analyzer, counts, words, learned }
+        Book { id, file_name, name, chapters, texts, analyzer, counts, words, learned, hash, modified }
     }
 
     pub fn saved(&self) -> SavedBook {
-        SavedBook { id: self.id, name: self.name.clone(), file_name: self.file_name.clone(), learned: self.learned }
+        SavedBook {
+            id: self.id,
+            name: self.name.clone(),
+            file_name: self.file_name.clone(),
+            learned: self.learned,
+            hash: self.hash.clone(),
+            modified: self.modified,
+        }
     }
 
     /// The analysis, to store and reuse with the same `key`.
@@ -346,7 +364,7 @@ impl PendingBook {
             bail!("{file_name}: no chapters found");
         }
         let name = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem).to_string();
-        let saved = SavedBook { id, name, file_name: file_name.to_string(), learned };
+        let saved = SavedBook { id, name, file_name: file_name.to_string(), learned, ..SavedBook::default() };
         Ok(Self::new(saved, chapters))
     }
 
@@ -418,6 +436,10 @@ pub struct RestoringBook {
 impl RestoringBook {
     pub fn id(&self) -> u64 {
         self.saved.id
+    }
+
+    pub fn saved_mut(&mut self) -> &mut SavedBook {
+        &mut self.saved
     }
 
     /// Decode parts, then build word lists, until `deadline` (one part or list at least): `Some(true)` once the
@@ -542,6 +564,8 @@ mod tests {
             counts: Vec::new(),
             words: words.iter().map(|ws| ws.iter().map(|w| w.to_string()).collect()).collect(),
             learned: None,
+            hash: None,
+            modified: 0,
         }
     }
 
@@ -575,7 +599,7 @@ mod tests {
     fn settings_change_the_word_lists() {
         let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
         let pending = pending(
-            SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(1) },
+            SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(1), ..SavedBook::default() },
             chapters,
             vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥", "パン"])],
         );
@@ -597,7 +621,7 @@ mod tests {
     fn reuses_analysis_only_with_the_same_key() {
         let chapters: Vec<Chapter> = (0..2).map(|i| Chapter { index: i, title: format!("第{i}話"), text: "本文".into() }).collect();
         let pending = pending(
-            SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
+            SavedBook { id: 7, name: "A".into(), file_name: "A.epub".into(), learned: Some(0), ..SavedBook::default() },
             chapters,
             vec![tokens(&["猫", "猫", "犬"]), tokens(&["猫", "鳥"])],
         );
@@ -676,7 +700,7 @@ mod tests {
     fn keeps_words_by_dictionary_form_and_shows_the_books_spelling() {
         let spelled = |word: &str, spelling: &str| ParsedWord { spelling: spelling.into(), ..tokens(&[word]).remove(0) };
         let pending = pending(
-            SavedBook { id: 1, name: "A".into(), file_name: "A.epub".into(), learned: Some(0) },
+            SavedBook { id: 1, name: "A".into(), file_name: "A.epub".into(), learned: Some(0), ..SavedBook::default() },
             vec![Chapter { index: 1, title: "第1話".into(), text: String::new() }],
             vec![vec![spelled("出来る", "できる"), spelled("出来る", "できる"), spelled("出来る", "出来る")]],
         );

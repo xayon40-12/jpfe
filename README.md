@@ -134,6 +134,8 @@ Each book entry also shows how many of its words are left once the words learned
 
 Imported books, your progress in each, the settings and the plot scales are remembered: in the browser's private storage (OPFS) on the web, and in the user data folder (e.g. `~/Library/Application Support/jpfe-viewer`) on the desktop. Each book's analysis is cached too, and reused only by the same build of the viewer with the same dictionary; after an update, books are analyzed again from their stored file. On the web, the viewer asks the browser for persistent storage once books are stored, since a browser may otherwise clear the storage of a site when it needs room; a browser may refuse (Chrome grants it to sites used often or installed, Firefox asks), which **Show debug information** reports. A new book never takes the place of files already stored: files of books missing from the book list are kept, and reported in the sidebar.
 
+**Dropbox sync** (in **⚙ Settings**, when the build has a Dropbox app key): the settings, each book's entry and place in the reader, the view, and the books' original files are kept in a folder of your own Dropbox that only this app can see, and merged record by record between your devices, the newest winning. Analyses and the dictionary are not synced; each device rebuilds them. Removing a book removes it everywhere. Setting up the Dropbox app and its key: [docs/dropbox-setup.md](docs/dropbox-setup.md).
+
 ### Run it on the desktop
 ```bash
 cargo run --release -p jpfe-viewer

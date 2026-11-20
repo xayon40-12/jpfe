@@ -1,16 +1,17 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use egui::{Color32, RichText, Ui};
 use egui_plot::{GridInput, GridMark, HoverPosition, Line, Plot, Points, VLine};
 use crate::chart::{format_count, format_ratio, log_ticks};
 use jpfe::tokenizer::JapaneseTokenizer;
-use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
 
 use crate::book::{Book, BookStats, CacheKey, PendingBook, RestoringBook, SavedBook, Settings};
 use crate::platform::{self, Inbox, Incoming, WEB_DICTIONARY_FILES};
 use crate::reader::{self, BookReaderState, Lookup, Reader};
+use crate::state::{stamp, SavedState, ViewState, DEFAULT_LOG_SCALES};
 use crate::storage::{self, Key};
+use crate::sync::{self, account::Account, BookRecord, SettingsRecord, SyncDoc};
 use crate::theme::{self, Palette};
 use crate::timeline;
 
@@ -94,65 +95,6 @@ fn per_100(count: usize, total: usize) -> f64 {
     if total == 0 { 0.0 } else { 100.0 * count as f64 / total as f64 }
 }
 
-/// Log scale of each plot by default, in storage order: new words, characters, density, words learned so far.
-const DEFAULT_LOG_SCALES: [bool; 4] = [true; 4];
-
-/// Everything remembered between sessions, besides the files and analyses.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-struct SavedState {
-    settings: Settings,
-    /// Log scale of each plot, in the order of [`DEFAULT_LOG_SCALES`] (a list, so states saved with fewer plots load)
-    log_scales: Vec<bool>,
-    shown: Option<u64>,
-    next_id: u64,
-    books: Vec<SavedBook>,
-    /// Show load times and storage errors in the sidebar
-    debug: bool,
-    reader_font_size: f32,
-    /// Vertical text (縦書き) in the reader
-    reader_vertical: bool,
-    /// One page at a time in the reader, rather than scrolling
-    reader_paginate: bool,
-    /// Every word in the reader on a fill colored by its parts
-    reader_highlight: bool,
-    /// What the reader remembers of each book (where it was left), by book id
-    reader_books: BTreeMap<u64, BookReaderState>,
-    /// The view showing, reopened when the app starts again
-    view: ViewState,
-}
-
-/// Which view was showing, so the app reopens it: the reader on the same book (at its saved place), or the
-/// statistics. Saved with the settings; two copies of it (from two devices) merge by keeping the one
-/// `modified` last.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-struct ViewState {
-    /// The book shown in the reader; `None` for the statistics
-    reading: Option<u64>,
-    /// When the view last changed, in milliseconds since 1970-01-01 UTC
-    modified: u64,
-}
-
-impl Default for SavedState {
-    fn default() -> Self {
-        Self {
-            settings: Settings::default(),
-            log_scales: DEFAULT_LOG_SCALES.to_vec(),
-            shown: None,
-            next_id: 0,
-            books: Vec::new(),
-            debug: false,
-            reader_font_size: reader::DEFAULT_FONT_SIZE,
-            reader_vertical: reader::DEFAULT_VERTICAL,
-            reader_paginate: reader::DEFAULT_PAGINATE,
-            reader_highlight: reader::DEFAULT_HIGHLIGHT,
-            reader_books: BTreeMap::new(),
-            view: ViewState::default(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Statistics,
@@ -192,6 +134,28 @@ pub struct ViewerApp {
     reader_books: BTreeMap<u64, BookReaderState>,
     /// The view showing, as saved
     view_state: ViewState,
+    /// When the synced settings last changed, and their values as of then: a change is stamped when they differ
+    settings_modified: u64,
+    stamped_settings: Option<SettingsRecord>,
+    /// Books removed, by hash, with when (see [`SavedState::removed`])
+    removed: BTreeMap<String, u64>,
+    /// Dropbox sync
+    account: Account,
+    /// The records last given to the sync, which pushes them when they change
+    synced: Option<SyncDoc>,
+    /// Books whose file is being read for the sync to upload: id and hash
+    sync_reads: HashMap<u64, String>,
+    /// A book whose file is read to name it by its hash (states saved before sync), and the books whose file
+    /// is missing
+    hashing: Option<u64>,
+    unhashable: HashSet<u64>,
+    /// A newer place from another device for the book open in the reader, offered rather than applied
+    place_offer: Option<(u64, BookReaderState)>,
+    /// Whether the first sync since the app started is still to come, and whether the view was switched since:
+    /// another device's view is only taken before
+    first_sync: bool,
+    view_touched: bool,
+    ctx: egui::Context,
     /// The book the reader showed when the app was last closed, reopened once it is ready
     wanted_reader: Option<u64>,
     /// The book selected last (being read, or else shown in the statistics), restored before the others
@@ -250,6 +214,8 @@ impl ViewerApp {
         let inbox = Inbox::default();
         let ctx = &cc.egui_ctx;
         platform::load_assets(&inbox, ctx);
+        platform::watch_page_hidden(sync::account::flush_now);
+        let account = Account::new(&inbox, ctx);
         storage::read(&inbox, ctx, Key::State);
         storage::list_books(&inbox, ctx);
         let dictionary = match platform::embedded_tokenizer() {
@@ -283,6 +249,18 @@ impl ViewerApp {
             reader_highlight: reader::DEFAULT_HIGHLIGHT,
             reader_books: BTreeMap::new(),
             view_state: ViewState::default(),
+            settings_modified: 0,
+            stamped_settings: None,
+            removed: BTreeMap::new(),
+            account,
+            synced: None,
+            sync_reads: HashMap::new(),
+            hashing: None,
+            unhashable: HashSet::new(),
+            place_offer: None,
+            first_sync: true,
+            view_touched: false,
+            ctx: ctx.clone(),
             wanted_reader: None,
             first_book: None,
             lookup: platform::embedded_lookup(),
@@ -320,6 +298,12 @@ impl ViewerApp {
                 // New books get ids after the saved and stored ones, so wait until both are known
                 Incoming::File { .. } if !self.state_loaded || self.stored_books.is_none() => deferred.push(message),
                 Incoming::File { name, bytes } => {
+                    // Books are named by their contents: the same file twice is the same book
+                    let hash = sync::content_hash(&bytes);
+                    if let Some(open) = self.book_with_hash(&hash) {
+                        self.errors.push(format!("{name}: already open, as {open}"));
+                        continue;
+                    }
                     let id = self.next_id;
                     self.next_id += 1;
                     self.ask_persistence(ctx);
@@ -328,7 +312,12 @@ impl ViewerApp {
                     let parsed = self.load_times.timed("reading books", || PendingBook::parse(id, &name, bytes, None));
                     timeline::note(format!("{name}: file parsed in {:.0} ms", timeline::since(start)));
                     match parsed {
-                        Ok(book) => self.pending.push(book),
+                        Ok(mut book) => {
+                            // Added again after it was removed: after the removal, so that it comes back everywhere
+                            book.saved.modified = stamp(self.removed.remove(&hash).unwrap_or(0));
+                            book.saved.hash = Some(hash);
+                            self.pending.push(book);
+                        }
                         Err(e) => {
                             storage::remove_book(&self.inbox, ctx, id);
                             self.errors.push(format!("{e:#}"));
@@ -393,6 +382,10 @@ impl ViewerApp {
                     timeline::note(format!("font {name} added in {:.0} ms", timeline::since(start)));
                 }
                 Incoming::Error(e) => self.errors.push(e),
+                Incoming::SyncSignIn(result) => {
+                    self.account.finish_sign_in(result, ctx);
+                    self.first_sync = true;
+                }
             }
         }
         if !deferred.is_empty() {
@@ -410,7 +403,7 @@ impl ViewerApp {
     fn handle_stored(&mut self, ctx: &egui::Context, key: Key, bytes: Option<Vec<u8>>) {
         match key {
             Key::State => {
-                let state: SavedState = bytes.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                let state = SavedState::load(bytes.as_deref());
                 self.settings = state.settings;
                 self.edited_settings = state.settings;
                 self.log_scales = std::array::from_fn(|i| state.log_scales.get(i).copied().unwrap_or(DEFAULT_LOG_SCALES[i]));
@@ -420,6 +413,9 @@ impl ViewerApp {
                 self.reader_paginate = state.reader_paginate;
                 self.reader_highlight = state.reader_highlight;
                 self.reader_books = state.reader_books.clone();
+                self.settings_modified = state.settings_modified;
+                self.stamped_settings = Some(SettingsRecord::of(&state));
+                self.removed = state.removed.clone();
                 self.wanted_reader = state.view.reading;
                 self.view_state = state.view.clone();
                 self.wanted_shown = state.shown;
@@ -481,13 +477,36 @@ impl ViewerApp {
                 }
             }
             Key::Source(id) => {
-                let Some(pos) = self.restoring.iter().position(|b| b.id == id) else { return };
-                let saved = self.restoring.remove(pos);
+                let mut bytes = bytes;
+                let restoring = self.restoring.iter().position(|b| b.id == id);
+                if let Some(hash) = self.sync_reads.remove(&id) {
+                    if let Some(engine) = self.account.engine() {
+                        let bytes = if restoring.is_some() { bytes.clone() } else { bytes.take() };
+                        engine.borrow_mut().source(&hash, bytes);
+                    }
+                }
+                if self.hashing == Some(id) {
+                    self.hashing = None;
+                    match &bytes {
+                        Some(file) => self.set_hash(id, sync::content_hash(file)),
+                        None => _ = self.unhashable.insert(id),
+                    }
+                }
+                let Some(pos) = restoring else { return };
+                let mut saved = self.restoring.remove(pos);
+                // Read again for a new build: named by its hash if it was not yet (states saved before sync)
+                if saved.hash.is_none() {
+                    saved.hash = bytes.as_deref().map(sync::content_hash);
+                }
                 let start = Instant::now();
                 let parsed = self.load_times.timed("reading books", || bytes.map(|b| PendingBook::parse(saved.id, &saved.file_name, b, saved.learned)));
                 timeline::note(format!("{}: file parsed in {:.0} ms", saved.name, timeline::since(start)));
                 match parsed {
-                    Some(Ok(book)) => self.push_pending(book),
+                    Some(Ok(mut book)) => {
+                        // Its saved entry as it was (the name may come from another device), with its hash
+                        book.saved = SavedBook { id: book.saved.id, file_name: book.saved.file_name, ..saved };
+                        self.push_pending(book);
+                    }
                     Some(Err(e)) => self.errors.push(format!("{e:#}")),
                     None => self.errors.push(format!("{}: the stored file is missing; open it again", saved.name)),
                 }
@@ -731,8 +750,10 @@ impl ViewerApp {
             reader_vertical: self.reader_vertical,
             reader_paginate: self.reader_paginate,
             reader_highlight: self.reader_highlight,
+            settings_modified: self.settings_modified,
             reader_books: self.reader_books.clone(),
             view: self.view_state.clone(),
+            removed: self.removed.clone(),
             shown: self.wanted_shown.or_else(|| self.books.get(self.shown).map(|b| b.id)),
             next_id: self.next_id,
             books,
@@ -743,12 +764,200 @@ impl ViewerApp {
         if !self.state_loaded {
             return;
         }
+        self.stamp_settings(ctx);
         let state = self.current_state();
         if self.saved.as_ref() != Some(&state) {
             if let Ok(json) = serde_json::to_vec(&state) {
                 storage::write(&self.inbox, ctx, Key::State, &json);
             }
             self.saved = Some(state);
+            self.touch_sync(ctx);
+        }
+    }
+
+    /// The synced settings as chosen (the word-list settings being edited, rather than the ones the lists
+    /// were last built with).
+    fn synced_settings(&self) -> SettingsRecord {
+        SettingsRecord {
+            modified: self.settings_modified,
+            settings: self.edited_settings,
+            log_scales: self.log_scales.to_vec(),
+            reader_font_size: self.reader_font_size,
+            reader_vertical: self.reader_vertical,
+            reader_paginate: self.reader_paginate,
+            reader_highlight: self.reader_highlight,
+        }
+    }
+
+    /// Stamp the synced settings with the time they changed (once a slider is let go).
+    fn stamp_settings(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let current = self.synced_settings();
+        if let Some(stamped) = &self.stamped_settings {
+            // Changed here, rather than taken with its time from another device
+            if current.modified == stamped.modified && (SettingsRecord { modified: stamped.modified, ..current }) != *stamped {
+                self.settings_modified = stamp(self.settings_modified);
+            }
+        }
+        self.stamped_settings = Some(self.synced_settings());
+    }
+
+    /// This device's synced records.
+    fn local_records(&self) -> SyncDoc {
+        let mut state = self.current_state();
+        state.settings = self.edited_settings;
+        sync::local_doc(&state)
+    }
+
+    /// Tell the sync when the synced records changed.
+    fn touch_sync(&mut self, ctx: &egui::Context) {
+        let Some(engine) = self.account.engine() else { return };
+        let records = self.local_records();
+        if self.synced.as_ref() != Some(&records) {
+            self.synced = Some(records.clone());
+            engine.borrow_mut().touch(ctx.input(|i| i.time), records);
+        }
+    }
+
+    /// Run the sync (when signed in): name the books saved before sync by their hash, then let the sync engine
+    /// handle its replies and start what is due.
+    fn sync_step(&mut self, ctx: &egui::Context) {
+        self.account.check_revoked();
+        let Some(engine) = self.account.engine() else {
+            self.synced = None;
+            return;
+        };
+        // New books get ids after the saved and stored ones (downloaded ones too)
+        if !self.state_loaded || self.stored_books.is_none() {
+            return;
+        }
+        if self.hashing.is_none() {
+            if let Some(book) = self.books.iter().find(|b| b.hash.is_none() && !self.unhashable.contains(&b.id)) {
+                self.hashing = Some(book.id);
+                storage::read(&self.inbox, ctx, Key::Source(book.id));
+            }
+        }
+        let wait = engine.borrow_mut().poll(ctx.input(|i| i.time), self);
+        if let Some(wait) = wait {
+            ctx.request_repaint_after(Duration::from_secs_f64(wait.clamp(0.0, 3600.0)));
+        }
+    }
+
+    /// The name of the book with this hash, at any stage.
+    fn book_with_hash(&self, hash: &str) -> Option<String> {
+        self.current_state().books.into_iter().find(|b| b.hash.as_deref() == Some(hash)).map(|b| b.name)
+    }
+
+    /// Change a book's saved entry (name, progress, hash, time), at any stage.
+    fn set_book(&mut self, saved: SavedBook) {
+        let id = saved.id;
+        if let Some(book) = self.books.iter_mut().find(|b| b.id == id) {
+            book.name = saved.name;
+            book.learned = saved.learned.map(|pos| pos.min(book.chapters.len().saturating_sub(1)));
+            book.hash = saved.hash;
+            book.modified = saved.modified;
+            self.generation += 1;
+            return;
+        }
+        for book in self.pending.iter_mut().filter(|b| b.saved.id == id) {
+            book.saved = saved.clone();
+        }
+        for book in self.restoring.iter_mut().chain(self.to_restore.iter_mut()).filter(|b| b.id == id) {
+            *book = saved.clone();
+        }
+        for book in self.decoded.iter_mut().filter(|b| b.id() == id) {
+            *book.saved_mut() = saved.clone();
+        }
+    }
+
+    fn set_hash(&mut self, id: u64, hash: String) {
+        if let Some(mut saved) = self.current_state().books.into_iter().find(|b| b.id == id) {
+            saved.hash = Some(hash);
+            self.set_book(saved);
+        }
+    }
+
+    /// Take what is newer in another device's records (see [`sync::adopt`]).
+    fn adopt_records(&mut self, remote: &SyncDoc) {
+        let mut state = self.current_state();
+        state.settings = self.edited_settings;
+        let open = self.reader.as_ref().filter(|_| self.view == View::Reader).map(|r| r.book);
+        let take_view = std::mem::replace(&mut self.first_sync, false) && !self.view_touched && open.is_none();
+        let adopted = sync::adopt(&mut state, remote, open, take_view);
+        if adopted.settings {
+            // The word lists are rebuilt next frame, as after editing the settings
+            self.edited_settings = state.settings;
+            self.log_scales = std::array::from_fn(|i| state.log_scales.get(i).copied().unwrap_or(DEFAULT_LOG_SCALES[i]));
+            self.reader_font_size = state.reader_font_size.clamp(*reader::FONT_SIZES.start(), *reader::FONT_SIZES.end());
+            self.reader_vertical = state.reader_vertical;
+            self.reader_paginate = state.reader_paginate;
+            self.reader_highlight = state.reader_highlight;
+            self.settings_modified = state.settings_modified;
+            self.stamped_settings = Some(self.synced_settings());
+        }
+        for id in &adopted.books {
+            if let Some(saved) = state.books.iter().find(|b| b.id == *id) {
+                self.set_book(saved.clone());
+            }
+        }
+        for &id in &adopted.removed {
+            self.forget_book(id);
+        }
+        self.removed = state.removed;
+        // A book left in the reader (behind the statistics) opens at its new place
+        if self.reader.as_ref().is_some_and(|r| adopted.places.contains(&r.book)) {
+            self.reader = None;
+        }
+        self.reader_books = state.reader_books;
+        self.place_offer = adopted.offered;
+        if adopted.view {
+            self.view_state = state.view.clone();
+            self.wanted_reader = state.view.reading;
+            if state.view.reading.is_none() {
+                self.view = View::Statistics;
+            }
+        }
+    }
+
+    /// Take the records of the last sync again (the reader has left a book whose changes waited).
+    fn adopt_again(&mut self) {
+        let remote = self.account.engine().and_then(|engine| engine.borrow().remote().cloned());
+        if let Some(remote) = remote {
+            self.adopt_records(&remote);
+        }
+    }
+
+    /// A book downloaded from another device: stored and analyzed, as a book opened here.
+    fn add_downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>) -> Result<(), String> {
+        if sync::content_hash(&bytes) != hash {
+            return Err("the downloaded file is damaged".into());
+        }
+        if self.book_with_hash(hash).is_some() {
+            return Ok(());
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let ctx = self.ctx.clone();
+        self.ask_persistence(&ctx);
+        storage::write(&self.inbox, &ctx, Key::Source(id), &bytes);
+        let start = Instant::now();
+        let parsed = PendingBook::parse(id, &record.file_name, bytes, record.learned);
+        timeline::note(format!("{}: downloaded, file parsed in {:.0} ms", record.name, timeline::since(start)));
+        match parsed {
+            Ok(mut book) => {
+                book.saved.name = record.name.clone();
+                book.saved.hash = Some(hash.to_string());
+                book.saved.modified = record.modified;
+                self.removed.remove(hash);
+                self.push_pending(book);
+                Ok(())
+            }
+            Err(e) => {
+                storage::remove_book(&self.inbox, &ctx, id);
+                Err(format!("{e:#}"))
+            }
         }
     }
 
@@ -878,6 +1087,8 @@ impl ViewerApp {
         ui.checkbox(&mut s.include_particles, "Include particles and auxiliary verbs (助詞・助動詞)");
         note(ui, "Changing this analyzes the books again.");
 
+        ui.separator();
+        self.account.ui(ui, palette, &self.inbox);
 
         ui.separator();
         ui.checkbox(&mut self.debug, "Show debug information");
@@ -915,8 +1126,20 @@ impl ViewerApp {
     /// Switch between the statistics and the reader on the selected book.
     fn toggle_view(&mut self) {
         if self.view == View::Reader {
-            self.remember_place();
+            match self.place_offer.take() {
+                // A newer place from another device, not taken while the book was read: it opens there next time
+                Some((id, place)) if self.reader.as_ref().is_some_and(|r| r.book == id) => {
+                    self.reader_books.insert(id, place);
+                    self.reader = None;
+                }
+                offer => {
+                    self.place_offer = offer;
+                    self.remember_place();
+                }
+            }
             self.view = View::Statistics;
+            // What waited while the book was read (a removal)
+            self.adopt_again();
             return;
         }
         self.wanted_reader = None;
@@ -956,7 +1179,8 @@ impl ViewerApp {
         }
         let reading = self.reader.as_ref().filter(|_| self.view == View::Reader).map(|r| r.book);
         if reading != self.view_state.reading {
-            self.view_state = ViewState { reading, modified: now_millis() };
+            self.view_state = ViewState { reading, modified: stamp(self.view_state.modified) };
+            self.view_touched = true;
         }
     }
 
@@ -968,8 +1192,18 @@ impl ViewerApp {
     }
 
     fn store_place(&mut self, book: u64, place: BookReaderState) {
-        if self.reader_books.get(&book).is_none_or(|saved| !saved.same_place(&place)) {
-            self.reader_books.insert(book, BookReaderState { modified: now_millis(), ..place });
+        // Reading on here: this place replaces the one another device offered
+        let offered = match self.place_offer.take() {
+            Some((id, offer)) if id == book => offer.modified,
+            offer => {
+                self.place_offer = offer;
+                0
+            }
+        };
+        let previous = self.reader_books.get(&book);
+        if offered > 0 || previous.is_none_or(|saved| !saved.same_place(&place)) {
+            let modified = stamp(previous.map_or(0, |p| p.modified).max(offered));
+            self.reader_books.insert(book, BookReaderState { modified, ..place });
         }
     }
 
@@ -1040,6 +1274,20 @@ impl ViewerApp {
                     });
             });
         });
+        // A newer place from another device: the page stays until the reader chooses
+        let mut offer_taken = None;
+        if let Some((_, place)) = self.place_offer.as_ref().filter(|(id, _)| *id == reader.book) {
+            ui.horizontal_wrapped(|ui| {
+                let at = book.filter(|b| place.chapter < b.chapters.len()).map_or_else(String::new, |b| format!(": {}", b.chapter_label(place.chapter)));
+                ui.label(RichText::new(format!("Newer place from another device{at}")).small().color(palette.secondary_text));
+                if ui.small_button("Go there").clicked() {
+                    offer_taken = Some(true);
+                }
+                if ui.small_button("Stay here").clicked() {
+                    offer_taken = Some(false);
+                }
+            });
+        }
         if reader.needs_words() {
             if let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary {
                 // Every word the tokenizer finds can be looked up, whether word lists count it or not
@@ -1066,6 +1314,24 @@ impl ViewerApp {
         }
         if let Some((book, place)) = settled {
             self.store_place(book, place);
+        }
+        match (offer_taken, self.place_offer.take()) {
+            (Some(true), Some((id, place))) => {
+                if let Some(book) = self.books.iter().find(|b| b.id == id && place.chapter < b.chapters.len()) {
+                    let mut reader = Reader::new(book, place.chapter);
+                    reader.go_to(place.offset, &place.text);
+                    self.reader = Some(reader);
+                }
+                self.reader_books.insert(id, place);
+            }
+            // Stay: this place, stamped after the offered one, so it replaces it
+            (Some(false), Some((id, offered))) => {
+                if let Some(here) = self.reader.as_ref().filter(|r| r.book == id).map(Reader::place) {
+                    let previous = self.reader_books.get(&id).map_or(0, |p| p.modified);
+                    self.reader_books.insert(id, BookReaderState { modified: stamp(previous.max(offered.modified)), ..here });
+                }
+            }
+            (_, offer) => self.place_offer = offer,
         }
         if toggle {
             self.toggle_view();
@@ -1102,6 +1368,15 @@ impl ViewerApp {
             platform::pick_files(&self.inbox, ui.ctx());
         }
         ui.label(RichText::new("You can also drop files on the window.").small().color(palette.secondary_text));
+        if let Some(status) = self.account.status() {
+            if status.downloads > 0 {
+                let books = if status.downloads == 1 { "a book".to_string() } else { format!("{} books", status.downloads) };
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Downloading {books} from Dropbox…")).small().color(palette.secondary_text));
+                });
+            }
+        }
 
         let total = WEB_DICTIONARY_FILES.len();
         match &self.dictionary {
@@ -1196,6 +1471,7 @@ impl ViewerApp {
                         }
                         ui.label(RichText::new("Learned up to (included)").small().color(palette.secondary_text));
                         let selected_text = book.learned.map_or("Not started".to_string(), |pos| book.chapter_label(pos));
+                        let before = book.learned;
                         egui::ComboBox::from_id_salt(("learned", i))
                             .width(ui.available_width())
                             .height(400.0)
@@ -1210,6 +1486,9 @@ impl ViewerApp {
                                     }
                                 });
                             });
+                        if book.learned != before {
+                            book.modified = stamp(book.modified);
+                        }
                     });
                 });
                 if card.response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -1259,9 +1538,24 @@ impl ViewerApp {
         }
     }
 
-    /// Forget a book and its stored files, at any stage: ready, being analyzed, or being restored (so a book
-    /// whose analysis makes the page reload can still be removed).
+    /// Remove a book, here and on the other devices (a record of the removal is synced), at any stage: ready,
+    /// being analyzed, or being restored (so a book whose analysis makes the page reload can still be removed).
     fn remove_book(&mut self, ctx: &egui::Context, id: u64) {
+        let books = self.current_state().books;
+        if let Some(book) = books.iter().find(|b| b.id == id) {
+            // Not if the same file is open twice (from before books were named by their contents)
+            if let Some(hash) = book.hash.as_ref().filter(|h| !books.iter().any(|b| b.id != id && b.hash.as_ref() == Some(*h))) {
+                let previous = self.removed.get(hash).copied().unwrap_or(0).max(book.modified);
+                self.removed.insert(hash.clone(), stamp(previous));
+            }
+        }
+        self.forget_book(id);
+        // Save the book list now, before any further work that could make the page reload
+        self.save_state(ctx);
+    }
+
+    /// Forget a book and its stored files, at any stage.
+    fn forget_book(&mut self, id: u64) {
         if let Some(i) = self.books.iter().position(|b| b.id == id) {
             self.books.remove(i);
             if self.shown > i {
@@ -1284,9 +1578,11 @@ impl ViewerApp {
         if self.wanted_reader == Some(id) {
             self.wanted_reader = None;
         }
-        storage::remove_book(&self.inbox, ctx, id);
-        // Save the book list now, before any further work that could make the page reload
-        self.save_state(ctx);
+        if self.place_offer.as_ref().is_some_and(|(book, _)| *book == id) {
+            self.place_offer = None;
+        }
+        self.sync_reads.remove(&id);
+        storage::remove_book(&self.inbox, &self.ctx, id);
     }
 
     /// `viewport_height` is the visible height (the content scrolls when it does not fit).
@@ -1744,6 +2040,7 @@ impl eframe::App for ViewerApp {
         self.settings_window(&ctx, palette);
         // After drawing, so the window shows this frame while the slow work runs
         self.do_work(&ctx);
+        timeline::step("sync", || self.sync_step(&ctx));
         timeline::step("saving the state", || self.save_state(&ctx));
         let loading = !self.state_loaded
             || !self.to_restore.is_empty()
@@ -1754,48 +2051,46 @@ impl eframe::App for ViewerApp {
     }
 }
 
-/// Now, in milliseconds since 1970-01-01 UTC.
-fn now_millis() -> u64 {
-    web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
-}
-
 /// The id of the next new book: after every id the saved state used (`saved_next`, `saved`) and every book
 /// something is stored for (`stored`), so a new book never takes the files of another.
 fn next_book_id(saved_next: u64, saved: &[u64], stored: &[u64]) -> u64 {
     saved.iter().chain(stored).map(|id| id + 1).max().unwrap_or(0).max(saved_next)
 }
 
+/// What the sync engine asks of the app.
+impl sync::engine::Host for ViewerApp {
+    fn local(&self) -> SyncDoc {
+        self.local_records()
+    }
+
+    fn adopt(&mut self, remote: &SyncDoc) {
+        self.adopt_records(remote);
+    }
+
+    fn local_files(&self) -> Vec<String> {
+        self.books.iter().filter_map(|b| b.hash.clone()).collect()
+    }
+
+    fn can_download(&self) -> bool {
+        self.current_state().books.iter().all(|b| b.hash.is_some() || self.unhashable.contains(&b.id))
+    }
+
+    fn read_source(&mut self, hash: &str) -> bool {
+        let Some(id) = self.books.iter().find(|b| b.hash.as_deref() == Some(hash)).map(|b| b.id) else { return false };
+        self.sync_reads.insert(id, hash.to_string());
+        storage::read(&self.inbox, &self.ctx, Key::Source(id));
+        true
+    }
+
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>) -> Result<(), String> {
+        self.add_downloaded(hash, record, bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui::{pos2, Event, Modifiers, PointerButton, RawInput, TouchDeviceId, TouchId, TouchPhase};
-
-    #[test]
-    fn states_saved_before_the_reader_remembered_places_load() {
-        let old = r#"{"settings":{},"shown":0,"next_id":1,"books":[{"id":0,"name":"本","file_name":"本.epub","learned":2}],"reader_font_size":24.0,"reader_vertical":false}"#;
-        let state: SavedState = serde_json::from_str(old).unwrap();
-        assert_eq!(state.books.len(), 1);
-        assert_eq!(state.reader_font_size, 24.0);
-        assert!(state.reader_paginate);
-        assert!(!state.reader_highlight);
-        assert!(state.reader_books.is_empty());
-        // The statistics, as before
-        assert_eq!(state.view, ViewState::default());
-
-        // Places saved with the book's progress, before the reader stopped using it
-        let with_learned = r#"{"reader_books":{"7":{"chapter":3,"offset":120,"text":"探す文","learned":2,"modified":5}}}"#;
-        let state: SavedState = serde_json::from_str(with_learned).unwrap();
-        assert_eq!(state.reader_books.get(&7).map(|p| (p.chapter, p.offset)), Some((3, 120)));
-
-        let mut state = SavedState::default();
-        let place = BookReaderState { chapter: 3, offset: 120, text: "探す文".into(), modified: 1_800_000_000_000 };
-        state.reader_books.insert(7, place.clone());
-        state.view = ViewState { reading: Some(7), modified: 1_800_000_000_001 };
-        let json = serde_json::to_string(&state).unwrap();
-        let back: SavedState = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.reader_books.get(&7), Some(&place));
-        assert_eq!(back.view, state.view);
-    }
 
     #[test]
     fn new_books_never_take_the_id_of_stored_ones() {
