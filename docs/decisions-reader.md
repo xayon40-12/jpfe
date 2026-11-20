@@ -168,6 +168,46 @@ Planned in [plans-sync-and-highlighting.md](plans-sync-and-highlighting.md), whe
 
 **Only what is visible is painted**, line by line like the text, finding the line's first word by binary search: one rectangle per word piece and one per affix region. Turning 20 pages quickly in the web build kept 60 frames a second (median frame 16.7 ms, longest 18.6 ms, no long tasks).
 
+### 9. A word's color is how the sentence uses it, as the dictionary window shows it (not committed yet, 20 November 2026)
+
+The user found the highlight and the dictionary window disagreeing: 家 in グレイラット家 and 心 in 心は完璧 colored as suffixes, 伊達 (in 伊達に十年) in the proper-noun blue while the window showed the common word だて, and the window's entry often of another part of speech than the color. Decision 8 colored the stem by UniDic's tag; the window picked a JMdict entry by its own rule.
+
+**A survey first** (six books, 8.1 million words, the viewer's tokenizer and JMdict data): the color and the first sense of the entry the window showed agreed for 92.4% of words, had no entry for 3.2%, and disagreed for 4.4%, mostly in four ways:
+
+- UniDic's nouns that JMdict lists as な-adjectives (必要, 駄目, 無理, 完璧: 59,000) or adverbs (そもそも, 絶対, 殆ど: 14,000), and UniDic's adverbs JMdict lists as nouns (一番, 余り).
+- Grammar the window showed as something else: のだ's ん showed 【ん】 "yes; yeah" 30,570 times; ほど, くらい, さ showed their noun or suffix sense first.
+- Suffixes that are words of their own (様, さん, 族, 君: 76,000), 97% right after a word the tokenizer does not group them with.
+- Names that are common words (悪魔, 竜, 王, 伊達: UniDic tags them 固有名詞 in some sentences).
+
+It also found two tokenizer bugs, being fixed on another branch: UniDic reads the full-width space that indents a paragraph as a noun, so the word after it becomes a suffix with a wrong reading (目, 人【にん】, 家【か】, 心【しん】: about 8,000 words); and readings are cached by dictionary form, so one misreading sticks to every later occurrence (心 read しん where the text has こころ 3,886 times).
+
+**Decided: one function, `usage(word, next) → (entries, sense, part)`** (`viewer/src/usage.rs`), used by both the highlight and the window, so they cannot disagree. It starts from the window's entry order (the word's part of speech first, then the entry read as in the text) and decides, in this order:
+
+1. **Grammar** (particles and auxiliaries) is grammar, in the entry and sense of a particle or auxiliary: のだ's ん is found as の when ん has none. JMdict lists ずつ only as a suffix, so it stays grammar with no sense marked.
+2. **Numbers** are grey, and so are **fragments** (あ, ぐ: mostly stutters and broken words, though JMdict has many as interjections). A **number with its counter** is the counter, in its counter sense when the entry has one; its leading numerals (digits, 一…兆, 何, 数, 幾) are drawn as a grey number region and the counter in teal, so 十 at the end of a column reads as a number.
+3. **A suffix or prefix that is a word of its own** (the stem, not an affix) is what it can be alone: the first sense, in an entry read as in the text, that is not a suffix, prefix or counter (族 is a noun used as a suffix, 的 a な-adjective). When there is none (さん, 様, 君, ちゃん, 殿, 教, 流), a noun. Affixes inside a word keep the prefix, ending and suffix colors.
+4. **A name** (UniDic's 固有名詞) gets the darker blue only when JMdict has no common word written and read as the name. JMdict's common flag (its priority tags) is now in `definitions.tsv`: `scripts/jmdict-definitions.py` follows each common spelling and reading with `*`, and `Entry::common` (`src/dictionary.rs`) lists them. It is per spelling, not per entry, because an entry is common as soon as one of its spellings is: グレイ shares its entry with the common グレー, and stays a name. 伊達, 悪魔, 竜, 日本 are common words; エリス, マナ, レム are names. Exceptions: ローズ and アイリス are common words.
+5. **A noun, な-adjective or adverb** (UniDic's 名詞, 形状詞, 副詞), in the entry the window shows, by the token right after the stem (its first ending, or the next word when nothing is between them):
+   - before a copula (UniDic's 助動詞 だ or です: the な, に, で, だった of a な-adjective), its な-adjective sense: 完璧に, 完璧な;
+   - before a particle, a real noun sense (n, n-adv, n-t; not a noun taking の or する): 完璧と言える, 必要が; but not for an adverb UniDic tags so (すぐに, 次々と), nor for a な-adjective before と (意外と), nor before a particle that ends a sentence (大丈夫よ);
+   - before a verb or an adjective (な-adjectives included), its adverb sense: 結局, そもそも, 一番簡単.
+6. **Otherwise**, UniDic's part when the entry has a sense of it, for a verb, pronoun, adnominal, adverb or な-adjective (UniDic decided those from the sentence; a noun is left to JMdict, which tells apart the nouns that are な-adjectives); else the entry's first sense that is not an affix (自分 is a pronoun, 筈 an auxiliary, 必要ない a な-adjective).
+
+Only the entry the window shows is searched in step 5: searching every entry read the same made どうやら's どう a noun (堂 "hall").
+
+**Changed from the proposal after the survey:**
+
+- **No adverb before punctuation.** The proposal made a noun or な-adjective an adverb before punctuation too. On the six books that turned 時、, その後、, 瞬間、 and ため、 into adverbs (JMdict's 時 has "occasion" as an adverb sense, 後 "more"), and 大丈夫。 into the adverb "certainly". Only a verb or an adjective after it makes an adverb now; UniDic's own adverbs stay adverbs by step 6.
+- **Particles that end a sentence, and と,** do not make a noun (大丈夫よ, 意外と).
+
+**The window marks the sense used.** It shows the entry used first (as before), and the sense used first within it, with its own number, so a later sense shows out of order (5. before 1.), under a small "as used here: な-adjective" label in the color the word is highlighted with (and "(sense 5)" when it is not the first). When no sense fits (さん as a noun, a name, ずつ), the label goes under the word instead.
+
+**Cost.** The highlight computes a word's usage once, the first time it is painted with the dictionary loaded, and keeps it (`Word::part`, a `OnceCell`): only words on screen are looked up. Before the dictionary is loaded, colors come from UniDic's tags.
+
+**Data size.** `definitions.tsv` grows by 41 KB (28.51 → 28.55 MB, +0.14%), its zstd file by 31 KB (7.89 → 7.92 MB). `fetch-jmdict.sh` rebuilds the file when the script changes (it compares their dates), and the web build's `version.txt` is a hash of the compressed files (`build-web-assets.sh`), so it changes and browsers download the dictionary again. The CLI and the tokenizer do not read the definitions, and the headwords file is unchanged, so word lists cannot change.
+
+**Effect on the six books:** 2.8% of words change color (227,000): suffixes of their own become nouns (71,000), nouns become な-adjectives (67,000), adverbs (17,000) or pronouns (自分, 17,000), names that are common words become nouns (4,000). The color now agrees with the first sense of the entry the window shows first for 93.7% of words (92.4% before), and departs from it on purpose for the rest, which the window marks: grammar found in a later sense (46,700), な-adjectives used as such (24,000), counters (21,000), adverbs before verbs (15,000). About 33,000 of the remaining departures come from the two tokenizer bugs (21,000 after a paragraph indent, 11,000 with a cached reading), which should go once they are fixed.
+
 ## Rejected or replaced approaches
 
 - **Egui's own window scrolling** for the dictionary windows: it always takes the maximum height, leaving empty space under short entries. Replaced by a scroll area that shrinks to its content.
@@ -198,7 +238,10 @@ Planned in [plans-sync-and-highlighting.md](plans-sync-and-highlighting.md), whe
 - **Phrases UniDic misreads as one kana verb** show in kana (役にたちそう as たちそう, from 立ち添う); they were wrong before too, under a kanji lemma.
 - **PDF paragraphs** whose sentence ends exactly at the end of a full line are not joined to the next line when it is not indented, which some PDFs do for continuations (陰の実力者になりたくて).
 - **On phones, the chapter list** in the reader's top bar is cut short (e.g. "0: プ…"); it still works.
-- **Names UniDic does not tag as names** are highlighted as plain nouns: proper nouns follow UniDic's tag, which some invented katakana names of the novels do not get.
+- **Names UniDic does not tag as names** are highlighted as plain nouns: proper nouns follow UniDic's tag, which some invented katakana names of the novels do not get (ロズワール, ルイジェルド: unknown to UniDic, tagged 普通名詞, not in JMdict; 46,000 occurrences). UniDic also splits many invented names into known fragments, colored each on its own (カゲ + ノー, where ノー is the interjection "no"; グレイ + ラット).
+- **ように and そうな** (UniDic's 形状詞 stems of the auxiliaries ようだ and そうだ) take the color of JMdict's 様 "appearing" (a noun, 9,800 times) and そう: they are grammar, which the tokenizer does not tell apart from other 形状詞.
+- **Honorific suffixes of their own** (さん, 様, 君) are nouns; grouping them with the name before them would be a tokenizer change that changes word lists.
+- **Interjection fragments** (あ, え) stay grey, though JMdict has many of them as interjections.
 - **Word highlighting is off by default**, and its colors (thirteen hues, some close: pronoun olive and adjective green, prefix orange and ending yellow) have not been reviewed by the user yet.
 - **Shading the okurigana inside a stem** (the べ of 食べ) needs a split of the stem the tokenizer does not give yet.
 - **A scheduled JMdict update** (a pull request moving `jmdict.lock` to the latest release) is not set up; `scripts/fetch-jmdict.sh --update` does it by hand.

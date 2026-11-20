@@ -3,8 +3,9 @@
 
 Lines, after the first one ("# JMdict <version>"):
 - "#tags", then for each part-of-speech or usage tag: "<code>=<description>", tab-separated
-- one line per entry, numbered from 0: spellings (・-separated), readings (・-separated), then one field per
-  sense: "<tags, comma-separated>|<glosses, separated by "; ">"
+- one line per entry, numbered from 0: spellings (・-separated), readings (・-separated), each followed by "*" when
+  it is a common word (JMdict's priority tags), then one field per sense: "<tags, comma-separated>|<glosses,
+  separated by "; ">"
 - "#index"
 - one line per spelling or reading, sorted by it: the word, then its entries (comma-separated, the entries where
   it is a common word first)
@@ -37,7 +38,8 @@ def main(version):
             glosses = "; ".join(clean(g["text"]) for g in sense["gloss"])
             if glosses:
                 senses.append(",".join(tags) + "|" + glosses)
-        entries.append("\t".join(["・".join(k["text"] for k in kanji), "・".join(k["text"] for k in kana)] + senses))
+        words = lambda elements: "・".join(k["text"] + ("*" if k["common"] else "") for k in elements)
+        entries.append("\t".join([words(kanji), words(kana)] + senses))
         for word in entry["kanji"] + entry["kana"]:
             index.setdefault(word["text"], []).append((not word["common"], number))
     if len(entries) < MIN_ENTRIES:

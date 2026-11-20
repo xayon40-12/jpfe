@@ -41,6 +41,22 @@ fn find_sorted(text: &str, lines: &[u32], key: &str) -> Option<usize> {
         .ok()
 }
 
+/// The words of a `・`-separated field of spellings or readings, those followed by "*" (common words) also added
+/// to `common`.
+fn words<'a>(field: &'a str, common: &mut Vec<&'a str>) -> Vec<&'a str> {
+    field
+        .split('・')
+        .filter(|w| !w.is_empty())
+        .map(|w| match w.strip_suffix('*') {
+            Some(word) => {
+                common.push(word);
+                word
+            }
+            None => w,
+        })
+        .collect()
+}
+
 /// The first line, which names the release: `# <name> <version>`.
 fn version(text: &str, name: &str) -> Result<String> {
     let first = text.lines().next().unwrap_or_default();
@@ -67,6 +83,8 @@ pub struct Entry<'a> {
     pub spellings: Vec<&'a str>,
     pub readings: Vec<&'a str>,
     pub senses: Vec<Sense<'a>>,
+    /// Those of its spellings and readings that are common words (JMdict's priority tags: news1, ichi1, spec1…)
+    pub common: Vec<&'a str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -115,15 +133,17 @@ impl Definitions {
             .filter_map(|n| self.entries.get(n.parse::<usize>().ok()?))
             .map(|&start| {
                 let mut fields = line_at(&self.text, start).split('\t');
-                let mut list = || fields.next().unwrap_or_default().split('・').filter(|s| !s.is_empty()).collect::<Vec<_>>();
-                let (spellings, readings) = (list(), list());
+                // Spellings, then readings, each followed by "*" when it is a common word
+                let mut common = Vec::new();
+                let spellings = words(fields.next().unwrap_or_default(), &mut common);
+                let readings = words(fields.next().unwrap_or_default(), &mut common);
                 let senses = fields
                     .map(|sense| {
                         let (tags, glosses) = sense.split_once('|').unwrap_or(("", sense));
                         Sense { tags: tags.split(',').filter(|t| !t.is_empty()).collect(), glosses }
                     })
                     .collect();
-                Entry { spellings, readings, senses }
+                Entry { spellings, readings, senses, common }
             })
             .collect()
     }
@@ -231,9 +251,9 @@ mod tests {
     use super::*;
 
     const DEFINITIONS: &str = "# JMdict 1.0\n#tags\tn=noun\tadj-na=adjectival nouns or quasi-adjectives\n\
-        上手・上て\tじょうず\tadj-na,n|skillful; skilled\tn|flattery\n\
+        上手*・上て\tじょうず*\tadj-na,n|skillful; skilled\tn|flattery\n\
         上手\tうわて・かみて\tn|upper part\n\
-        \tする\tvs-i|to do\n\
+        \tする*\tvs-i|to do\n\
         #index\nうわて\t1\nかみて\t1\nじょうず\t0\nする\t2\n上て\t0\n上手\t0,1\n";
 
     #[test]
@@ -246,9 +266,13 @@ mod tests {
         assert_eq!(entries[0].readings, ["じょうず"]);
         assert_eq!(entries[0].senses[0], Sense { tags: vec!["adj-na", "n"], glosses: "skillful; skilled" });
         assert_eq!(entries[1].readings, ["うわて", "かみて"]);
+        // Common words are marked with a "*" after them
+        assert_eq!(entries[0].common, ["上手", "じょうず"]);
+        assert!(entries[1].common.is_empty());
         assert_eq!(definitions.lookup("じょうず"), definitions.lookup("上て"));
         let suru = definitions.lookup("する");
         assert!(suru[0].spellings.is_empty());
+        assert_eq!((suru[0].readings.clone(), suru[0].common.clone()), (vec!["する"], vec!["する"]));
         assert_eq!(suru[0].senses[0].glosses, "to do");
         assert!(definitions.lookup("下手").is_empty());
         assert_eq!(definitions.tag("n"), "noun");

@@ -5,6 +5,7 @@
 //! (縦書き, the default), or in lines from left to right, top to bottom. egui only lays out horizontal text,
 //! so the reader places every character itself.
 
+use std::cell::OnceCell;
 use std::f32::consts::FRAC_PI_2;
 use std::ops::{Range, RangeInclusive};
 
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::book::Book;
 use crate::theme::{Palette, WordFills};
+use crate::usage::{usage, Next, Part, Usage};
 
 pub const DEFAULT_FONT_SIZE: f32 = 20.0;
 pub const FONT_SIZES: RangeInclusive<f32> = 10.0..=48.0;
@@ -147,102 +149,43 @@ struct Word {
     paragraph: usize,
     /// Characters of the word in its paragraph
     chars: Range<usize>,
-    /// Its parts, in order, as characters of its paragraph covering `chars` (see [`word_parts`])
-    parts: Vec<(Range<usize>, Part)>,
+    /// Its regions, in order, as characters of its paragraph covering `chars` (see [`word_parts`])
+    parts: Vec<(Range<usize>, Region)>,
+    /// How it is used (see [`usage`]), found once it is painted with the dictionary loaded
+    part: OnceCell<Part>,
 }
 
-/// What part of a word some of its characters are, which gives their color when the reader highlights words.
+/// What some characters of a word are, which gives their color when the reader highlights words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Part {
-    Noun,
-    /// Names of people, places, organizations (名詞-固有名詞)
-    ProperNoun,
-    Verb,
-    /// い- and な-adjectives
-    Adjective,
-    Adverb,
-    /// A counter, with its number (５冊)
-    Counter,
-    Pronoun,
-    /// Interjections, conjunctions, adnominals, expressions
-    Other,
-    /// The prefix before a word: polite (お, ご), ordinal (第), or a kanji prefix (大)
-    Prefix,
-    /// Conjugation endings and auxiliaries after a word (られる, た, て, ない)
-    Ending,
-    /// Suffixes after a word (さ, ら, たち), and a suffix that is a word of its own (家)
-    Suffix,
-    /// Particles and auxiliaries that are words of their own
-    Grammar,
-    /// Numbers and fragments
-    Faint,
+enum Region {
+    /// The word itself, colored by how it is used (see [`usage`])
+    Stem,
+    /// The number of a counter (the 十 of 十年), grey like numbers
+    Number,
+    /// A prefix, an ending or a suffix
+    Affix(Part),
 }
 
-impl Part {
-    /// The word itself (its affixes left out), from its kind and part of speech.
-    fn of_stem(word: &ParsedWord) -> Self {
-        match word.kind {
-            WordKind::Grammar => Self::Grammar,
-            WordKind::Number | WordKind::Fragment => Self::Faint,
-            WordKind::Word if word.written_reading.is_some() => Self::Counter,
-            WordKind::Word => match word.pos.as_str() {
-                "名詞" if word.proper_noun => Self::ProperNoun,
-                "名詞" => Self::Noun,
-                "動詞" => Self::Verb,
-                "形容詞" | "形状詞" => Self::Adjective,
-                "副詞" => Self::Adverb,
-                "代名詞" => Self::Pronoun,
-                "接尾辞" => Self::Suffix,
-                _ => Self::Other,
-            },
-        }
-    }
-
-    /// One of a word's affixes (see [`ParsedWord::affixes`]): prefixes are tagged 接頭辞 and suffixes 接尾辞;
-    /// the rest are conjugation endings (auxiliaries, the particles of conjugated forms such as て, the ない of
-    /// 美しくない, the stems of そうだ and ようだ), except the adjective づらい (辛い), a suffix like やすい.
-    fn of_affix(affix: &ParsedWord) -> Self {
-        match affix.pos.as_str() {
-            "接頭辞" => Self::Prefix,
-            "接尾辞" => Self::Suffix,
-            "形容詞" if !matches!(affix.base_word.as_str(), "無い" | "ない") => Self::Suffix,
-            _ => Self::Ending,
-        }
-    }
-
-    fn fill(self, fills: &WordFills) -> Color32 {
-        match self {
-            Self::Noun => fills.noun,
-            Self::ProperNoun => fills.proper_noun,
-            Self::Verb => fills.verb,
-            Self::Adjective => fills.adjective,
-            Self::Adverb => fills.adverb,
-            Self::Counter => fills.counter,
-            Self::Pronoun => fills.pronoun,
-            Self::Other => fills.other,
-            Self::Prefix => fills.prefix,
-            Self::Ending => fills.ending,
-            Self::Suffix => fills.suffix,
-            Self::Grammar => fills.grammar,
-            Self::Faint => fills.faint,
-        }
-    }
+/// Whether `c` is part of a number before a counter: digits, numerals, and the 何, 数 and 幾 of 何匹, 数十年.
+fn is_number_char(c: char) -> bool {
+    c.is_ascii_digit() || ('０'..='９').contains(&c) || "〇一二三四五六七八九十百千万億兆何数幾.．".contains(c)
 }
 
-/// The parts of `word`, written `surface` in the text, in order, as characters of the surface that cover it: the
-/// word itself (its stem) and each affix. Grammar, numbers and fragments are one part, affixes included.
-fn word_parts(word: &ParsedWord, surface: &str) -> Vec<(Range<usize>, Part)> {
-    let stem = Part::of_stem(word);
+/// The regions of `word`, written `surface` in the text, in order, as characters of the surface that cover it: the
+/// word itself (its stem), the number of a counter, and each affix. Grammar, numbers and fragments are one region,
+/// affixes included.
+fn word_parts(word: &ParsedWord, surface: &str) -> Vec<(Range<usize>, Region)> {
+    let stem = Region::Stem;
     let char_at = |byte: usize| surface.get(..byte).map_or_else(|| surface.chars().count(), |t| t.chars().count());
-    if word.kind != WordKind::Word || word.affixes.is_empty() {
+    if word.kind != WordKind::Word {
         return vec![(0..char_at(surface.len()), stem)];
     }
-    let mut affixes: Vec<(Range<usize>, Part)> = word
+    let mut affixes: Vec<(Range<usize>, Region)> = word
         .affixes
         .iter()
         .filter_map(|a| {
             let span = a.span.start.checked_sub(word.span.start)?..a.span.end.checked_sub(word.span.start)?.min(surface.len());
-            (span.start < span.end).then(|| (span, Part::of_affix(a)))
+            (span.start < span.end).then(|| (span, Region::Affix(Part::of_affix(a))))
         })
         .collect();
     affixes.sort_by_key(|(span, _)| span.start);
@@ -260,6 +203,17 @@ fn word_parts(word: &ParsedWord, surface: &str) -> Vec<(Range<usize>, Part)> {
     }
     if at < surface.len() {
         parts.push((at..surface.len(), stem));
+    }
+    // A counter: its number first, unless the whole stem is digits (then nothing tells the counter apart)
+    if word.written_reading.is_some() {
+        if let Some(i) = parts.iter().position(|(_, r)| *r == Region::Stem) {
+            let span = parts[i].0.clone();
+            let number = surface[span.clone()].char_indices().find(|&(_, c)| !is_number_char(c)).map_or(span.end, |(b, _)| span.start + b);
+            if number > span.start && number < span.end {
+                parts[i].0.start = number;
+                parts.insert(i, (span.start..number, Region::Number));
+            }
+        }
     }
     parts.into_iter().map(|(span, part)| (char_at(span.start)..char_at(span.end), part)).collect()
 }
@@ -335,13 +289,15 @@ fn drag_page(shown: i8, other: i8, forward: f32, threshold: f32) -> i8 {
 
 /// Colors of the text and of the highlighted words.
 #[derive(Clone, Copy)]
-struct Colors {
+struct Colors<'a> {
     text: Color32,
     secondary: Color32,
     hover: Color32,
     selected: Color32,
     /// Fills under every word, by part, when the reader highlights words
     words: Option<WordFills>,
+    /// The dictionary, which tells how each word is used
+    lookup: Option<&'a Lookup>,
 }
 
 /// The characters of a run (a word, or some of it) on one line, and its rectangle there.
@@ -767,7 +723,7 @@ impl Reader {
                 let (start, end) = (word.span.start - paragraph.span.start, word.span.end - paragraph.span.start);
                 let chars = char_at(start)..char_at(end);
                 let parts = word_parts(&word, &text[start..end]).into_iter().map(|(c, part)| (c.start + chars.start..c.end + chars.start, part)).collect();
-                self.words.push(Word { parsed: word, paragraph: index, chars, parts });
+                self.words.push(Word { parsed: word, paragraph: index, chars, parts, part: OnceCell::new() });
             }
             paragraph.words = start..self.words.len();
         }
@@ -776,6 +732,28 @@ impl Reader {
     /// Book name, for the top bar.
     pub fn book_name(&self) -> &str {
         &self.book_name
+    }
+
+    /// What comes right after word `index` (see [`Next`]): its first ending, or the next word if nothing is between them.
+    fn next_of(&self, index: usize) -> Next {
+        let word = &self.words[index].parsed;
+        let following = self.words.get(index + 1).map(|w| &w.parsed).filter(|w| w.span.start == word.span.end);
+        Next::after(word, following)
+    }
+
+    /// How word `index` is used (see [`usage`]), with the dictionary; its entries are left for the window.
+    fn usage_of<'d>(&self, index: usize, lookup: &'d Lookup) -> Usage<'d> {
+        usage(&lookup.words, &self.words[index].parsed, self.next_of(index))
+    }
+
+    /// The part that colors word `index`'s stem: how it is used, found once with the dictionary and kept, or UniDic's
+    /// tag until the dictionary is loaded.
+    fn word_part(&self, index: usize, lookup: Option<&Lookup>) -> Part {
+        let word = &self.words[index];
+        match lookup {
+            Some(lookup) => *word.part.get_or_init(|| self.usage_of(index, lookup).part),
+            None => Part::of_unidic(&word.parsed),
+        }
     }
 
     /// The word at a character of a paragraph.
@@ -864,6 +842,7 @@ impl Reader {
             hover: palette.accent.gamma_multiply(0.12),
             selected: palette.accent.gamma_multiply(0.28),
             words: highlight.then_some(palette.words),
+            lookup,
         };
         let clicked = if paginate {
             self.paged_ui(ui, &layout, view, replace, colors, &mut response)
@@ -892,7 +871,7 @@ impl Reader {
 
     /// The whole chapter, scrolling (sideways for vertical text); returns a click on the text, with the word
     /// clicked if any.
-    fn scrolled_ui(&mut self, ui: &mut Ui, layout: &Layout, view: Vec2, replace: bool, colors: Colors, response: &mut ReaderResponse) -> Option<Option<(usize, Pos2, Align2)>> {
+    fn scrolled_ui(&mut self, ui: &mut Ui, layout: &Layout, view: Vec2, replace: bool, colors: Colors<'_>, response: &mut ReaderResponse) -> Option<Option<(usize, Pos2, Align2)>> {
         let (size, vertical) = (layout.key.size, layout.key.vertical);
         let content = layout.content_size(view);
         let scrollable = if vertical { content.x - view.x } else { content.y - view.y }.max(0.0);
@@ -955,7 +934,7 @@ impl Reader {
 
     /// One page of the chapter: whole columns (or lines) from `self.page`, turned by dragging sideways or
     /// with the arrow keys, in the reading direction. Returns a click on the text, with the word clicked if any.
-    fn paged_ui(&mut self, ui: &mut Ui, layout: &Layout, view: Vec2, replace: bool, colors: Colors, response: &mut ReaderResponse) -> Option<Option<(usize, Pos2, Align2)>> {
+    fn paged_ui(&mut self, ui: &mut Ui, layout: &Layout, view: Vec2, replace: bool, colors: Colors<'_>, response: &mut ReaderResponse) -> Option<Option<(usize, Pos2, Align2)>> {
         let (size, vertical) = (layout.key.size, layout.key.vertical);
         let next_chapter = self.chapter + 1 < self.chapters;
         // Room for the next chapter button after the text, as for scrolling
@@ -1132,12 +1111,12 @@ impl Reader {
     /// Draws lines `drawn`, with the words of `highlights` filled where they are on lines `lines` (over the
     /// fills of every word, when words are highlighted).
     #[allow(clippy::too_many_arguments)]
-    fn paint(&self, painter: &Painter, layout: &Layout, origin: Pos2, drawn: Range<usize>, lines: Range<usize>, highlights: [(Option<usize>, Color32); 2], colors: Colors) {
+    fn paint(&self, painter: &Painter, layout: &Layout, origin: Pos2, drawn: Range<usize>, lines: Range<usize>, highlights: [(Option<usize>, Color32); 2], colors: Colors<'_>) {
         let (size, vertical) = (layout.key.size, layout.key.vertical);
         let radius = layout.word_radius();
         if let Some(fills) = &colors.words {
             for line in &layout.lines[drawn.clone()] {
-                self.paint_word_fills(painter, layout, line, origin, fills);
+                self.paint_word_fills(painter, layout, line, origin, fills, colors.lookup);
             }
         }
         for (word, fill) in highlights {
@@ -1164,19 +1143,28 @@ impl Reader {
     /// The fills under the words of `line`, colored by part: the word's piece on the line in the color of its
     /// stem, then the regions of its other parts over it, square where they meet so the word reads as one
     /// rectangle. PDF page numbers are not words, and are left as they are.
-    fn paint_word_fills(&self, painter: &Painter, layout: &Layout, line: &Line, origin: Pos2, fills: &WordFills) {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_word_fills(&self, painter: &Painter, layout: &Layout, line: &Line, origin: Pos2, fills: &WordFills, lookup: Option<&Lookup>) {
         let Some(paragraph) = line.paragraph.and_then(|p| self.paragraphs.get(p)) else { return };
         if paragraph.page_number || line.chars.is_empty() {
             return;
         }
         let (vertical, radius) = (layout.key.vertical, layout.word_radius());
-        let words = &self.words[paragraph.words.clone()];
-        let first = words.partition_point(|w| w.chars.end <= line.chars.start);
-        for word in words[first..].iter().take_while(|w| w.chars.start < line.chars.end) {
+        let range = paragraph.words.clone();
+        let first = range.start + self.words[range.clone()].partition_point(|w| w.chars.end <= line.chars.start);
+        for index in first..range.end {
+            let word = &self.words[index];
+            if word.chars.start >= line.chars.end {
+                break;
+            }
             let Some(piece) = layout.piece(line, &word.chars, origin) else { continue };
-            let stem = Part::of_stem(&word.parsed);
+            let stem = self.word_part(index, lookup);
             painter.rect_filled(piece.rect, word_corners(piece.start, piece.end, vertical, radius), stem.fill(fills));
-            for (chars, part) in word.parts.iter().filter(|(_, part)| *part != stem) {
+            for (chars, region) in word.parts.iter().filter(|(_, region)| *region != Region::Stem) {
+                let part = match region {
+                    Region::Affix(part) => *part,
+                    _ => Part::Faint,
+                };
                 let (start, end) = (chars.start.max(piece.chars.start), chars.end.min(piece.chars.end));
                 if start < end {
                     let rect = layout.chars_rect(line, start..end, origin);
@@ -1243,7 +1231,8 @@ impl Reader {
                     // Scrolls when long, and is no taller than its content otherwise (egui's own window
                     // scrolling always takes the maximum height)
                     egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
-                        kanji = word_ui(ui, &word.parsed, surface, lookup, body, palette);
+                        let used = lookup.map(|l| self.usage_of(popup.word, l));
+                        kanji = word_ui(ui, &word.parsed, surface, lookup, used.as_ref(), body, palette);
                     });
                 });
             self.word_popup_rect = shown.map(|s| s.response.rect);
@@ -1382,21 +1371,18 @@ fn readings_parts<'a>(readings: &[&'a str], palette: Palette) -> Vec<(&'a str, C
 
 /// The word with its other spellings and its readings, the number it counts with its reading (一つ【ひとつ】),
 /// what its conjugation means, then its definitions; returns a kanji of the word that was clicked.
-fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup>, body: f32, palette: Palette) -> Option<char> {
+/// The dictionary window of a word: its entries as `used` orders them, the one it is used as first, with the
+/// sense it is used in first and marked "as used here", in the color the word is highlighted with.
+#[allow(clippy::too_many_arguments)]
+fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup>, used: Option<&Usage>, body: f32, palette: Palette) -> Option<char> {
     let mut clicked = None;
     let text_color = ui.visuals().text_color();
     let note = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).size(body * 0.8).color(palette.secondary_text));
     ui.spacing_mut().item_spacing.y = body * 0.35;
 
-    // Those of the word's part of speech first (the particle は, not the noun 歯 read the same)
-    let mut entries = lookup.map(|l| l.words.lookup_as(&word.base_word, &word.pos)).unwrap_or_default();
-    // The entry read as in the text first, of the word's part of speech if one is: its readings go on the first
-    // line, with the word
-    let read_so = |e: &jpfe::dictionary::Entry| e.readings.contains(&word.pronunciation.as_str());
-    let first = entries.iter().position(|e| read_so(e) && e.is_part_of_speech(&word.pos)).or_else(|| entries.iter().position(read_so));
-    if let Some(i) = first {
-        entries[..=i].rotate_right(1);
-    }
+    // The entry the word is used as first (see `usage`): its readings go on the first line, with the word
+    let no_entries = Vec::new();
+    let entries = used.map_or(&no_entries, |u| &u.entries);
     let mut readings: Vec<&str> = entries.first().map(|e| e.readings.clone()).unwrap_or_default();
     // The reading in the text first; none that only repeats a word written in kana (の【の】)
     if word.pronunciation != word.base_word {
@@ -1435,6 +1421,16 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
     if !word.forms.is_empty() {
         ui.label(colored(ui, &[(&word.forms.join(", "), palette.grammar)], body * 0.9, false));
     }
+    // How the word is used here, in the color it is highlighted with; on the sense it is used in when one fits,
+    // else under the word
+    let marker = |ui: &mut Ui, used: &Usage, note: &str| {
+        let text = RichText::new(format!("as used here: {}{note}", used.label())).size(body * 0.75).color(ui.visuals().text_color());
+        let fill = used.part.fill(&palette.words);
+        ui.add(egui::Button::new(text).fill(fill).stroke(egui::Stroke::NONE).corner_radius(4).sense(Sense::hover()));
+    };
+    if let Some(used) = used.filter(|u| u.sense.is_none() && u.part != Part::Faint) {
+        marker(ui, used, "");
+    }
     let Some(lookup) = lookup else {
         note(ui, "The dictionary is still loading.");
         return clicked;
@@ -1458,7 +1454,16 @@ fn word_ui(ui: &mut Ui, word: &ParsedWord, surface: &str, lookup: Option<&Lookup
         }
         let numbered = entry.senses.len() > 1;
         let mut previous_tags = None;
-        for (n, sense) in entry.senses.iter().enumerate() {
+        // The sense the word is used in goes first, with its own number, so a later one shows out of order
+        let used_sense = used.and_then(|u| u.sense).filter(|_| i == 0);
+        let order = used_sense.into_iter().chain((0..entry.senses.len()).filter(|&n| Some(n) != used_sense));
+        for n in order {
+            let sense = &entry.senses[n];
+            if let (Some(used), true) = (used, Some(n) == used_sense) {
+                let note = if n > 0 { format!(" (sense {})", n + 1) } else { String::new() };
+                marker(ui, used, &note);
+                previous_tags = None;
+            }
             // Senses often share their tags: shown again only when they change
             if !sense.tags.is_empty() && previous_tags != Some(&sense.tags) {
                 let tags: Vec<&str> = sense.tags.iter().map(|t| short_tag(t).unwrap_or_else(|| lookup.words.tag(t))).collect();
@@ -1771,44 +1776,51 @@ mod tests {
     }
 
     #[test]
-    fn words_are_colored_by_their_parts() {
-        use Part::*;
+    fn words_are_split_into_their_parts() {
+        use Region::{Affix, Number as N, Stem};
         use WordKind::{Fragment, Grammar as G, Number, Word as W};
         let parts = |word: &ParsedWord, text: &str| word_parts(word, &text[word.span.clone()]);
 
         // 数えられた: the verb, then two endings
         let mut word = parsed("数える", "動詞", 0..15, W);
         word.affixes = vec![parsed("られる", "助動詞", 6..12, G), parsed("た", "助動詞", 12..15, G)];
-        assert_eq!(parts(&word, "数えられた"), [(0..2, Verb), (2..4, Ending), (4..5, Ending)]);
+        assert_eq!(parts(&word, "数えられた"), [(0..2, Stem), (2..4, Affix(Part::Ending)), (4..5, Affix(Part::Ending))]);
 
-        // お二人: the polite prefix, then the counter with its number
+        // お二人: the polite prefix, then the number and its counter
         let mut word = parsed("人", "接尾辞", 0..9, W);
         word.written_reading = Some("おふたり".to_string());
         word.affixes = vec![parsed("御", "接頭辞", 0..3, G)];
-        assert_eq!(parts(&word, "お二人"), [(0..1, Prefix), (1..3, Counter)]);
+        assert_eq!(parts(&word, "お二人"), [(0..1, Affix(Part::Prefix)), (1..2, N), (2..3, Stem)]);
+        // 十年, ２０歳, 何匹: the number grey, the counter after it
+        for (text, digits) in [("十年", 1), ("２０歳", 2), ("何匹", 1), ("十数年", 2)] {
+            let mut word = parsed("年", "名詞", 0..text.len(), W);
+            word.written_reading = Some(String::new());
+            let len = text.chars().count();
+            assert_eq!(parts(&word, text), [(0..digits, N), (digits..len, Stem)], "{text}");
+        }
 
         // 静かさ, 使いづらい: suffixes; 美しくない: an ending
         let mut word = parsed("静か", "形状詞", 0..9, W);
         word.affixes = vec![parsed("さ", "接尾辞", 6..9, G)];
-        assert_eq!(parts(&word, "静かさ"), [(0..2, Adjective), (2..3, Suffix)]);
+        assert_eq!(parts(&word, "静かさ"), [(0..2, Stem), (2..3, Affix(Part::Suffix))]);
         let mut word = parsed("使う", "動詞", 0..15, W);
         word.affixes = vec![parsed("辛い", "形容詞", 6..15, G)];
-        assert_eq!(parts(&word, "使いづらい"), [(0..2, Verb), (2..5, Suffix)]);
+        assert_eq!(parts(&word, "使いづらい"), [(0..2, Stem), (2..5, Affix(Part::Suffix))]);
         let mut word = parsed("美しい", "形容詞", 0..15, W);
         word.affixes = vec![parsed("無い", "形容詞", 9..15, G)];
-        assert_eq!(parts(&word, "美しくない"), [(0..3, Adjective), (3..5, Ending)]);
+        assert_eq!(parts(&word, "美しくない"), [(0..3, Stem), (3..5, Affix(Part::Ending))]);
 
-        // Grammar is one quiet part, its endings included (だった); numbers and fragments are grey
+        // Grammar is one part, its endings included (だった); so are numbers and fragments
         let mut word = parsed("だ", "助動詞", 0..9, G);
         word.affixes = vec![parsed("た", "助動詞", 6..9, G)];
-        assert_eq!(parts(&word, "だった"), [(0..3, Grammar)]);
-        assert_eq!(parts(&parsed("二十三", "名詞", 0..9, Number), "二十三"), [(0..3, Faint)]);
-        assert_eq!(parts(&parsed("あ", "感動詞", 0..3, Fragment), "あ"), [(0..1, Faint)]);
+        assert_eq!(parts(&word, "だった"), [(0..3, Stem)]);
+        assert_eq!(parts(&parsed("二十三", "名詞", 0..9, Number), "二十三"), [(0..3, Stem)]);
+        assert_eq!(parts(&parsed("あ", "感動詞", 0..3, Fragment), "あ"), [(0..1, Stem)]);
 
-        // Stems by part of speech
-        let stem = |pos: &str| Part::of_stem(&parsed("語", pos, 0..3, W));
-        assert_eq!(["名詞", "副詞", "代名詞", "接尾辞", "連体詞"].map(stem), [Noun, Adverb, Pronoun, Suffix, Other]);
-        assert_eq!(Part::of_stem(&ParsedWord { proper_noun: true, ..parsed("東京", "名詞", 0..6, W) }), ProperNoun);
+        // Before the dictionary is loaded, stems by UniDic's part of speech; a word of its own is never a suffix
+        let stem = |pos: &str| Part::of_unidic(&parsed("語", pos, 0..3, W));
+        assert_eq!(["名詞", "副詞", "代名詞", "接尾辞", "連体詞"].map(stem), [Part::Noun, Part::Adverb, Part::Pronoun, Part::Noun, Part::Other]);
+        assert_eq!(Part::of_unidic(&ParsedWord { proper_noun: true, ..parsed("東京", "名詞", 0..6, W) }), Part::ProperNoun);
     }
 
     /// One frame of the reader, paginated, in a 400 × 300 window.

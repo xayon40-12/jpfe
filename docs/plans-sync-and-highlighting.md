@@ -67,3 +67,7 @@ It can be added later as a second storage provider (see the design below).
 ## Word highlighting in the reader
 
 Built: its decisions (the parts and their colors, the corner rule) are now decision 8 of [decisions-reader.md](decisions-reader.md), with what is left open (names UniDic does not know, which show as plain nouns; okurigana shading; the default and the colors, not reviewed by the user yet).
+
+### Survey: colors against the dictionary window (19 November 2026)
+
+The user saw the highlight and the dictionary window disagree (家 and 心 colored as suffixes, 伊達 as a name). A survey of the six books compared each word's color with the part of speech of the JMdict entry the window showed: 92.4% agreed, 3.2% had no entry, 4.4% disagreed (UniDic's nouns that are な-adjectives or adverbs in JMdict, grammar shown in another sense, suffixes standing alone, common words tagged as names). It also found two tokenizer bugs, fixed on another branch: the full-width space indenting a paragraph read as a noun (the word after it becomes a misread suffix), and readings cached by dictionary form. The rule the user then chose, and its results, are decision 9 of [decisions-reader.md](decisions-reader.md).
