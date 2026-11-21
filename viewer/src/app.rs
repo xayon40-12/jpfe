@@ -989,11 +989,7 @@ impl ViewerApp {
                 self.wanted_reader = None;
             }
             ui.add(egui::Label::new(RichText::new(name).strong()).truncate());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new("⚙").selected(self.show_settings)).on_hover_text("Settings, with the font size and text direction").clicked() {
-                    self.show_settings = !self.show_settings;
-                }
-            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| bar_buttons(ui, &mut self.show_settings, &mut self.reader_highlight));
         });
         ui.add_space(8.0);
         ui.label(RichText::new("Opening the book…").color(palette.secondary_text));
@@ -1006,40 +1002,98 @@ impl ViewerApp {
         let book = self.books.iter().find(|b| b.id == reader.book);
         let mut chapter = reader.chapter;
         let mut toggle = false;
-        ui.horizontal(|ui| {
-            let button = egui::Button::new(RichText::new("📊").size(15.0)).min_size(egui::vec2(28.0, 24.0));
-            toggle = ui.add(button).on_hover_text("Back to the statistics").clicked();
-            // Phones only have room for the chapter
-            if book.is_none() || ui.available_width() > 520.0 {
-                ui.add(egui::Label::new(RichText::new(reader.book_name()).strong()).truncate());
+        // The bar: statistics and the book name on the left, the highlight toggle and settings on the right, the
+        // chapter buttons and list between them, centered when there is room, filling the middle otherwise
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), BAR_HEIGHT), egui::Sense::hover());
+        // Phones: tighter, so the chapter list keeps its room beside the highlight toggle
+        let compact = bar.width() < 520.0;
+        let (gap, arrow_width) = if compact { (2.0, 16.0) } else { (4.0, ARROW_WIDTH) };
+        let padding = ui.spacing().button_padding;
+        if compact {
+            ui.spacing_mut().button_padding.x = (padding.x - 2.0).max(2.0);
+        }
+        let row = |ui: &mut Ui, rect: egui::Rect, layout: egui::Layout, add: &mut dyn FnMut(&mut Ui)| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(layout), |ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                add(ui);
+            })
+            .response
+            .rect
+        };
+        let right = row(ui, bar, egui::Layout::right_to_left(egui::Align::Center), &mut |ui| bar_buttons(ui, &mut self.show_settings, &mut self.reader_highlight));
+        let name = reader.book_name().to_string();
+        let name_width = ui.painter().layout_no_wrap(name.clone(), egui::TextStyle::Body.resolve(ui.style()), Color32::WHITE).size().x;
+        // Widths of the buttons as they will be drawn, and of the chapter group around a list of a given width (the
+        // list's width is its outer width)
+        let arrow_width = button_width(ui, "‹", None, arrow_width).max(button_width(ui, "›", None, arrow_width));
+        let group_width = |list: f32| 2.0 * arrow_width + list + 2.0 * gap;
+        let left_start = bar.left() + button_width(ui, "📊", Some(15.0), 28.0) + gap;
+        // Centered, the list is as wide as fits beside the name and the right buttons (up to its full width); too
+        // narrow, and the controls fill the middle instead
+        let left_end = left_start + name_width.min(MAX_NAME_WIDTH) + 3.0 * gap;
+        let widest = 2.0 * (bar.center().x - left_end).min(right.left() - 3.0 * gap - bar.center().x);
+        let wide_list = (widest - group_width(0.0)).min(MAX_CHAPTER_LIST);
+        let wide = book.is_some() && wide_list >= MIN_WIDE_CHAPTER_LIST;
+        let wide_group = group_width(wide_list);
+        let centered = bar.center().x - wide_group / 2.0;
+        let (group, name_room) = if wide {
+            (egui::Rect::from_min_size(egui::pos2(centered, bar.top()), egui::vec2(wide_group, BAR_HEIGHT)), centered - left_start - 3.0 * gap)
+        } else {
+            // Phones only have room for the chapter, unless the book is missing (analyzed again)
+            let name_room = if book.is_none() { right.left() - left_start - gap } else if bar.width() > 520.0 { name_width.min(MAX_NAME_WIDTH).min(bar.width() * 0.3) } else { 0.0 };
+            let start = left_start + if name_room > 0.0 { name_room + gap } else { 0.0 };
+            (egui::Rect::from_min_max(egui::pos2(start, bar.top()), egui::pos2(right.left() - gap, bar.bottom())), name_room)
+        };
+        row(ui, bar, egui::Layout::left_to_right(egui::Align::Center), &mut |ui| {
+            let statistics = egui::Button::new(RichText::new("📊").size(15.0)).min_size(egui::vec2(28.0, BAR_HEIGHT));
+            toggle = ui.add(statistics).on_hover_text("Back to the statistics").clicked();
+            if name_room > 20.0 {
+                ui.allocate_ui_with_layout(egui::vec2(name_room, BAR_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(&name).strong()).truncate());
+                });
             }
-            if ui.add_enabled(book.is_some() && chapter > 0, egui::Button::new("‹")).on_hover_text("Previous chapter").clicked() {
-                chapter -= 1;
-            }
-            // From the right: settings, next chapter, then the chapter list in the room left
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new("⚙").selected(self.show_settings)).on_hover_text("Settings, with the font size and text direction").clicked() {
-                    self.show_settings = !self.show_settings;
-                }
-                let Some(book) = book else { return };
-                if ui.add_enabled(chapter + 1 < book.chapters.len(), egui::Button::new("›")).on_hover_text("Next chapter").clicked() {
-                    chapter += 1;
-                }
-                egui::ComboBox::from_id_salt("reader-chapter")
-                    // The box adds its padding and arrow to this width
-                    .width((ui.available_width() - 40.0).clamp(40.0, 320.0))
-                    .height(400.0)
-                    .truncate()
-                    .selected_text(book.chapter_label(chapter))
-                    .show_ui(ui, |ui| {
-                        list_rows(ui, |ui| {
-                            for pos in 0..book.chapters.len() {
-                                ui.selectable_value(&mut chapter, pos, book.chapter_label(pos));
-                            }
-                        });
-                    });
-            });
         });
+        if let Some(book) = book {
+            // Vertical text reads to the left, so the next chapter is on the left, as for turning pages
+            let next = (chapter + 1 < book.chapters.len()).then_some(chapter + 1);
+            let previous = chapter.checked_sub(1);
+            let ((left, left_hint), (right, right_hint)) =
+                if self.reader_vertical { ((next, "Next chapter"), (previous, "Previous chapter")) } else { ((previous, "Previous chapter"), (next, "Next chapter")) };
+            // Too narrow for the buttons beside a usable list: the list alone (pages still turn into the next chapter)
+            let arrows = wide || group.width() - group_width(0.0) >= MIN_CHAPTER_LIST;
+            let list = if wide {
+                wide_list
+            } else if arrows {
+                (group.width() - group_width(0.0)).min(MAX_CHAPTER_LIST)
+            } else {
+                group.width().max(MIN_CHAPTER_LIST)
+            };
+            row(ui, group, egui::Layout::left_to_right(egui::Align::Center), &mut |ui| {
+                let arrow = |glyph: &str| egui::Button::new(glyph).min_size(egui::vec2(arrow_width, BAR_HEIGHT));
+                if arrows && ui.add_enabled(left.is_some(), arrow("‹")).on_hover_text(left_hint).clicked() {
+                    chapter = left.unwrap_or(chapter);
+                }
+                // Exactly its width: a list given more room grows into it (its width is only a minimum)
+                ui.allocate_ui_with_layout(egui::vec2(list, BAR_HEIGHT), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("reader-chapter")
+                        .width(list)
+                        .height(400.0)
+                        .truncate()
+                        .selected_text(book.chapter_label(chapter))
+                        .show_ui(ui, |ui| {
+                            list_rows(ui, |ui| {
+                                for pos in 0..book.chapters.len() {
+                                    ui.selectable_value(&mut chapter, pos, book.chapter_label(pos));
+                                }
+                            });
+                        });
+                });
+                if arrows && ui.add_enabled(right.is_some(), arrow("›")).on_hover_text(right_hint).clicked() {
+                    chapter = right.unwrap_or(chapter);
+                }
+            });
+        }
+        ui.spacing_mut().button_padding = padding;
         if reader.needs_words() {
             if let DictionaryState::Ready { tokenizer, .. } = &mut self.dictionary {
                 // Every word the tokenizer finds can be looked up, whether word lists count it or not
@@ -1455,6 +1509,9 @@ fn reader_help(ui: &mut Ui, vertical: bool, paginate: bool, palette: Palette) {
         items.push(if vertical { "The mouse wheel scrolls through the columns.".to_string() } else { "The mouse wheel scrolls through the text.".to_string() });
     }
     items.push("Shift or Cmd/Ctrl + the mouse wheel, or a pinch, changes the font size.".to_string());
+    let (next_button, previous_button) = if vertical { ("‹", "›") } else { ("›", "‹") };
+    items.push(format!("Beside the chapter list, {next_button} opens the next chapter and {previous_button} the previous one."));
+    items.push(format!("{HIGHLIGHT_ICON} in the bar turns word highlighting on and off."));
     for item in items {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -1463,6 +1520,36 @@ fn reader_help(ui: &mut Ui, vertical: bool, paginate: bool, palette: Palette) {
         });
     }
 }
+
+/// The width of a button showing `text` (at `size`, or the button font), at least `min`.
+fn button_width(ui: &Ui, text: &str, size: Option<f32>, min: f32) -> f32 {
+    let font = size.map_or_else(|| egui::TextStyle::Button.resolve(ui.style()), egui::FontId::proportional);
+    let text = ui.painter().layout_no_wrap(text.to_string(), font, Color32::WHITE).size().x;
+    (text + 2.0 * ui.spacing().button_padding.x).max(min)
+}
+
+/// The right end of the reader's bar, from the right: settings, then the highlight toggle.
+fn bar_buttons(ui: &mut Ui, show_settings: &mut bool, highlight: &mut bool) {
+    if ui.add(egui::Button::new("⚙").min_size(egui::vec2(0.0, BAR_HEIGHT)).selected(*show_settings)).on_hover_text("Settings, with the font size and text direction").clicked() {
+        *show_settings = !*show_settings;
+    }
+    let hint = if *highlight { "Highlighting words: click to stop" } else { "Highlight words, colored by their parts" };
+    if ui.add(egui::Button::new(HIGHLIGHT_ICON).min_size(egui::vec2(0.0, BAR_HEIGHT)).selected(*highlight)).on_hover_text(hint).clicked() {
+        *highlight = !*highlight;
+    }
+}
+
+/// Height of the reader's bar, and width of its chapter buttons.
+const BAR_HEIGHT: f32 = 24.0;
+const ARROW_WIDTH: f32 = 24.0;
+/// Width of the chapter list at most, at least when centered (narrower, the controls fill the middle), and at least.
+const MAX_CHAPTER_LIST: f32 = 320.0;
+const MIN_WIDE_CHAPTER_LIST: f32 = 200.0;
+const MIN_CHAPTER_LIST: f32 = 40.0;
+/// The book name is cut to this width when the chapter controls are centered.
+const MAX_NAME_WIDTH: f32 = 260.0;
+/// The highlight toggle's icon (a marker), in the emoji font egui ships.
+const HIGHLIGHT_ICON: &str = "🖍";
 
 /// Rows of a drop-down list that fill its width with no gaps, so a click anywhere on a row selects it.
 fn list_rows(ui: &mut Ui, rows: impl FnOnce(&mut Ui)) {

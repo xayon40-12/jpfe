@@ -76,3 +76,11 @@ The user saw the highlight and the dictionary window disagree (家 and 心 color
 - **Readings cached by dictionary form** (fixed: each occurrence takes UniDic's reading in its sentence; the kana spelling, homograph and じる rules are kept). One misreading stuck to later occurrences: 1.81% of single-token words got another reading than UniDic gives in context (心 しん for こころ 3,886 times). The window picks its entry by this reading, so it showed the wrong entry too.
 
 The rule the user then chose, and its results, are decision 9 of [decisions-reader.md](decisions-reader.md).
+
+## Next investigation (after the Dropbox sync and the reader's top-bar change are merged)
+
+The user found these issues on the first page of chapter 0 (the prologue) of 無職転生, on 20 November 2026. The first two show in both the PDF and the EPUB; the third only in the EPUB:
+
+- **A に shown as だ in the dictionary window.** In 逆にぼっこぼこにされた, clicking the に of 逆に opens the entry だ ("as used here: auxiliary", then た and 兊【だ】). UniDic likely tags this に as the continuative form of the copula だ, so the window looks up its dictionary form. Find whether the tokenization is right, and whether the window should show the form as written (に, "continuative of だ") rather than だ.
+- **Line breaks after 、 that look inconsistent.** Some columns end right after a comma (兄弟たちの奸計にハマり、 / 見事に家を追い出された。, 床ドンと壁ドンをマスターし、 / 家で傍若無人に…), others run on. Find whether the EPUB itself breaks these lines (the prologue's layout), or whether the extraction or the reader joins or splits sentences and whitespace wrongly.
+- **Spacing in the EPUB much larger than in the PDF.** In the EPUB, the same passage shows an empty column between each line (兄弟たちの…追い出された。 / empty / 床ドンと壁ドンをマスターし、 / empty / 家で傍若無人に…), and a blank cell after ハマり、 before 見事に (likely a full-width space, now given to UniDic as ASCII spaces but still drawn as a cell). Find what the EPUB's markup holds there (empty paragraphs, `<br/>`, spaces) and how the EPUB extraction turns it into lines, then decide how the reader should show it: e.g. collapse empty lines, or treat a full-width space after 、 as a line's continuation.
