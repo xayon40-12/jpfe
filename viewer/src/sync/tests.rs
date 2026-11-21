@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use super::engine::{Done, Engine, Fetched, Host, Listing, Provider, ProviderError, WriteMode, STATE_PATH};
+use super::engine::{Done, Engine, Fetched, Rejected, Host, Listing, Provider, ProviderError, WriteMode, STATE_PATH};
 use super::*;
 use crate::book::SavedBook;
 use crate::state::{stamp_at, SavedState};
@@ -337,13 +337,18 @@ impl Host for Device {
     }
 
     fn read_source(&mut self, hash: &str) -> bool {
+        // As the app: a stored copy that is not the book is not uploaded
+        let id = self.id_of_hash(hash);
+        if id.and_then(|id| self.files.get(&id)).is_none_or(|bytes| content_hash(bytes) != hash) {
+            return false;
+        }
         self.reads.push(hash.to_string());
         true
     }
 
-    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, _detail: &str) -> Result<(), String> {
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, _detail: &str) -> Result<(), Rejected> {
         if content_hash(&bytes) != hash {
-            return Err("damaged".into());
+            return Err(Rejected::Damaged("damaged".into()));
         }
         let id = self.state.next_id;
         self.state.next_id += 1;
@@ -533,6 +538,29 @@ fn a_newer_place_for_the_open_book_is_offered() {
     pair.phone.0.open = None;
     pair.sync(true);
     assert_eq!(pair.phone.0.state.reader_books[&a].chapter, 4);
+}
+
+#[test]
+fn a_book_stored_damaged_is_replaced_by_the_right_file() {
+    let mut pair = Pair::new();
+    pair.phone.0.clock = 1_000_000;
+    let a = pair.phone.0.add_book(BOOK_A, "A");
+    // The phone stored its copy twice over (Safari's bug) and uploaded that
+    pair.phone.0.files.insert(a, [BOOK_A, BOOK_A].concat());
+    let path = book_path(&content_hash(BOOK_A), "A.epub");
+    pair.sync(true);
+    assert!(!pair.cloud.0.borrow().files.contains_key(&path), "a stored copy that is not the book is not uploaded");
+    pair.cloud.0.borrow_mut().files.insert(path.clone(), ([BOOK_A, BOOK_A].concat(), "bad".into()));
+    // The computer refuses it and deletes it from the folder
+    pair.sync(false);
+    assert!(pair.computer.0.id_of(BOOK_A).is_none());
+    assert!(!pair.cloud.0.borrow().files.contains_key(&path));
+    // The phone's copy repaired (the file opened again): uploaded, then downloaded
+    pair.phone.0.files.insert(a, BOOK_A.to_vec());
+    pair.sync_both();
+    assert_eq!(pair.cloud.0.borrow().files[&path].0, BOOK_A);
+    let on_computer = pair.computer.0.id_of(BOOK_A).expect("downloaded once uploaded right");
+    assert_eq!(pair.computer.0.files[&on_computer], BOOK_A);
 }
 
 #[test]

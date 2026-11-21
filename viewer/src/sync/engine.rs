@@ -109,7 +109,17 @@ pub trait Host {
     fn read_source(&mut self, hash: &str) -> bool;
     /// A book's file downloaded: add the book. An error is shown, and the book not downloaded again this session.
     /// `detail` is what the storage said about the file (status, type, size), for the error if it is damaged.
-    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), String>;
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), Rejected>;
+}
+
+/// Why a downloaded book was not added.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Rejected {
+    /// Its contents are not the file its name (its hash) says: deleted from the folder, so that a device with
+    /// the right file uploads it again
+    Damaged(String),
+    /// Anything else (it could not be read as a book): not downloaded again this session
+    Other(String),
 }
 
 /// What the sync is doing, to show.
@@ -472,9 +482,17 @@ impl Engine {
             Reply::Book(hash, record, Ok(found)) if self.phase == Phase::Transferring => {
                 self.status.downloads = self.status.downloads.saturating_sub(1);
                 if let Some(Fetched { bytes, detail, .. }) = found {
-                    if let Err(e) = host.downloaded(&hash, &record, bytes, &detail) {
-                        self.problem(format!("{}: {e}", record.name));
-                        self.skipped.insert(hash);
+                    if let Err(rejected) = host.downloaded(&hash, &record, bytes, &detail) {
+                        match rejected {
+                            Rejected::Damaged(e) => {
+                                self.problem(format!("{}: {e}; deleted from the folder, to be uploaded again", record.name));
+                                self.transfers.push_front(Transfer::Delete { path: record.path(&hash) });
+                            }
+                            Rejected::Other(e) => {
+                                self.problem(format!("{}: {e}", record.name));
+                                self.skipped.insert(hash);
+                            }
+                        }
                     } else if let Some((remote, _)) = &self.remote {
                         // Its place, and the view if it was waiting for it
                         host.adopt(remote);

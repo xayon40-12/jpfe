@@ -149,6 +149,8 @@ pub struct ViewerApp {
     /// is missing
     hashing: Option<u64>,
     unhashable: HashSet<u64>,
+    /// Books whose stored file is not the book (its hash differs): not uploaded until the file is opened again
+    damaged: HashSet<u64>,
     /// A newer place from another device for the book open in the reader, offered rather than applied
     place_offer: Option<(u64, BookReaderState)>,
     /// Whether the first sync since the app started is still to come, and whether the view was switched since:
@@ -257,6 +259,7 @@ impl ViewerApp {
             sync_reads: HashMap::new(),
             hashing: None,
             unhashable: HashSet::new(),
+            damaged: HashSet::new(),
             place_offer: None,
             first_sync: true,
             view_touched: false,
@@ -300,8 +303,17 @@ impl ViewerApp {
                 Incoming::File { name, bytes } => {
                     // Books are named by their contents: the same file twice is the same book
                     let hash = sync::content_hash(&bytes);
-                    if let Some(open) = self.book_with_hash(&hash) {
-                        self.errors.push(format!("{name}: already open, as {open}"));
+                    if let Some(open) = self.current_state().books.into_iter().find(|b| b.hash.as_deref() == Some(hash.as_str())) {
+                        if self.damaged.remove(&open.id) {
+                            // Its stored copy was damaged: replaced by the file, and synced again
+                            storage::write(&self.inbox, ctx, Key::Source(open.id), &bytes);
+                            self.errors.push(format!("{name}: the copy stored here is repaired"));
+                            if let Some(engine) = self.account.engine() {
+                                engine.borrow_mut().sync_now();
+                            }
+                        } else {
+                            self.errors.push(format!("{name}: already open, as {}", open.name));
+                        }
                         continue;
                     }
                     let id = self.next_id;
@@ -481,8 +493,21 @@ impl ViewerApp {
                 let restoring = self.restoring.iter().position(|b| b.id == id);
                 if let Some(hash) = self.sync_reads.remove(&id) {
                     if let Some(engine) = self.account.engine() {
-                        let bytes = if restoring.is_some() { bytes.clone() } else { bytes.take() };
-                        engine.borrow_mut().source(&hash, bytes);
+                        let mut file = if restoring.is_some() { bytes.clone() } else { bytes.take() };
+                        // Only the book itself is uploaded: a stored copy that is not (an older version of the app could
+                        // store a file twice over in Safari) waits for the file to be opened again
+                        if let Some(stored) = file.as_ref().filter(|stored| sync::content_hash(stored) != hash) {
+                            let name = self.saved_name(id);
+                            let message = format!(
+                                "{name}: the copy stored in this browser is damaged ({} bytes), so it is not synced; open the file again to repair it",
+                                stored.len()
+                            );
+                            platform::log(&format!("jpfe sync: {message}"));
+                            self.errors.push(message);
+                            self.damaged.insert(id);
+                            file = None;
+                        }
+                        engine.borrow_mut().source(&hash, file);
                     }
                 }
                 if self.hashing == Some(id) {
@@ -845,6 +870,11 @@ impl ViewerApp {
         }
     }
 
+    /// A book's name, at any stage.
+    fn saved_name(&self, id: u64) -> String {
+        self.current_state().books.into_iter().find(|b| b.id == id).map(|b| b.name).unwrap_or_default()
+    }
+
     /// The name of the book with this hash, at any stage.
     fn book_with_hash(&self, hash: &str) -> Option<String> {
         self.current_state().books.into_iter().find(|b| b.hash.as_deref() == Some(hash)).map(|b| b.name)
@@ -930,7 +960,8 @@ impl ViewerApp {
     }
 
     /// A book downloaded from another device: stored and analyzed, as a book opened here.
-    fn add_downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), String> {
+    fn add_downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), sync::engine::Rejected> {
+        use sync::engine::Rejected;
         let got = sync::content_hash(&bytes);
         if got != hash {
             let short = sync::dropbox::short;
@@ -941,7 +972,7 @@ impl ViewerApp {
                 bytes.len()
             );
             platform::log(&format!("jpfe sync: {}: {message}", record.name));
-            return Err(message);
+            return Err(Rejected::Damaged(message));
         }
         if self.book_with_hash(hash).is_some() {
             return Ok(());
@@ -965,7 +996,7 @@ impl ViewerApp {
             }
             Err(e) => {
                 storage::remove_book(&self.inbox, &ctx, id);
-                Err(format!("{e:#}"))
+                Err(Rejected::Other(format!("{e:#}")))
             }
         }
     }
@@ -2086,12 +2117,15 @@ impl sync::engine::Host for ViewerApp {
 
     fn read_source(&mut self, hash: &str) -> bool {
         let Some(id) = self.books.iter().find(|b| b.hash.as_deref() == Some(hash)).map(|b| b.id) else { return false };
+        if self.damaged.contains(&id) {
+            return false;
+        }
         self.sync_reads.insert(id, hash.to_string());
         storage::read(&self.inbox, &self.ctx, Key::Source(id));
         true
     }
 
-    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), String> {
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), sync::engine::Rejected> {
         self.add_downloaded(hash, record, bytes, detail)
     }
 }

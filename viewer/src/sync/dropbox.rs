@@ -383,6 +383,10 @@ impl Provider for Dropbox {
                 if r.ok {
                     let meta: Value = r.headers.get("Dropbox-API-Result").and_then(|m| serde_json::from_str(m).ok()).unwrap_or_default();
                     let detail = download_detail(&r, &meta);
+                    // Changed on the way: an error, retried later
+                    if meta["content_hash"].as_str().is_some_and(|stored| stored != dropbox_content_hash(&r.bytes)) {
+                        return Err(ProviderError::Other(format!("download damaged: {detail}")));
+                    }
                     Ok(Some(Fetched { rev: meta["rev"].as_str().unwrap_or_default().to_string(), bytes: r.bytes, detail }))
                 } else if r.status == 409 && api_error(&r).starts_with("path/not_found") {
                     Ok(None)

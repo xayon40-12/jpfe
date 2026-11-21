@@ -176,6 +176,11 @@ mod imp {
     /// Large single writes fail in Safari ("UnknownError ... e.g. out of memory"), so files are written in parts.
     const CHUNK: u32 = 4 << 20;
 
+    /// The parts of a file written in parts: `(start, end)` of each, covering `len` bytes once.
+    pub(super) fn parts(len: u32, chunk: u32) -> Vec<(u32, u32)> {
+        (0..len.div_ceil(chunk)).map(|i| (i * chunk, ((i + 1) * chunk).min(len))).collect()
+    }
+
     thread_local! {
         /// The last write in the queue: Safari also fails when many large writes run at once
         static QUEUE: std::cell::RefCell<js_sys::Promise> = std::cell::RefCell::new(js_sys::Promise::resolve(&JsValue::UNDEFINED));
@@ -205,20 +210,32 @@ mod imp {
         if js_sys::Reflect::has(&handle, &"createWritable".into()).unwrap_or(false) {
             let written = async {
                 let stream: FileSystemWritableFileStream = JsFuture::from(handle.create_writable()).await?.unchecked_into();
-                let mut at = 0;
-                while at < bytes.length() {
-                    let end = (at + CHUNK).min(bytes.length());
-                    JsFuture::from(stream.write_with_js_u8_array(&bytes.subarray(at, end))?).await?;
-                    at = end;
+                for (start, end) in parts(bytes.length(), CHUNK) {
+                    // A copy of each part, not a view (`subarray`): Safari wrote a view's whole buffer, so a book in
+                    // two parts was stored twice over
+                    JsFuture::from(stream.write_with_js_u8_array(&bytes.slice(start, end))?).await?;
                 }
                 // The file is replaced only when the stream is closed, so a half-written file is never seen
-                JsFuture::from(stream.close()).await
+                JsFuture::from(stream.close()).await?;
+                stored_size(&handle).await
             };
-            if written.await.is_ok() {
-                return Ok("stream");
+            match written.await {
+                Ok(size) if size == bytes.length() as f64 => return Ok("stream"),
+                Ok(size) => web_sys::console::error_1(&format!("jpfe storage: {path} stored {size} bytes of {}; written again", bytes.length()).into()),
+                Err(_) => {}
             }
         }
-        worker::write(path, bytes).await.map(|()| "worker")
+        worker::write(path, bytes.clone()).await?;
+        match stored_size(&handle).await? {
+            size if size == bytes.length() as f64 => Ok("worker"),
+            size => Err(JsValue::from_str(&format!("stored {size} bytes of {}", bytes.length()))),
+        }
+    }
+
+    /// The size of the file as stored.
+    async fn stored_size(handle: &FileSystemFileHandle) -> Result<f64, JsValue> {
+        let file: web_sys::File = JsFuture::from(handle.get_file()).await?.unchecked_into();
+        Ok(file.size())
     }
 
     /// Writes through a dedicated worker with a sync access handle, which every browser with OPFS supports.
@@ -244,7 +261,9 @@ mod imp {
                     try {
                         handle.truncate(0);
                         let at = 0;
-                        while (at < bytes.byteLength) at += handle.write(bytes.subarray(at, at + CHUNK), { at });
+                        // Copies of each part (not views of the whole buffer), each at its place
+                        while (at < bytes.byteLength) at += handle.write(bytes.slice(at, at + CHUNK), { at });
+                        handle.truncate(bytes.byteLength);
                         handle.flush();
                     } finally {
                         handle.close();
@@ -294,6 +313,8 @@ mod imp {
                 n.set(id.wrapping_add(1));
                 id
             });
+            // The buffer is transferred to the worker: a copy, so the caller's array stays usable
+            let array = js_sys::Uint8Array::new(&array);
             let message = js_sys::Object::new();
             js_sys::Reflect::set(&message, &"id".into(), &id.into())?;
             js_sys::Reflect::set(&message, &"path".into(), &path.into())?;
@@ -432,6 +453,24 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    /// The same arithmetic as the web's `imp::parts`, which only builds for wasm.
+    fn parts(len: u32, chunk: u32) -> Vec<(u32, u32)> {
+        (0..len.div_ceil(chunk)).map(|i| (i * chunk, ((i + 1) * chunk).min(len))).collect()
+    }
+
+    #[test]
+    fn files_are_written_in_parts_covering_each_byte_once() {
+        let chunk = 4 << 20;
+        // The book Safari stored twice over: 7,357,293 bytes, two parts
+        let parts = parts(7_357_293, chunk);
+        assert_eq!(parts, [(0, chunk), (chunk, 7_357_293)]);
+        let total: u32 = parts.iter().map(|(start, end)| end - start).sum();
+        assert_eq!(total, 7_357_293);
+        assert!(parts.windows(2).all(|w| w[0].1 == w[1].0));
+        assert_eq!(super::tests::parts(0, chunk), []);
+        assert_eq!(super::tests::parts(chunk, chunk), [(0, chunk)]);
+    }
+
     #[test]
     fn book_ids_are_the_numbered_folders() {
         let names = ["3", "0", "notes", "12"].map(String::from);
