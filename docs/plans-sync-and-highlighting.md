@@ -87,11 +87,17 @@ The design planned here (a small storage interface, books named by a hash of the
 
 **Tested:** unit tests for the merge (newest wins per record, the same copy on a tie whichever way round, removals against older and newer entries, places of removed books dropped), old state files loading, the local id to hash mapping and back, the reader-open rule, and a future timestamp; and two devices syncing through an in-memory provider (a place on each, a book added on one and removed on the other then added again, conflicting settings, a write in between, the offered place, an offline provider retried, the cheap check). In the browser, without a Dropbox key: the app works with sync shown as not available, an old state with a book and a place migrates (the book gets the hash of its file, the place and settings are kept, the reader reopens there), and a page turn and a setting change are stamped. With a dummy key: the signed-out section on a phone, a sign-in coming back with a wrong `state` refused (and removed from the address), and a refused refresh token signing the device out with the app working on.
 
-**Not tested against the real Dropbox API** (no account or app was created): signing in, the token exchange and renewal, and the uploads, downloads, listings and deletions. They follow Dropbox's documented endpoints, and CORS was checked.
+**8. Tried with the real Dropbox (21 November 2026, commits "Sync: say what differs when a downloaded book is damaged" and "Stored files written exactly once; damaged copies never synced").** The user created the Dropbox app and signed in from Safari and Chrome on `localhost:8769`: sign-in, settings and places synced at once, but Chrome refused the book Safari had uploaded ("the downloaded file is damaged"). The error now says what differs (expected and received SHA-256 and size, the HTTP status and type, Dropbox's size and content hash), and it showed 14,714,586 bytes for a 7,357,293-byte PDF: exactly twice, intact in transit, so stored twice over by Safari.
+
+- **The cause, in the storage, not the sync:** files are written to the browser's storage in 4 MB parts, and each part was given to the writable stream as a view (`subarray`) of the whole file; Safari wrote each view's whole buffer, so a file of two parts was stored twice (three parts, three times). Safari only recently gained `createWritable` outside workers, which is why the worker path, used before, never did it, and Chromium writes views correctly. Each part is now a copy (`slice`), every write checks the stored size and writes again through the worker if it differs, and the worker truncates to the exact length. **This also fixes main:** its stored books and analyses over 4 MB written by Safari were affected the same way (the analyses' format hid it, and a book is only read again when a new build analyzes it).
+- **Never syncing a damaged copy:** a book's stored file is checked against its hash before it is uploaded; a damaged one is reported ("the copy stored in this browser is damaged … open the file again to repair it"), and opening the file again replaces it. A download that differs from what Dropbox stores is an error, retried; a file in Dropbox that is not the book its name says is deleted by the device that downloads it, so that a device with the right file uploads it again.
+- After the fix, the user repaired Safari's copy, and books downloaded between Safari and Chrome.
+
+**Not tried yet:** the desktop app's sign-in (the pasted code) and sync.
 
 ### Still open
 
-- **Trying it with a real Dropbox app** (see [dropbox-setup.md](dropbox-setup.md)): the first real sync between the web and the desktop, and between two browsers.
+- **The desktop app with the real Dropbox** (see [dropbox-setup.md](dropbox-setup.md)): its sign-in with a pasted code, and syncing with the web.
 - **Desktop close:** the desktop app does not push on quitting; a change made in the last 3 s is pushed at the next start.
 - **Removal records are kept forever** (a few dozen bytes each); they could be dropped after a year.
 - **CloudKit**, for an iOS app, as a second provider (see above).
@@ -108,3 +114,11 @@ The user saw the highlight and the dictionary window disagree (家 and 心 color
 - **Readings cached by dictionary form** (fixed: each occurrence takes UniDic's reading in its sentence; the kana spelling, homograph and じる rules are kept). One misreading stuck to later occurrences: 1.81% of single-token words got another reading than UniDic gives in context (心 しん for こころ 3,886 times). The window picks its entry by this reading, so it showed the wrong entry too.
 
 The rule the user then chose, and its results, are decision 9 of [decisions-reader.md](decisions-reader.md).
+
+## Next investigation (after the Dropbox sync and the reader's top-bar change are merged)
+
+The user found these issues on the first page of chapter 0 (the prologue) of 無職転生, on 20 November 2026. The first two show in both the PDF and the EPUB; the third only in the EPUB:
+
+- **A に shown as だ in the dictionary window.** In 逆にぼっこぼこにされた, clicking the に of 逆に opens the entry だ ("as used here: auxiliary", then た and 兊【だ】). UniDic likely tags this に as the continuative form of the copula だ, so the window looks up its dictionary form. Find whether the tokenization is right, and whether the window should show the form as written (に, "continuative of だ") rather than だ.
+- **Line breaks after 、 that look inconsistent.** Some columns end right after a comma (兄弟たちの奸計にハマり、 / 見事に家を追い出された。, 床ドンと壁ドンをマスターし、 / 家で傍若無人に…), others run on. Find whether the EPUB itself breaks these lines (the prologue's layout), or whether the extraction or the reader joins or splits sentences and whitespace wrongly.
+- **Spacing in the EPUB much larger than in the PDF.** In the EPUB, the same passage shows an empty column between each line (兄弟たちの…追い出された。 / empty / 床ドンと壁ドンをマスターし、 / empty / 家で傍若無人に…), and a blank cell after ハマり、 before 見事に (likely a full-width space, now given to UniDic as ASCII spaces but still drawn as a cell). Find what the EPUB's markup holds there (empty paragraphs, `<br/>`, spaces) and how the EPUB extraction turns it into lines, then decide how the reader should show it: e.g. collapse empty lines, or treat a full-width space after 、 as a line's continuation.
