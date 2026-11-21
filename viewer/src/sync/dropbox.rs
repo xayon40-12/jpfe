@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::engine::{Done, Listing, Provider, ProviderError, WriteMode};
+use super::engine::{Done, Fetched, Listing, Provider, ProviderError, WriteMode};
 
 /// The app key of the Dropbox app, a public value for an app using PKCE; set when building, with the
 /// `JPFE_DROPBOX_APP_KEY` environment variable. Without it, sync is not offered.
@@ -303,6 +303,36 @@ impl Dropbox {
     }
 }
 
+/// Dropbox's content hash of a file: the SHA-256 of the SHA-256 of each 4 MiB block (hex).
+pub fn dropbox_content_hash(bytes: &[u8]) -> String {
+    let mut all = Sha256::new();
+    for block in bytes.chunks(4 << 20) {
+        all.update(Sha256::digest(block));
+    }
+    all.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What Dropbox said about a downloaded file, against what arrived: to tell a damaged download from a file
+/// stored damaged.
+fn download_detail(r: &ehttp::Response, meta: &Value) -> String {
+    let received = dropbox_content_hash(&r.bytes);
+    let stored = meta["content_hash"].as_str().unwrap_or("?");
+    let same = if stored == received { "matches" } else { "differs from" };
+    format!(
+        "HTTP {}, Content-Type {}, Dropbox size {}, Dropbox content_hash {} ({same} what arrived: {})",
+        r.status,
+        r.headers.get("Content-Type").unwrap_or("none"),
+        meta["size"].as_u64().map_or("?".to_string(), |s| s.to_string()),
+        short(stored),
+        short(&received),
+    )
+}
+
+/// The first 12 characters of a hash.
+pub fn short(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
 /// A Dropbox error message: its `error_summary`, or the HTTP status.
 fn api_error(response: &ehttp::Response) -> String {
     let json: Option<Value> = serde_json::from_slice(&response.bytes).ok();
@@ -340,7 +370,7 @@ fn api_arg(arg: &Value) -> String {
 }
 
 impl Provider for Dropbox {
-    fn read(&mut self, path: &str, done: Done<Option<(Vec<u8>, String)>>) {
+    fn read(&mut self, path: &str, done: Done<Option<Fetched>>) {
         let arg = api_arg(&json!({ "path": path }));
         let make: MakeRequest = Arc::new(move |token| {
             let auth = format!("Bearer {token}");
@@ -352,7 +382,8 @@ impl Provider for Dropbox {
             done(result.and_then(|r| {
                 if r.ok {
                     let meta: Value = r.headers.get("Dropbox-API-Result").and_then(|m| serde_json::from_str(m).ok()).unwrap_or_default();
-                    Ok(Some((r.bytes, meta["rev"].as_str().unwrap_or_default().to_string())))
+                    let detail = download_detail(&r, &meta);
+                    Ok(Some(Fetched { rev: meta["rev"].as_str().unwrap_or_default().to_string(), bytes: r.bytes, detail }))
                 } else if r.status == 409 && api_error(&r).starts_with("path/not_found") {
                     Ok(None)
                 } else {
@@ -554,6 +585,17 @@ mod tests {
         assert!(a.url.contains("token_access_type=offline") && a.url.contains("code_challenge_method=S256"));
         assert!(!a.url.contains("redirect_uri"));
         assert!(b.url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8766%2F"));
+    }
+
+    #[test]
+    fn dropbox_content_hash_of_blocks() {
+        // Dropbox's documented example hash for an empty file is the SHA-256 of nothing hashed once more
+        assert_eq!(dropbox_content_hash(b""), format!("{:x}", Sha256::digest(b"")));
+        let big = vec![7u8; (4 << 20) + 5];
+        let mut all = Sha256::new();
+        all.update(Sha256::digest(&big[..4 << 20]));
+        all.update(Sha256::digest(&big[4 << 20..]));
+        assert_eq!(dropbox_content_hash(&big), format!("{:x}", all.finalize()));
     }
 
     #[test]

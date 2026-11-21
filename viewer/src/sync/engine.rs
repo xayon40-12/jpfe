@@ -61,6 +61,14 @@ pub enum WriteMode {
     Update(String),
 }
 
+/// A file read: its contents and revision, and what the storage said about it (shown if it turns out damaged).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Fetched {
+    pub bytes: Vec<u8>,
+    pub rev: String,
+    pub detail: String,
+}
+
 /// Files of the synced folder, as paths from its root in lower case ("/books/<hash>.epub"), and a cursor to
 /// ask what changed since.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -73,7 +81,7 @@ pub struct Listing {
 /// once through `done`, from any thread.
 pub trait Provider {
     /// The file's contents and revision, or `None` if there is no such file.
-    fn read(&mut self, path: &str, done: Done<Option<(Vec<u8>, String)>>);
+    fn read(&mut self, path: &str, done: Done<Option<Fetched>>);
     /// Write the file; answers with its new revision.
     fn write(&mut self, path: &str, bytes: Vec<u8>, mode: WriteMode, done: Done<String>);
     /// Every file of the folder, and a cursor.
@@ -100,7 +108,8 @@ pub trait Host {
     /// Read a book's file, to upload it, and answer with [`Engine::source`]; false if there is no such book.
     fn read_source(&mut self, hash: &str) -> bool;
     /// A book's file downloaded: add the book. An error is shown, and the book not downloaded again this session.
-    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>) -> Result<(), String>;
+    /// `detail` is what the storage said about the file (status, type, size), for the error if it is damaged.
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), String>;
 }
 
 /// What the sync is doing, to show.
@@ -122,11 +131,11 @@ pub struct Status {
 }
 
 enum Reply {
-    State(Result<Option<(Vec<u8>, String)>, ProviderError>),
+    State(Result<Option<Fetched>, ProviderError>),
     Wrote(SyncDoc, Result<String, ProviderError>),
     Listed(Result<Listing, ProviderError>),
     Changes(Result<Listing, ProviderError>),
-    Book(String, BookRecord, Result<Option<(Vec<u8>, String)>, ProviderError>),
+    Book(String, BookRecord, Result<Option<Fetched>, ProviderError>),
     Uploaded(Result<String, ProviderError>),
     Deleted(Result<(), ProviderError>),
     /// A book not uploaded after all (its file is missing, or too large)
@@ -401,7 +410,7 @@ impl Engine {
         match reply {
             Reply::State(Ok(found)) if self.phase == Phase::Reading => {
                 let (remote, rev) = match found {
-                    Some((bytes, rev)) => match serde_json::from_slice::<SyncDoc>(&bytes) {
+                    Some(Fetched { bytes, rev, .. }) => match serde_json::from_slice::<SyncDoc>(&bytes) {
                         Ok(doc) if doc.format > FORMAT => {
                             return self.fail(ProviderError::Other("synced by a newer version of the app: update it (reload the page)".into()));
                         }
@@ -462,8 +471,8 @@ impl Engine {
             Reply::Changes(Err(ProviderError::Reset)) if self.phase == Phase::Checking => self.start_pull(),
             Reply::Book(hash, record, Ok(found)) if self.phase == Phase::Transferring => {
                 self.status.downloads = self.status.downloads.saturating_sub(1);
-                if let Some((bytes, _)) = found {
-                    if let Err(e) = host.downloaded(&hash, &record, bytes) {
+                if let Some(Fetched { bytes, detail, .. }) = found {
+                    if let Err(e) = host.downloaded(&hash, &record, bytes, &detail) {
                         self.problem(format!("{}: {e}", record.name));
                         self.skipped.insert(hash);
                     } else if let Some((remote, _)) = &self.remote {

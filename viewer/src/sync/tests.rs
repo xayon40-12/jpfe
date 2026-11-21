@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use super::engine::{Done, Engine, Host, Listing, Provider, ProviderError, WriteMode, STATE_PATH};
+use super::engine::{Done, Engine, Fetched, Host, Listing, Provider, ProviderError, WriteMode, STATE_PATH};
 use super::*;
 use crate::book::SavedBook;
 use crate::state::{stamp_at, SavedState};
@@ -219,12 +219,12 @@ impl Cloud {
 }
 
 impl Provider for FakeCloud {
-    fn read(&mut self, path: &str, done: Done<Option<(Vec<u8>, String)>>) {
+    fn read(&mut self, path: &str, done: Done<Option<Fetched>>) {
         let cloud = self.0.borrow();
         if cloud.offline {
             return done(Err(ProviderError::Other("offline".into())));
         }
-        done(Ok(cloud.files.get(path).cloned()));
+        done(Ok(cloud.files.get(path).map(|(bytes, rev)| Fetched { bytes: bytes.clone(), rev: rev.clone(), detail: String::new() })));
     }
 
     fn write(&mut self, path: &str, bytes: Vec<u8>, mode: WriteMode, done: Done<String>) {
@@ -341,7 +341,7 @@ impl Host for Device {
         true
     }
 
-    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>) -> Result<(), String> {
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, _detail: &str) -> Result<(), String> {
         if content_hash(&bytes) != hash {
             return Err("damaged".into());
         }

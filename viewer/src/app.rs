@@ -930,9 +930,18 @@ impl ViewerApp {
     }
 
     /// A book downloaded from another device: stored and analyzed, as a book opened here.
-    fn add_downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>) -> Result<(), String> {
-        if sync::content_hash(&bytes) != hash {
-            return Err("the downloaded file is damaged".into());
+    fn add_downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), String> {
+        let got = sync::content_hash(&bytes);
+        if got != hash {
+            let short = sync::dropbox::short;
+            let message = format!(
+                "the downloaded file is damaged: expected SHA-256 {}…, got {}… ({} bytes); {detail}",
+                short(hash),
+                short(&got),
+                bytes.len()
+            );
+            platform::log(&format!("jpfe sync: {}: {message}", record.name));
+            return Err(message);
         }
         if self.book_with_hash(hash).is_some() {
             return Ok(());
@@ -2082,8 +2091,8 @@ impl sync::engine::Host for ViewerApp {
         true
     }
 
-    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>) -> Result<(), String> {
-        self.add_downloaded(hash, record, bytes)
+    fn downloaded(&mut self, hash: &str, record: &BookRecord, bytes: Vec<u8>, detail: &str) -> Result<(), String> {
+        self.add_downloaded(hash, record, bytes, detail)
     }
 }
 
