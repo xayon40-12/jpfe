@@ -27,9 +27,11 @@ then click **Submit** at the bottom. Do this before anyone signs in: a sign-in o
 In the **Settings** tab, under **OAuth 2**:
 
 - **Allow public clients (Implicit Grant & PKCE):** *Allow* (the default). The viewer uses PKCE, never the implicit grant.
-- **Redirect URIs:** add each address the web viewer is opened at, exactly, with the final slash:
-  - `http://localhost:8766/`, for testing locally (see below);
-  - `https://xayon40-12.github.io/jpfe/`, the GitHub Pages site (the repository `xayon40-12/jpfe`, published by `.github/workflows/pages.yml`).
+- **Redirect URIs:** the web viewer sends Dropbox its own address (the page's origin and path, without query), so add each address it is opened at, exactly, with the final slash:
+  - `https://xayon40-12.github.io/jpfe/`, the GitHub Pages site (the repository `xayon40-12/jpfe`, published by `.github/workflows/pages.yml`);
+  - for testing locally, the address of the local server: `http://localhost:8766/` (the main checkout's build, served on port 8766) and `http://localhost:8769/` (the sync branch's build, served on port 8769), or whichever port you serve on.
+
+  `localhost` and `127.0.0.1` are different addresses to Dropbox: open the page at the one registered.
 
 The desktop app needs no redirect URI: Dropbox shows it a code to paste instead (its "no redirect" flow).
 
@@ -42,8 +44,12 @@ The **App key** is on the **Settings** tab. The viewer reads it when it is compi
 **Locally:**
 
 ```sh
-# Web, at http://localhost:8766/ (the redirect URI above; 127.0.0.1 would not match)
+# Web, at http://localhost:8766/ (a registered redirect URI; 127.0.0.1 would not match)
 cd viewer && JPFE_DROPBOX_APP_KEY=<app key> trunk serve --release --port 8766
+
+# Or build, and serve viewer/dist on a registered port, e.g. 8769
+cd viewer && JPFE_DROPBOX_APP_KEY=<app key> trunk build --release
+python3 -m http.server 8769 --bind 127.0.0.1 --directory dist   # then open http://localhost:8769/
 
 # Desktop
 JPFE_DROPBOX_APP_KEY=<app key> cargo run --release -p jpfe-viewer
